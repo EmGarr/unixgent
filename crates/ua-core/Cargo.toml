@@ -1,0 +1,14 @@
+[package]
+name = "ua-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "unixagent"
+path = "src/main.rs"
+
+[dependencies]
+ua-protocol.workspace = true
+ua-backend.workspace = true
+tokio.workspace = true
