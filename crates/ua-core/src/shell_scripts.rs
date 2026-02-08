@@ -51,6 +51,8 @@ __ua_prompt_command() {
 }
 [[ "${PROMPT_COMMAND[*]}" =~ __ua_prompt_command ]] || PROMPT_COMMAND=("__ua_prompt_command" "${PROMPT_COMMAND[@]}")
 
+PS1="\[\e[38;5;242m\]◇\[\e[0m\] ${PS1}"
+
 # Append 133;B to PS1 to mark end of prompt (start of user input).
 # This fires after PS1 is rendered and readline is ready for input.
 case "$PS1" in
@@ -83,6 +85,7 @@ __ua_zle_line_init() {
 zle -N zle-line-init __ua_zle_line_init
 (( ${precmd_functions[(Ie)__ua_precmd]} )) || precmd_functions=(__ua_precmd $precmd_functions)
 (( ${preexec_functions[(Ie)__ua_preexec]} )) || preexec_functions=(__ua_preexec $preexec_functions)
+PROMPT="%F{242}◇%f ${PROMPT}"
 clear
 "#;
 
@@ -95,6 +98,13 @@ end
 function __ua_fish_preexec --on-event fish_preexec
     printf \x1b]133\;B\x07
     printf \x1b]133\;C\x07
+end
+functions -c fish_prompt __ua_original_fish_prompt 2>/dev/null
+function fish_prompt
+    set_color brblack
+    echo -n '◇ '
+    set_color normal
+    __ua_original_fish_prompt
 end
 clear
 "#;
