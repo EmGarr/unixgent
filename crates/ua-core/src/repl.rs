@@ -7,7 +7,7 @@ use futures::StreamExt;
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
 use ua_backend::AnthropicClient;
-use ua_protocol::{ConversationMessage, StreamEvent};
+use ua_protocol::{ConversationMessage, StreamEvent, ToolResultRecord, ToolUseRecord};
 
 use crate::config::Config;
 use crate::context::{build_agent_request, OutputHistory};
@@ -42,6 +42,8 @@ enum AgentState {
         iteration: usize,
         /// Commands captured from tool_use events.
         tool_commands: Vec<String>,
+        /// Full tool_use records for conversation history.
+        tool_uses: Vec<ToolUseRecord>,
     },
     /// Awaiting user approval of proposed commands.
     Approving {
@@ -49,6 +51,8 @@ enum AgentState {
         commands: Vec<String>,
         /// Current agentic loop iteration.
         iteration: usize,
+        /// Tool use IDs for building tool_result messages.
+        tool_use_ids: Vec<String>,
     },
     /// Commands are being executed in the PTY.
     Executing {
@@ -56,6 +60,8 @@ enum AgentState {
         iteration: usize,
         /// Captures output during execution for observation.
         capture: OutputHistory,
+        /// Tool use IDs for building tool_result messages.
+        tool_use_ids: Vec<String>,
     },
 }
 
@@ -383,6 +389,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                     if let AgentState::Approving {
                                         commands,
                                         iteration,
+                                        tool_use_ids,
                                         ..
                                     } = std::mem::replace(&mut state, AgentState::Idle)
                                     {
@@ -402,6 +409,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                                 state = AgentState::Executing {
                                                     iteration,
                                                     capture: OutputHistory::new(200),
+                                                    tool_use_ids,
                                                 };
                                             }
                                         }
@@ -439,6 +447,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                     ref mut display,
                     ref mut is_thinking,
                     ref mut tool_commands,
+                    ref mut tool_uses,
                     ..
                 } = state
                 {
@@ -464,7 +473,17 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                             let _ = write!(stderr, "{raw_safe}");
                             let _ = stderr.flush();
                         }
-                        StreamEvent::ToolUse { input_json, .. } => {
+                        StreamEvent::ToolUse {
+                            id,
+                            name,
+                            input_json,
+                        } => {
+                            // Track full record for conversation history
+                            tool_uses.push(ToolUseRecord {
+                                id: id.clone(),
+                                name: name.clone(),
+                                input_json: input_json.clone(),
+                            });
                             // Parse the tool input to extract the command
                             if let Ok(input) = serde_json::from_str::<serde_json::Value>(input_json)
                             {
@@ -489,6 +508,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                     display,
                     iteration,
                     tool_commands,
+                    tool_uses,
                     ..
                 } = std::mem::replace(&mut state, AgentState::Idle)
                 {
@@ -508,7 +528,20 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                             if let Some(instruction) = pending_instruction.take() {
                                 conversation.push(ConversationMessage::user(&instruction));
                             }
-                            conversation.push(ConversationMessage::assistant(&response_text));
+
+                            // Push assistant message with tool_use records if present
+                            if !tool_uses.is_empty() {
+                                conversation.push(ConversationMessage::assistant_with_tool_use(
+                                    &response_text,
+                                    tool_uses.clone(),
+                                ));
+                            } else if !response_text.is_empty() {
+                                conversation.push(ConversationMessage::assistant(&response_text));
+                            }
+
+                            // Extract tool_use_ids for Approving/Executing states
+                            let tool_use_ids: Vec<String> =
+                                tool_uses.iter().map(|t| t.id.clone()).collect();
 
                             // Evict oldest turns if over limit
                             let max = config.context.max_conversation_turns;
@@ -532,6 +565,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                 state = AgentState::Approving {
                                     commands,
                                     iteration,
+                                    tool_use_ids,
                                 };
                             }
                         }
@@ -582,25 +616,38 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                         QueueEvent::AllDone => {
                             // Commands finished executing
                             if let AgentState::Executing {
-                                iteration, capture, ..
+                                iteration,
+                                capture,
+                                tool_use_ids,
+                                ..
                             } = std::mem::replace(&mut state, AgentState::Idle)
                             {
                                 let captured_lines = capture.lines();
                                 if !captured_lines.is_empty() && iteration < MAX_AGENT_ITERATIONS {
-                                    // Build observation and call LLM again
+                                    // Build observation
                                     let observation = format!(
                                         "Command output:\n\n{}\n",
                                         captured_lines.join("\n")
                                     );
-                                    conversation.push(ConversationMessage::user(&observation));
+
+                                    // Push as tool_result if we have tool_use_ids,
+                                    // otherwise fall back to plain user message.
+                                    if !tool_use_ids.is_empty() {
+                                        let tool_results: Vec<ToolResultRecord> = tool_use_ids
+                                            .iter()
+                                            .map(|id| ToolResultRecord {
+                                                tool_use_id: id.clone(),
+                                                content: observation.clone(),
+                                            })
+                                            .collect();
+                                        conversation
+                                            .push(ConversationMessage::tool_result(tool_results));
+                                    } else {
+                                        conversation.push(ConversationMessage::user(&observation));
+                                    }
 
                                     // Clear readline before next LLM call
                                     let _ = session.write_all(b"\x15");
-
-                                    // Don't set pending_instruction — we already pushed
-                                    // the observation as a user message above. The
-                                    // BackendDone handler only needs pending_instruction
-                                    // for the initial user instruction.
 
                                     let next_iteration = iteration + 1;
                                     if next_iteration >= MAX_AGENT_ITERATIONS {
@@ -613,10 +660,12 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                             stderr,
                                             "\r[ua] observing output ({next_iteration}/{MAX_AGENT_ITERATIONS})..."
                                         );
+                                        // Pass empty instruction — tool_result is
+                                        // already in conversation history.
                                         state = start_streaming(
                                             rt_handle,
                                             config,
-                                            &observation,
+                                            "",
                                             &output_history,
                                             &conversation,
                                             terminal_size,
@@ -734,6 +783,7 @@ fn start_streaming(
         is_thinking: false,
         iteration,
         tool_commands: Vec::new(),
+        tool_uses: Vec::new(),
     }
 }
 
@@ -1125,5 +1175,107 @@ mod tests {
         }
 
         assert!(commands.is_empty());
+    }
+
+    // --- Tool use record tracking tests ---
+
+    #[test]
+    fn tool_use_captures_full_record() {
+        let events = vec![StreamEvent::ToolUse {
+            id: "toolu_abc".to_string(),
+            name: "shell".to_string(),
+            input_json: r#"{"command":"ls /tmp"}"#.to_string(),
+        }];
+
+        let mut tool_commands = Vec::new();
+        let mut tool_uses: Vec<ToolUseRecord> = Vec::new();
+
+        for event in &events {
+            if let StreamEvent::ToolUse {
+                id,
+                name,
+                input_json,
+            } = event
+            {
+                tool_uses.push(ToolUseRecord {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input_json: input_json.clone(),
+                });
+                if let Some(cmd) = extract_tool_command(input_json) {
+                    tool_commands.push(cmd);
+                }
+            }
+        }
+
+        assert_eq!(tool_commands, vec!["ls /tmp"]);
+        assert_eq!(tool_uses.len(), 1);
+        assert_eq!(tool_uses[0].id, "toolu_abc");
+        assert_eq!(tool_uses[0].name, "shell");
+    }
+
+    #[test]
+    fn tool_use_multiple_captures_ids() {
+        let events = vec![
+            StreamEvent::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "shell".to_string(),
+                input_json: r#"{"command":"ls"}"#.to_string(),
+            },
+            StreamEvent::ToolUse {
+                id: "toolu_2".to_string(),
+                name: "shell".to_string(),
+                input_json: r#"{"command":"pwd"}"#.to_string(),
+            },
+        ];
+
+        let mut tool_uses: Vec<ToolUseRecord> = Vec::new();
+        let mut tool_commands = Vec::new();
+
+        for event in &events {
+            if let StreamEvent::ToolUse {
+                id,
+                name,
+                input_json,
+            } = event
+            {
+                tool_uses.push(ToolUseRecord {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input_json: input_json.clone(),
+                });
+                if let Some(cmd) = extract_tool_command(input_json) {
+                    tool_commands.push(cmd);
+                }
+            }
+        }
+
+        assert_eq!(tool_uses.len(), 2);
+        assert_eq!(tool_commands, vec!["ls", "pwd"]);
+        let ids: Vec<&str> = tool_uses.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["toolu_1", "toolu_2"]);
+    }
+
+    #[test]
+    fn tool_result_built_from_ids() {
+        let tool_use_ids = vec!["toolu_a".to_string(), "toolu_b".to_string()];
+        let observation = "file1.txt\nfile2.txt".to_string();
+
+        let tool_results: Vec<ToolResultRecord> = tool_use_ids
+            .iter()
+            .map(|id| ToolResultRecord {
+                tool_use_id: id.clone(),
+                content: observation.clone(),
+            })
+            .collect();
+
+        assert_eq!(tool_results.len(), 2);
+        assert_eq!(tool_results[0].tool_use_id, "toolu_a");
+        assert_eq!(tool_results[1].tool_use_id, "toolu_b");
+        assert_eq!(tool_results[0].content, observation);
+
+        let msg = ConversationMessage::tool_result(tool_results);
+        assert_eq!(msg.role, ua_protocol::Role::User);
+        assert_eq!(msg.tool_results.len(), 2);
     }
 }

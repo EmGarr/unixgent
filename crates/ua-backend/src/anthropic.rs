@@ -191,20 +191,62 @@ fn build_messages(request: &AgentRequest) -> Vec<ApiMessage> {
 
     // Add conversation history
     for msg in &request.conversation {
-        messages.push(ApiMessage {
-            role: match msg.role {
-                ua_protocol::Role::User => "user".to_string(),
-                ua_protocol::Role::Assistant => "assistant".to_string(),
-            },
-            content: ApiContent::Text(msg.content.clone()),
-        });
+        let role = match msg.role {
+            ua_protocol::Role::User => "user",
+            ua_protocol::Role::Assistant => "assistant",
+        };
+
+        if !msg.tool_uses.is_empty() {
+            // Assistant message with tool_use blocks
+            let mut blocks = Vec::new();
+            if !msg.content.is_empty() {
+                blocks.push(ApiContentBlock::Text {
+                    text: msg.content.clone(),
+                });
+            }
+            for tu in &msg.tool_uses {
+                let input: Value = serde_json::from_str(&tu.input_json)
+                    .unwrap_or(Value::Object(Default::default()));
+                blocks.push(ApiContentBlock::ToolUse {
+                    id: tu.id.clone(),
+                    name: tu.name.clone(),
+                    input,
+                });
+            }
+            messages.push(ApiMessage {
+                role: role.to_string(),
+                content: ApiContent::Blocks(blocks),
+            });
+        } else if !msg.tool_results.is_empty() {
+            // User message with tool_result blocks
+            let blocks = msg
+                .tool_results
+                .iter()
+                .map(|tr| ApiContentBlock::ToolResult {
+                    tool_use_id: tr.tool_use_id.clone(),
+                    content: tr.content.clone(),
+                })
+                .collect();
+            messages.push(ApiMessage {
+                role: role.to_string(),
+                content: ApiContent::Blocks(blocks),
+            });
+        } else {
+            // Plain text message
+            messages.push(ApiMessage {
+                role: role.to_string(),
+                content: ApiContent::Text(msg.content.clone()),
+            });
+        }
     }
 
-    // Add current instruction
-    messages.push(ApiMessage {
-        role: "user".to_string(),
-        content: ApiContent::Text(request.instruction.clone()),
-    });
+    // Add current instruction (skip if empty — agentic continuation)
+    if !request.instruction.is_empty() {
+        messages.push(ApiMessage {
+            role: "user".to_string(),
+            content: ApiContent::Text(request.instruction.clone()),
+        });
+    }
 
     messages
 }
@@ -380,15 +422,36 @@ struct ApiMessage {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+enum ApiContentBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    #[serde(rename = "tool_result")]
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+    },
+}
+
+#[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum ApiContent {
     Text(String),
+    Blocks(Vec<ApiContentBlock>),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ua_protocol::{ConversationMessage, ShellContext, TerminalHistory};
+    use ua_protocol::{
+        ConversationMessage, ShellContext, TerminalHistory, ToolResultRecord, ToolUseRecord,
+    };
 
     #[test]
     fn build_system_prompt_basic() {
@@ -638,5 +701,161 @@ mod tests {
             .unwrap()
             .get("command")
             .is_some());
+    }
+
+    #[test]
+    fn build_messages_with_tool_use_history() {
+        let request = AgentRequest {
+            instruction: "continue".to_string(),
+            context: ShellContext::default(),
+            terminal_history: TerminalHistory::new(),
+            conversation: vec![
+                ConversationMessage::user("list files"),
+                ConversationMessage::assistant_with_tool_use(
+                    "I'll list the files.",
+                    vec![ToolUseRecord {
+                        id: "toolu_123".to_string(),
+                        name: "shell".to_string(),
+                        input_json: r#"{"command":"ls"}"#.to_string(),
+                    }],
+                ),
+            ],
+        };
+
+        let messages = build_messages(&request);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1].role, "assistant");
+
+        // Verify the assistant message has blocks content
+        let json = serde_json::to_value(&messages[1].content).unwrap();
+        let blocks = json.as_array().unwrap();
+        assert_eq!(blocks.len(), 2); // text + tool_use
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[1]["type"], "tool_use");
+        assert_eq!(blocks[1]["id"], "toolu_123");
+        assert_eq!(blocks[1]["input"]["command"], "ls");
+    }
+
+    #[test]
+    fn build_messages_with_tool_result() {
+        let request = AgentRequest {
+            instruction: "".to_string(),
+            context: ShellContext::default(),
+            terminal_history: TerminalHistory::new(),
+            conversation: vec![ConversationMessage::tool_result(vec![ToolResultRecord {
+                tool_use_id: "toolu_123".to_string(),
+                content: "file1.txt\nfile2.txt".to_string(),
+            }])],
+        };
+
+        let messages = build_messages(&request);
+        // Empty instruction → skipped, so just the tool_result
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+
+        let json = serde_json::to_value(&messages[0].content).unwrap();
+        let blocks = json.as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert_eq!(blocks[0]["tool_use_id"], "toolu_123");
+    }
+
+    #[test]
+    fn build_messages_tool_use_then_result_roundtrip() {
+        let request = AgentRequest {
+            instruction: "what do you see?".to_string(),
+            context: ShellContext::default(),
+            terminal_history: TerminalHistory::new(),
+            conversation: vec![
+                ConversationMessage::user("list files"),
+                ConversationMessage::assistant_with_tool_use(
+                    "I'll check.",
+                    vec![ToolUseRecord {
+                        id: "toolu_1".to_string(),
+                        name: "shell".to_string(),
+                        input_json: r#"{"command":"ls"}"#.to_string(),
+                    }],
+                ),
+                ConversationMessage::tool_result(vec![ToolResultRecord {
+                    tool_use_id: "toolu_1".to_string(),
+                    content: "file.txt".to_string(),
+                }]),
+            ],
+        };
+
+        let messages = build_messages(&request);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[2].role, "user");
+        assert_eq!(messages[3].role, "user"); // instruction
+    }
+
+    #[test]
+    fn build_messages_skips_empty_instruction() {
+        let request = AgentRequest {
+            instruction: "".to_string(),
+            context: ShellContext::default(),
+            terminal_history: TerminalHistory::new(),
+            conversation: vec![
+                ConversationMessage::user("hi"),
+                ConversationMessage::assistant("hello"),
+            ],
+        };
+
+        let messages = build_messages(&request);
+        // No extra user message for empty instruction
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn build_messages_assistant_tool_use_no_text() {
+        let request = AgentRequest {
+            instruction: "go".to_string(),
+            context: ShellContext::default(),
+            terminal_history: TerminalHistory::new(),
+            conversation: vec![ConversationMessage::assistant_with_tool_use(
+                "",
+                vec![ToolUseRecord {
+                    id: "toolu_x".to_string(),
+                    name: "shell".to_string(),
+                    input_json: r#"{"command":"pwd"}"#.to_string(),
+                }],
+            )],
+        };
+
+        let messages = build_messages(&request);
+        let json = serde_json::to_value(&messages[0].content).unwrap();
+        let blocks = json.as_array().unwrap();
+        // Only tool_use, no empty text block
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "tool_use");
+    }
+
+    #[test]
+    fn api_content_text_serialization() {
+        let content = ApiContent::Text("hello".to_string());
+        let json = serde_json::to_value(&content).unwrap();
+        assert_eq!(json, serde_json::json!("hello"));
+    }
+
+    #[test]
+    fn api_content_blocks_serialization() {
+        let content = ApiContent::Blocks(vec![
+            ApiContentBlock::Text {
+                text: "hi".to_string(),
+            },
+            ApiContentBlock::ToolUse {
+                id: "t1".to_string(),
+                name: "shell".to_string(),
+                input: serde_json::json!({"command": "ls"}),
+            },
+        ]);
+        let json = serde_json::to_value(&content).unwrap();
+        let blocks = json.as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "hi");
+        assert_eq!(blocks[1]["type"], "tool_use");
+        assert_eq!(blocks[1]["id"], "t1");
     }
 }

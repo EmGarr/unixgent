@@ -58,7 +58,8 @@ management. Plan display. Agentic loop.
 | Silent shell integration injection (single-line eval + clear) | DONE | `ua-core/src/shell_scripts.rs` |
 | **Agentic loop (execute → observe → iterate)** | DONE | `ua-core/src/repl.rs`, `ua-backend/src/anthropic.rs` |
 | **Tool use API for command delivery** | DONE | `ua-protocol/src/message.rs`, `ua-backend/src/anthropic.rs`, `ua-backend/src/mock.rs`, `ua-core/src/repl.rs` |
-| 110 unit tests pass, `make check` clean | DONE | |
+| **Proper tool_use/tool_result conversation format** | DONE | `ua-protocol/src/context.rs`, `ua-backend/src/anthropic.rs`, `ua-core/src/repl.rs` |
+| 128 unit tests pass, `make check` clean | DONE | |
 
 **Exit criteria met**:
 - `# what's in /tmp` → backend returns plan with `ls /tmp` ✅
@@ -175,6 +176,7 @@ Child agents, policy inheritance, trace propagation, musl build, packaging.
 | ~~`block_on` blocks main event loop during streaming~~ | ~~Critical~~ | FIXED — Replaced with async state machine. Backend streams via spawned tokio task, events flow through mpsc channel. Event loop processes Ctrl+C, PTY output, resize in real time. See DESIGN.md §19.2.1 |
 | ~~Command queue ignores exit codes~~ | ~~High~~ | FIXED — CommandQueue tracks last_exit_code from 133;D. Non-zero exit with remaining commands returns QueueEvent::Failed, clearing queue. See DESIGN.md §19.2.4 |
 | ~~Conversation history grows unbounded~~ | ~~High~~ | FIXED — max_conversation_turns (default 20) in ContextConfig. Oldest entries evicted after each push. See DESIGN.md §19.2.7 |
+| ~~API 400 on third agentic iteration~~ | ~~Critical~~ | FIXED — Three bugs: (1) empty assistant messages when LLM responds with only tool_use, (2) conversation history stored as plain text instead of tool_use/tool_result content blocks, (3) duplicate observation pushed to both conversation and instruction. Fixed with ToolUseRecord/ToolResultRecord types, ApiContentBlock enum, and empty instruction for agentic continuations. |
 | Shell integration sourcing unverified | Medium | No check that `source` succeeded; `clear` hack; temp file leak on panic. See DESIGN.md §19.2.5 |
 | ~~`try_wait()` polled on every event~~ | ~~Medium~~ | FIXED — Moved to PtyEof arm only, used for diagnostic logging. See DESIGN.md §19.2.6 |
 | ~~Thread handles discarded (fire-and-forget)~~ | ~~Medium~~ | FIXED — PTY reader JoinHandle stored and joined on exit. Stdin thread blocks on read (can't join portably). See DESIGN.md §19.2.8 |
@@ -196,6 +198,7 @@ Child agents, policy inheritance, trace propagation, musl build, packaging.
 | Extended thinking enabled | 2026-02-08 | Anthropic API with thinking budget (10k tokens), API version 2023-06-01 |
 | Dispatch commands on 133;B not 133;A | 2026-02-08 | 133;A fires in precmd before prompt rendering/ZLE init; dispatching there causes double-echo. 133;B fires after prompt is ready (zle-line-init for zsh, PS1 embedded for bash) |
 | Agentic loop via inner event loop | 2026-02-08 | After commands execute, output is captured and fed back to LLM. Loop continues until LLM responds without code blocks or max 10 iterations. Inner loop reads from same mpsc channel, keeping event-driven model intact |
+| Structured tool_use/tool_result in conversation | 2026-02-08 | ConversationMessage carries ToolUseRecord/ToolResultRecord vecs. build_messages emits ApiContentBlock arrays for assistant tool_use and user tool_result messages. Empty instruction skipped for agentic continuations (tool_result already in conversation). Fixes API 400 on multi-turn agentic loops. |
 | Approximate token counting (chars/4) | 2026-02-07 | Good enough for 200-line terminal history within 200k context window |
 | reqwest + rustls-tls | 2026-02-07 | No OpenSSL dependency, integrates with tokio |
 | Temp file + source for shell integration | 2026-02-07 | Writing scripts to PTY causes echo; temp file sourced via ` source /path` with `clear` at end |

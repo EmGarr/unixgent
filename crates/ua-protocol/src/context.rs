@@ -42,6 +42,21 @@ impl TerminalHistory {
     }
 }
 
+/// A tool_use block from an assistant message.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolUseRecord {
+    pub id: String,
+    pub name: String,
+    pub input_json: String,
+}
+
+/// A tool_result block from a user message.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolResultRecord {
+    pub tool_use_id: String,
+    pub content: String,
+}
+
 /// Role in a conversation.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -55,6 +70,10 @@ pub enum Role {
 pub struct ConversationMessage {
     pub role: Role,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_uses: Vec<ToolUseRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_results: Vec<ToolResultRecord>,
 }
 
 impl ConversationMessage {
@@ -62,6 +81,8 @@ impl ConversationMessage {
         Self {
             role: Role::User,
             content: content.into(),
+            tool_uses: Vec::new(),
+            tool_results: Vec::new(),
         }
     }
 
@@ -69,6 +90,29 @@ impl ConversationMessage {
         Self {
             role: Role::Assistant,
             content: content.into(),
+            tool_uses: Vec::new(),
+            tool_results: Vec::new(),
+        }
+    }
+
+    pub fn assistant_with_tool_use(
+        content: impl Into<String>,
+        tool_uses: Vec<ToolUseRecord>,
+    ) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            tool_uses,
+            tool_results: Vec::new(),
+        }
+    }
+
+    pub fn tool_result(results: Vec<ToolResultRecord>) -> Self {
+        Self {
+            role: Role::User,
+            content: String::new(),
+            tool_uses: Vec::new(),
+            tool_results: results,
         }
     }
 }
@@ -168,5 +212,96 @@ mod tests {
         let assistant = Role::Assistant;
         let json = serde_json::to_string(&assistant).unwrap();
         assert_eq!(json, "\"assistant\"");
+    }
+
+    #[test]
+    fn tool_use_record_roundtrip() {
+        let record = ToolUseRecord {
+            id: "toolu_123".to_string(),
+            name: "shell".to_string(),
+            input_json: r#"{"command":"ls"}"#.to_string(),
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let record2: ToolUseRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(record, record2);
+    }
+
+    #[test]
+    fn tool_result_record_roundtrip() {
+        let record = ToolResultRecord {
+            tool_use_id: "toolu_123".to_string(),
+            content: "file1.txt\nfile2.txt".to_string(),
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let record2: ToolResultRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(record, record2);
+    }
+
+    #[test]
+    fn conversation_message_with_tool_use() {
+        let tool_uses = vec![ToolUseRecord {
+            id: "toolu_abc".to_string(),
+            name: "shell".to_string(),
+            input_json: r#"{"command":"pwd"}"#.to_string(),
+        }];
+        let msg = ConversationMessage::assistant_with_tool_use("I'll check.", tool_uses.clone());
+        assert_eq!(msg.role, Role::Assistant);
+        assert_eq!(msg.content, "I'll check.");
+        assert_eq!(msg.tool_uses, tool_uses);
+        assert!(msg.tool_results.is_empty());
+    }
+
+    #[test]
+    fn conversation_message_tool_result() {
+        let results = vec![ToolResultRecord {
+            tool_use_id: "toolu_abc".to_string(),
+            content: "/home/user".to_string(),
+        }];
+        let msg = ConversationMessage::tool_result(results.clone());
+        assert_eq!(msg.role, Role::User);
+        assert!(msg.content.is_empty());
+        assert!(msg.tool_uses.is_empty());
+        assert_eq!(msg.tool_results, results);
+    }
+
+    #[test]
+    fn conversation_message_roundtrip_with_tools() {
+        let msg = ConversationMessage::assistant_with_tool_use(
+            "checking",
+            vec![ToolUseRecord {
+                id: "toolu_1".to_string(),
+                name: "shell".to_string(),
+                input_json: r#"{"command":"ls"}"#.to_string(),
+            }],
+        );
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("tool_uses"));
+        let msg2: ConversationMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, msg2);
+    }
+
+    #[test]
+    fn conversation_message_roundtrip_without_tools() {
+        let msg = ConversationMessage::user("hello");
+        let json = serde_json::to_string(&msg).unwrap();
+        // skip_serializing_if means these fields are omitted
+        assert!(!json.contains("tool_uses"));
+        assert!(!json.contains("tool_results"));
+        let msg2: ConversationMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, msg2);
+    }
+
+    #[test]
+    fn conversation_message_user_has_empty_vecs() {
+        let msg = ConversationMessage::user("test");
+        assert!(msg.tool_uses.is_empty());
+        assert!(msg.tool_results.is_empty());
+    }
+
+    #[test]
+    fn conversation_message_assistant_has_empty_vecs() {
+        let msg = ConversationMessage::assistant("test");
+        assert!(msg.tool_uses.is_empty());
+        assert!(msg.tool_results.is_empty());
     }
 }

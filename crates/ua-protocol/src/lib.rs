@@ -6,5 +6,8 @@
 pub mod context;
 pub mod message;
 
-pub use context::{AgentRequest, ConversationMessage, Role, ShellContext, TerminalHistory};
+pub use context::{
+    AgentRequest, ConversationMessage, Role, ShellContext, TerminalHistory, ToolResultRecord,
+    ToolUseRecord,
+};
 pub use message::StreamEvent;
