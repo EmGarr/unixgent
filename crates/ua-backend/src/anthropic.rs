@@ -157,9 +157,10 @@ Terminal: {}x{}",
     }
 
     prompt.push_str(
-        "\n\nOutput shell commands inside fenced code blocks (```). \
-         Put each command in its own code block. \
-         Explain what each command does outside the code blocks.",
+        "\n\nWhen you need to run commands, output them in fenced code blocks (```). \
+         Each code block will be executed and you will see the output. \
+         You may then run more commands or provide your final answer. \
+         When you are done, respond without any code blocks.",
     );
 
     prompt

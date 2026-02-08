@@ -36,10 +36,10 @@ via OSC 133 in bash and zsh.
 
 ---
 
-## Phase 2: SSE Backends + Config + Context Management — WIP
+## Phase 2: SSE Backends + Config + Context Management — DONE
 
 Anthropic adapter with SSE streaming. Config for API keys. Context window
-management. Plan display.
+management. Plan display. Agentic loop.
 
 | Sub-task | Status | Files |
 |----------|--------|-------|
@@ -56,13 +56,15 @@ management. Plan display.
 | Wire backend into REPL | DONE | `ua-core/src/repl.rs` |
 | **Auto-execute plan commands via PTY** | DONE | `ua-core/src/repl.rs` |
 | Silent shell integration injection (single-line eval + clear) | DONE | `ua-core/src/shell_scripts.rs` |
-| 93 unit tests pass, `make check` clean | DONE | |
+| **Agentic loop (execute → observe → iterate)** | DONE | `ua-core/src/repl.rs`, `ua-backend/src/anthropic.rs` |
+| 104 unit tests pass, `make check` clean | DONE | |
 
-**Exit criteria — partially met**:
+**Exit criteria met**:
 - `# what's in /tmp` → backend returns plan with `ls /tmp` ✅
 - Plan is displayed to the user ✅
 - Context stays within token limits across multiple turns ✅
 - Commands are auto-executed after displaying the plan ✅
+- Agentic loop: commands execute, output fed back, LLM iterates until done ✅
 
 ---
 
@@ -166,6 +168,17 @@ Child agents, policy inheritance, trace propagation, musl build, packaging.
 | ~~Plan commands not auto-executed~~ | ~~High~~ | FIXED — commands now written to PTY after plan display |
 | ~~Shell integration script echoed on startup~~ | ~~Low~~ | FIXED — temp file + source approach; script ends with `clear` to wipe the short source line |
 | ~~Double command display on multi-command plans~~ | ~~Medium~~ | FIXED — commands dispatched on 133;A arrived before ZLE/readline init causing canonical echo + ZLE re-echo. Fix: dispatch on 133;B (after prompt rendered, input ready). Zsh uses `zle-line-init` hook, bash embeds 133;B in PS1 |
+| No Ctrl+C / interrupt handling | **Critical** | SIGINT during streaming sits in MPSC buffer until `block_on` returns. No signal handler registered. Safety bug for auto-executing agent. See DESIGN.md §19.2.2 |
+| No approval gate — auto-executes with zero safety | **Critical** | Commands go straight from LLM to PTY. No deny patterns, no confirmation prompt, no policy check. See DESIGN.md §19.2.3 |
+| `block_on` blocks main event loop during streaming | **Critical** | User cannot interact (Ctrl+C, see output, etc.) while LLM streams. Need async REPL or spawned backend task. See DESIGN.md §19.2.1 |
+| Command queue ignores exit codes | High | `133;D` exit code not checked — queue dispatches next command unconditionally. See DESIGN.md §19.2.4 |
+| Conversation history grows unbounded | High | `Vec<ConversationMessage>` with no eviction — will blow context window after ~20 turns. See DESIGN.md §19.2.7 |
+| Shell integration sourcing unverified | Medium | No check that `source` succeeded; `clear` hack; temp file leak on panic. See DESIGN.md §19.2.5 |
+| `try_wait()` polled on every event | Medium | `waitpid(WNOHANG)` on every keystroke. Should use SIGCHLD. See DESIGN.md §19.2.6 |
+| Thread handles discarded (fire-and-forget) | Medium | stdin/PTY/resize threads not joined — panics swallowed silently. See DESIGN.md §19.2.8 |
+| `looks_like_secret()` insufficient | Medium | Misses AWS keys, JWTs, base64 tokens, SSH private keys. Needs comprehensive patterns or explicit opt-in. See DESIGN.md §19.2.9 |
+| SIGWINCH polled every 250ms | Low | Should use signal handler instead of polling thread. See DESIGN.md §19.2.10 |
+| No integration tests with real shells + OSC 133 | Medium | Only 1 PTY test with `/bin/sh` + echo. No bash/zsh/fish integration tests. See DESIGN.md §19.3 |
 
 ---
 
@@ -179,6 +192,7 @@ Child agents, policy inheritance, trace propagation, musl build, packaging.
 | Plain text + OSC 133 sequencing | 2026-02-08 | LLM outputs commands in fenced code blocks; commands executed one-at-a-time via OSC 133 prompt detection. Simpler than tool calls, more robust than blasting all commands at once |
 | Extended thinking enabled | 2026-02-08 | Anthropic API with thinking budget (10k tokens), API version 2023-06-01 |
 | Dispatch commands on 133;B not 133;A | 2026-02-08 | 133;A fires in precmd before prompt rendering/ZLE init; dispatching there causes double-echo. 133;B fires after prompt is ready (zle-line-init for zsh, PS1 embedded for bash) |
+| Agentic loop via inner event loop | 2026-02-08 | After commands execute, output is captured and fed back to LLM. Loop continues until LLM responds without code blocks or max 10 iterations. Inner loop reads from same mpsc channel, keeping event-driven model intact |
 | Approximate token counting (chars/4) | 2026-02-07 | Good enough for 200-line terminal history within 200k context window |
 | reqwest + rustls-tls | 2026-02-07 | No OpenSSL dependency, integrates with tokio |
 | Temp file + source for shell integration | 2026-02-07 | Writing scripts to PTY causes echo; temp file sourced via ` source /path` with `clear` at end |

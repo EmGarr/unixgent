@@ -22,6 +22,17 @@ enum Event {
     Resize(u16, u16),
 }
 
+/// Result of processing an OSC event through the command queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QueueEvent {
+    /// Send this command to the PTY.
+    Dispatch(String),
+    /// All queued commands have finished executing.
+    AllDone,
+    /// Nothing to do.
+    None,
+}
+
 /// Manages queued commands for OSC 133 sequenced execution.
 ///
 /// Commands are dispatched one at a time. After the first (immediate) dispatch,
@@ -32,6 +43,8 @@ enum Event {
 struct CommandQueue {
     commands: VecDeque<String>,
     awaiting_ready: bool,
+    /// True while commands are being executed (from enqueue until AllDone).
+    executing: bool,
 }
 
 impl CommandQueue {
@@ -39,12 +52,16 @@ impl CommandQueue {
         Self {
             commands: VecDeque::new(),
             awaiting_ready: false,
+            executing: false,
         }
     }
 
-    /// Queue commands for execution.
+    /// Queue commands for execution and mark as executing.
     fn enqueue(&mut self, commands: impl IntoIterator<Item = String>) {
         self.commands.extend(commands);
+        if !self.commands.is_empty() {
+            self.executing = true;
+        }
     }
 
     /// Pop the first command for immediate dispatch (shell is already at prompt).
@@ -52,27 +69,35 @@ impl CommandQueue {
         self.commands.pop_front()
     }
 
-    /// Process an OSC event. Returns a command to dispatch if the shell is ready.
+    /// Process an OSC event. Returns a `QueueEvent` indicating what to do.
     ///
-    /// - `133;A` (prompt start): sets awaiting flag, does NOT dispatch
-    /// - `133;B` (prompt ready): dispatches next command if awaiting
-    fn handle_osc_event(&mut self, event: &OscEvent) -> Option<String> {
+    /// - `133;A` (prompt start): when executing, ALWAYS sets awaiting_ready
+    ///   (even if queue is empty — this is how we detect last command done)
+    /// - `133;B` (prompt ready): dispatches next command, or signals AllDone
+    fn handle_osc_event(&mut self, event: &OscEvent) -> QueueEvent {
         match event {
             OscEvent::Osc133A => {
-                if !self.commands.is_empty() {
+                if self.executing {
                     self.awaiting_ready = true;
                 }
-                None
+                QueueEvent::None
             }
             OscEvent::Osc133B => {
                 if self.awaiting_ready {
                     self.awaiting_ready = false;
-                    self.commands.pop_front()
+                    match self.commands.pop_front() {
+                        Some(cmd) => QueueEvent::Dispatch(cmd),
+                        None => {
+                            // Queue empty + was executing = all done
+                            self.executing = false;
+                            QueueEvent::AllDone
+                        }
+                    }
                 } else {
-                    None
+                    QueueEvent::None
                 }
             }
-            _ => None,
+            _ => QueueEvent::None,
         }
     }
 
@@ -84,6 +109,7 @@ impl CommandQueue {
     fn clear(&mut self) {
         self.commands.clear();
         self.awaiting_ready = false;
+        self.executing = false;
     }
 }
 
@@ -167,7 +193,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
     let mut stdout = io::stdout().lock();
     let mut stderr = io::stderr();
 
-    for event in rx {
+    while let Ok(event) = rx.recv() {
         match event {
             Event::Stdin(data) => {
                 let mut handled_instruction = false;
@@ -204,7 +230,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                         // (removes the # instruction text from prompt)
                                         let _ = session.write_all(b"\x15");
 
-                                        // Extract commands and queue for execution
+                                        // Extract commands and start agentic loop
                                         if let Ok(Some((commands, response_text))) = result {
                                             conversation
                                                 .push(ConversationMessage::user(instruction));
@@ -212,23 +238,22 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                                 &response_text,
                                             ));
 
-                                            if !commands.is_empty() {
-                                                command_queue.enqueue(commands);
-
-                                                // Send the first command immediately
-                                                // (shell is already at prompt with ZLE ready)
-                                                if let Some(cmd) = command_queue.pop_immediate() {
-                                                    let cmd = format!("{cmd}\n");
-                                                    if let Err(e) =
-                                                        session.write_all(cmd.as_bytes())
-                                                    {
-                                                        let _ = writeln!(
-                                                            stderr,
-                                                            "\r\n[ua] pty write error: {e}"
-                                                        );
-                                                    }
-                                                }
-                                            }
+                                            run_agentic_loop(
+                                                commands,
+                                                &mut session,
+                                                &mut parser,
+                                                &mut command_queue,
+                                                &mut output_history,
+                                                &mut conversation,
+                                                &mut line_buf,
+                                                &mut terminal_size,
+                                                &rx,
+                                                &mut stdout,
+                                                &mut stderr,
+                                                rt_handle,
+                                                config,
+                                                debug_osc,
+                                            )?;
                                         }
                                     }
                                 }
@@ -310,12 +335,15 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
 
                     // OSC 133 sequencing: dispatch next command on 133;B
                     // (prompt rendered, ZLE/readline ready — no double-echo)
-                    if let Some(cmd) = command_queue.handle_osc_event(evt) {
-                        let cmd = format!("{cmd}\n");
-                        if let Err(e) = session.write_all(cmd.as_bytes()) {
-                            let _ = writeln!(stderr, "\r\n[ua] pty write error: {e}");
-                            command_queue.clear();
+                    match command_queue.handle_osc_event(evt) {
+                        QueueEvent::Dispatch(cmd) => {
+                            let cmd = format!("{cmd}\n");
+                            if let Err(e) = session.write_all(cmd.as_bytes()) {
+                                let _ = writeln!(stderr, "\r\n[ua] pty write error: {e}");
+                                command_queue.clear();
+                            }
                         }
+                        QueueEvent::AllDone | QueueEvent::None => {}
                     }
                 }
             }
@@ -337,6 +365,159 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
             }
             break;
         }
+    }
+
+    Ok(())
+}
+
+/// Maximum number of agentic loop iterations before stopping.
+const MAX_AGENT_ITERATIONS: usize = 10;
+
+/// Run the agentic loop: execute commands, observe output, call LLM again.
+///
+/// Continues until the LLM responds without code blocks or max iterations reached.
+#[allow(clippy::too_many_arguments)]
+fn run_agentic_loop(
+    initial_commands: Vec<String>,
+    session: &mut PtySession,
+    parser: &mut OscParser,
+    command_queue: &mut CommandQueue,
+    output_history: &mut OutputHistory,
+    conversation: &mut Vec<ConversationMessage>,
+    line_buf: &mut String,
+    terminal_size: &mut (u16, u16),
+    rx: &mpsc::Receiver<Event>,
+    stdout: &mut io::StdoutLock<'_>,
+    stderr: &mut io::Stderr,
+    rt_handle: &Handle,
+    config: &Config,
+    debug_osc: bool,
+) -> io::Result<()> {
+    let mut current_commands = initial_commands;
+    let mut iteration = 0;
+
+    while !current_commands.is_empty() && iteration < MAX_AGENT_ITERATIONS {
+        iteration += 1;
+
+        if iteration > 1 {
+            let _ = writeln!(
+                stderr,
+                "\r[ua] running commands ({iteration}/{MAX_AGENT_ITERATIONS})..."
+            );
+        }
+
+        // Queue + dispatch first command
+        command_queue.enqueue(current_commands);
+        if let Some(cmd) = command_queue.pop_immediate() {
+            let cmd = format!("{cmd}\n");
+            if let Err(e) = session.write_all(cmd.as_bytes()) {
+                let _ = writeln!(stderr, "\r\n[ua] pty write error: {e}");
+                command_queue.clear();
+                return Ok(());
+            }
+        }
+
+        // Inner event loop: process events until AllDone
+        let mut capture = OutputHistory::new(200);
+        let mut pty_eof = false;
+
+        'commands: loop {
+            match rx.recv() {
+                Ok(Event::PtyOutput(data)) => {
+                    stdout.write_all(&data)?;
+                    stdout.flush()?;
+                    output_history.feed(&data);
+                    capture.feed(&data);
+
+                    let events = parser.feed_bytes(&data);
+                    if debug_osc {
+                        for evt in &events {
+                            let _ = writeln!(
+                                stderr,
+                                "\r[ua:osc] {evt:?} -> state={:?}",
+                                parser.terminal_state
+                            );
+                        }
+                    }
+
+                    for evt in &events {
+                        if *evt == OscEvent::Osc133A {
+                            line_buf.clear();
+                        }
+                        match command_queue.handle_osc_event(evt) {
+                            QueueEvent::Dispatch(cmd) => {
+                                let cmd = format!("{cmd}\n");
+                                if let Err(e) = session.write_all(cmd.as_bytes()) {
+                                    let _ = writeln!(stderr, "\r\n[ua] pty write error: {e}");
+                                    command_queue.clear();
+                                    break 'commands;
+                                }
+                            }
+                            QueueEvent::AllDone => break 'commands,
+                            QueueEvent::None => {}
+                        }
+                    }
+                }
+                Ok(Event::Resize(cols, rows)) => {
+                    *terminal_size = (cols, rows);
+                    if let Err(e) = session.resize(cols, rows) {
+                        if debug_osc {
+                            let _ = writeln!(stderr, "\r[ua] resize error: {e}");
+                        }
+                    }
+                }
+                Ok(Event::Stdin(data)) => {
+                    // Forward to PTY (user may need to interact with commands)
+                    let _ = session.write_all(&data);
+                }
+                Ok(Event::PtyEof) | Err(_) => {
+                    pty_eof = true;
+                    break 'commands;
+                }
+            }
+        }
+
+        if pty_eof {
+            break;
+        }
+
+        // Build observation from captured output
+        let captured_lines = capture.lines();
+        if captured_lines.is_empty() {
+            break;
+        }
+
+        let observation = format!("Command output:\n\n{}\n", captured_lines.join("\n"));
+        conversation.push(ConversationMessage::user(&observation));
+
+        // Clear readline before next LLM call
+        let _ = session.write_all(b"\x15");
+
+        // Call LLM again
+        let result = handle_instruction(
+            rt_handle,
+            config,
+            &observation,
+            output_history,
+            conversation,
+            *terminal_size,
+            stderr,
+        );
+
+        match result {
+            Ok(Some((new_commands, new_response))) => {
+                conversation.push(ConversationMessage::assistant(&new_response));
+                current_commands = new_commands;
+            }
+            _ => break,
+        }
+    }
+
+    if iteration >= MAX_AGENT_ITERATIONS {
+        let _ = writeln!(
+            stderr,
+            "\r[ua] max iterations ({MAX_AGENT_ITERATIONS}) reached"
+        );
     }
 
     Ok(())
@@ -567,7 +748,7 @@ mod tests {
         queue.enqueue(vec!["pwd".to_string()]);
 
         let result = queue.handle_osc_event(&OscEvent::Osc133A);
-        assert_eq!(result, None);
+        assert_eq!(result, QueueEvent::None);
         assert!(queue.awaiting_ready);
     }
 
@@ -578,7 +759,7 @@ mod tests {
 
         queue.handle_osc_event(&OscEvent::Osc133A);
         let result = queue.handle_osc_event(&OscEvent::Osc133B);
-        assert_eq!(result, Some("pwd".to_string()));
+        assert_eq!(result, QueueEvent::Dispatch("pwd".to_string()));
         assert!(!queue.awaiting_ready);
     }
 
@@ -597,24 +778,24 @@ mod tests {
         // cmd1 finishes → 133;D, 133;A (prompt start), then 133;B (prompt ready)
         assert_eq!(
             queue.handle_osc_event(&OscEvent::Osc133D { exit_code: Some(0) }),
-            None
+            QueueEvent::None
         );
-        assert_eq!(queue.handle_osc_event(&OscEvent::Osc133A), None);
+        assert_eq!(queue.handle_osc_event(&OscEvent::Osc133A), QueueEvent::None);
         assert!(queue.awaiting_ready);
         assert_eq!(
             queue.handle_osc_event(&OscEvent::Osc133B),
-            Some("cmd2".to_string())
+            QueueEvent::Dispatch("cmd2".to_string())
         );
 
         // cmd2 finishes → same cycle
         assert_eq!(
             queue.handle_osc_event(&OscEvent::Osc133D { exit_code: Some(0) }),
-            None
+            QueueEvent::None
         );
-        assert_eq!(queue.handle_osc_event(&OscEvent::Osc133A), None);
+        assert_eq!(queue.handle_osc_event(&OscEvent::Osc133A), QueueEvent::None);
         assert_eq!(
             queue.handle_osc_event(&OscEvent::Osc133B),
-            Some("cmd3".to_string())
+            QueueEvent::Dispatch("cmd3".to_string())
         );
 
         // No more commands
@@ -628,7 +809,7 @@ mod tests {
 
         // 133;B without preceding 133;A should not dispatch
         let result = queue.handle_osc_event(&OscEvent::Osc133B);
-        assert_eq!(result, None);
+        assert_eq!(result, QueueEvent::None);
         assert!(!queue.is_empty());
     }
 
@@ -636,10 +817,10 @@ mod tests {
     fn command_queue_empty_is_noop() {
         let mut queue = CommandQueue::new();
 
-        // All events are no-ops when queue is empty
-        assert_eq!(queue.handle_osc_event(&OscEvent::Osc133A), None);
+        // All events are no-ops when queue is empty (not executing)
+        assert_eq!(queue.handle_osc_event(&OscEvent::Osc133A), QueueEvent::None);
         assert!(!queue.awaiting_ready);
-        assert_eq!(queue.handle_osc_event(&OscEvent::Osc133B), None);
+        assert_eq!(queue.handle_osc_event(&OscEvent::Osc133B), QueueEvent::None);
     }
 
     #[test]
@@ -651,6 +832,7 @@ mod tests {
         queue.clear();
         assert!(queue.is_empty());
         assert!(!queue.awaiting_ready);
+        assert!(!queue.executing);
     }
 
     #[test]
@@ -660,12 +842,79 @@ mod tests {
         queue.handle_osc_event(&OscEvent::Osc133A);
 
         // 133;C and 133;D should not dispatch
-        assert_eq!(queue.handle_osc_event(&OscEvent::Osc133C), None);
+        assert_eq!(queue.handle_osc_event(&OscEvent::Osc133C), QueueEvent::None);
         assert_eq!(
             queue.handle_osc_event(&OscEvent::Osc133D { exit_code: Some(0) }),
-            None
+            QueueEvent::None
         );
         assert!(queue.awaiting_ready); // Still waiting for 133;B
+    }
+
+    #[test]
+    fn command_queue_single_command_all_done() {
+        let mut queue = CommandQueue::new();
+        queue.enqueue(vec!["ls".to_string()]);
+        assert!(queue.executing);
+
+        // First command dispatched immediately
+        assert_eq!(queue.pop_immediate(), Some("ls".to_string()));
+
+        // ls finishes → 133;D, 133;A, 133;B → AllDone (queue empty)
+        assert_eq!(
+            queue.handle_osc_event(&OscEvent::Osc133D { exit_code: Some(0) }),
+            QueueEvent::None
+        );
+        assert_eq!(queue.handle_osc_event(&OscEvent::Osc133A), QueueEvent::None);
+        assert!(queue.awaiting_ready); // executing=true, so 133;A sets awaiting
+        assert_eq!(
+            queue.handle_osc_event(&OscEvent::Osc133B),
+            QueueEvent::AllDone
+        );
+    }
+
+    #[test]
+    fn command_queue_multi_command_all_done() {
+        let mut queue = CommandQueue::new();
+        queue.enqueue(vec!["cmd1".to_string(), "cmd2".to_string()]);
+
+        // First command dispatched immediately
+        assert_eq!(queue.pop_immediate(), Some("cmd1".to_string()));
+
+        // cmd1 finishes → dispatches cmd2
+        queue.handle_osc_event(&OscEvent::Osc133D { exit_code: Some(0) });
+        queue.handle_osc_event(&OscEvent::Osc133A);
+        assert_eq!(
+            queue.handle_osc_event(&OscEvent::Osc133B),
+            QueueEvent::Dispatch("cmd2".to_string())
+        );
+
+        // cmd2 finishes → AllDone
+        queue.handle_osc_event(&OscEvent::Osc133D { exit_code: Some(0) });
+        queue.handle_osc_event(&OscEvent::Osc133A);
+        assert_eq!(
+            queue.handle_osc_event(&OscEvent::Osc133B),
+            QueueEvent::AllDone
+        );
+    }
+
+    #[test]
+    fn command_queue_all_done_resets_executing() {
+        let mut queue = CommandQueue::new();
+        queue.enqueue(vec!["ls".to_string()]);
+        assert!(queue.executing);
+
+        queue.pop_immediate();
+
+        // ls finishes → AllDone
+        queue.handle_osc_event(&OscEvent::Osc133D { exit_code: Some(0) });
+        queue.handle_osc_event(&OscEvent::Osc133A);
+        queue.handle_osc_event(&OscEvent::Osc133B);
+
+        assert!(!queue.executing);
+
+        // Subsequent 133;A should NOT set awaiting_ready (not executing)
+        queue.handle_osc_event(&OscEvent::Osc133A);
+        assert!(!queue.awaiting_ready);
     }
 
     // --- End-to-end tests: mock StreamEvent deltas → commands → dispatch ---
@@ -743,10 +992,10 @@ mod tests {
         );
 
         // Second command waits for 133;A (prompt start) then 133;B (prompt ready)
-        assert_eq!(queue.handle_osc_event(&OscEvent::Osc133A), None);
+        assert_eq!(queue.handle_osc_event(&OscEvent::Osc133A), QueueEvent::None);
         assert_eq!(
             queue.handle_osc_event(&OscEvent::Osc133B),
-            Some("ls -la /tmp/test.txt".to_string())
+            QueueEvent::Dispatch("ls -la /tmp/test.txt".to_string())
         );
 
         assert!(queue.is_empty());
