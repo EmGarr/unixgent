@@ -6,7 +6,22 @@ UnixAgent is an AI-powered Unix shell agent. It connects to LLM backends
 (Anthropic Claude, etc.) and executes shell commands on the user's behalf
 through a PTY-based terminal session.
 
-**Current state:** Phase 1 — workspace scaffold complete, no functional code yet.
+**Current state:** Phase 2 — SSE backends + context management implemented,
+plan auto-execution not yet wired.
+
+## PLAN.md — Living Implementation Tracker
+
+**`PLAN.md` is the single source of truth for implementation progress.**
+It must be kept up to date at all times.
+
+Rules:
+1. **Update PLAN.md** whenever you start, finish, or change a task.
+2. **Never remove completed items.** Mark them DONE, don't delete them.
+3. **If something looks stale or contradicts the code**, ask the user
+   before modifying or removing it. Do not silently "fix" the plan.
+4. **Add new issues/bugs** to the "Known Issues" table as you find them.
+5. **Add architecture decisions** to the "Architecture Decisions Log"
+   when making non-obvious choices.
 
 ## Build / Test / Lint
 
@@ -29,15 +44,20 @@ make docker-test    # build + test + clippy inside Debian Bookworm
 ### Running the binary
 
 ```bash
+export ANTHROPIC_API_KEY=$(security find-generic-password -s "anthropic_api_key" -w)
 cargo run -p ua-core
 ```
 
 ## API Key Setup
 
-Not needed yet. When Phase 2 begins:
-
 ```bash
+# Option 1: env var
 export ANTHROPIC_API_KEY="sk-ant-..."
+
+# Option 2: config.toml (recommended)
+# In ~/.config/unixagent/config.toml:
+# [backend.anthropic]
+# api_key_cmd = "security find-generic-password -s anthropic_api_key -w"
 ```
 
 ## Docker Workflow
@@ -62,6 +82,30 @@ ua-core → ua-backend → ua-protocol
       └───────────────┘
 ```
 
+### Key modules
+
+```
+ua-protocol/src/
+  context.rs       ShellContext, TerminalHistory, ConversationMessage, AgentRequest
+  message.rs       Plan, PlanStep, StreamEvent
+
+ua-backend/src/
+  sse.rs           Generic SSE stream parser
+  anthropic.rs     Anthropic API client with SSE + tool use
+  mock.rs          Mock provider for testing (SSE-level)
+
+ua-core/src/
+  main.rs          Entry point, CLI args, tokio runtime
+  repl.rs          REPL loop with # detection + backend calls
+  pty.rs           PTY session management
+  osc.rs           OSC 133 parser + terminal state machine
+  config.rs        Config loading (shell, backend, context)
+  context.rs       OutputHistory ring buffer, ANSI stripping, context assembly
+  display/mod.rs   PlanDisplay TUI component
+  display/testing.rs  TestTui harness for TUI tests
+  shell_scripts.rs    Shell integration scripts (bash/zsh/fish)
+```
+
 ## Dependency Strategy
 
 Self-contained workspace. No path dependencies on external projects.
@@ -76,15 +120,7 @@ Reference (not copy) patterns from `~/Documents/programming/zen-cli/` when neede
 
 1. **Commit often.** Small, focused commits.
 2. **Test always.** Run `make check` before committing.
-3. **Update CLAUDE.md** when adding crates, commands, or changing architecture.
-4. **No dead code.** If it's unused, delete it.
-5. **No over-engineering.** Build what's needed now.
-
-## Current Phase
-
-**Phase 1: PTY Wrapper + REPL** — not started.
-
-Next steps:
-- Implement PTY session management in ua-core
-- Build a basic REPL loop
-- Add integration tests for shell interaction
+3. **Update PLAN.md** when starting, finishing, or changing any task.
+4. **Update CLAUDE.md** when adding crates, commands, or changing architecture.
+5. **No dead code.** If it's unused, delete it.
+6. **No over-engineering.** Build what's needed now.

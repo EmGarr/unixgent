@@ -1,0 +1,182 @@
+# UnixAgent — Implementation Plan
+
+**Last updated**: 2026-02-07
+
+This document tracks the implementation status of every phase and sub-task.
+It is the single source of truth for "where are we at". See DESIGN.md for
+the full technical spec.
+
+**Convention**:
+- **DONE** — shipped, tested, merged
+- **WIP** — actively in progress
+- **TODO** — not started yet
+- **BLOCKED** — waiting on something (noted inline)
+
+---
+
+## Phase 1: PTY Wrapper + REPL — DONE
+
+Spawn child shell in PTY, proxy all I/O, inject OSC 133 shell integration,
+intercept `#` lines at the prompt.
+
+| Sub-task | Status | Files |
+|----------|--------|-------|
+| Workspace scaffold | DONE | `Cargo.toml`, crate layout |
+| PTY session management | DONE | `ua-core/src/pty.rs` |
+| OSC 133 parser + terminal state machine | DONE | `ua-core/src/osc.rs` |
+| Shell integration scripts (bash/zsh/fish) | DONE | `ua-core/src/shell_scripts.rs` |
+| REPL loop with `#` detection | DONE | `ua-core/src/repl.rs` |
+| Config file loading | DONE | `ua-core/src/config.rs` |
+| CLI args + main entry point | DONE | `ua-core/src/main.rs` |
+| `make check` passes | DONE | |
+
+**Exit criteria met**: Shell commands work normally. `#` instructions are
+captured only at the prompt (not in heredocs, REPLs). Prompt detection works
+via OSC 133 in bash and zsh.
+
+---
+
+## Phase 2: SSE Backends + Config + Context Management — WIP
+
+Anthropic adapter with SSE streaming. Config for API keys. Context window
+management. Plan display.
+
+| Sub-task | Status | Files |
+|----------|--------|-------|
+| Add workspace deps (reqwest, bytes, async-stream, ratatui) | DONE | `Cargo.toml`, crate Cargo.tomls |
+| Protocol types (context, message) | DONE | `ua-protocol/src/context.rs`, `ua-protocol/src/message.rs` |
+| SSE stream parser | DONE | `ua-backend/src/sse.rs` |
+| Mock provider + test fixtures | DONE | `ua-backend/src/mock.rs` |
+| Anthropic SSE adapter | DONE | `ua-backend/src/anthropic.rs` |
+| Config: BackendConfig, AnthropicConfig, ContextConfig | DONE | `ua-core/src/config.rs` |
+| Context capture (OutputHistory, ANSI stripping, env filter) | DONE | `ua-core/src/context.rs` |
+| PlanDisplay TUI component | DONE | `ua-core/src/display/mod.rs` |
+| TestTui harness | DONE | `ua-core/src/display/testing.rs` |
+| Tokio runtime in main.rs | DONE | `ua-core/src/main.rs` |
+| Wire backend into REPL | DONE | `ua-core/src/repl.rs` |
+| **Auto-execute plan commands via PTY** | DONE | `ua-core/src/repl.rs` |
+| Silent shell integration injection (single-line eval + clear) | DONE | `ua-core/src/shell_scripts.rs` |
+| 93 unit tests pass, `make check` clean | DONE | |
+
+**Exit criteria — partially met**:
+- `# what's in /tmp` → backend returns plan with `ls /tmp` ✅
+- Plan is displayed to the user ✅
+- Context stays within token limits across multiple turns ✅
+- Commands are auto-executed after displaying the plan ✅
+
+---
+
+## Phase 3: Second Backend + Common Interface — TODO
+
+OpenAI adapter. Extract common backend trait from what the two adapters
+actually share. Subprocess adapter for ollama.
+
+| Sub-task | Status | Files |
+|----------|--------|-------|
+| OpenAI SSE adapter | TODO | `ua-backend/src/openai.rs` |
+| Extract Backend trait | TODO | `ua-backend/src/lib.rs` |
+| Subprocess adapter (ollama) | TODO | `ua-backend/src/subprocess.rs` |
+| Backend selection in config | TODO | |
+
+**Exit criteria**: Can switch between Anthropic, OpenAI, and ollama.
+Backend interface is clean and minimal.
+
+---
+
+## Phase 4: Policy Engine + Hooks — TODO
+
+Parse `policy.toml`. Pre-exec hook runner. Command allow/deny.
+
+| Sub-task | Status | Files |
+|----------|--------|-------|
+| Policy file parsing | TODO | `ua-core/src/policy.rs` |
+| Deny pattern matching | TODO | |
+| Hook runner (pre/post exec) | TODO | `ua-core/src/hooks.rs` |
+| Audit log writer | TODO | `ua-core/src/audit.rs` |
+
+**Exit criteria**: Hook denies `curl` → agent command blocked.
+Policy deny patterns work.
+
+---
+
+## Phase 5: Agent Mode TUI + Interactive Approval — TODO
+
+Full agent loop: context → backend → plan stream → agent mode TUI →
+interactive approval/steering → execute. Multi-turn conversation.
+
+This is the big one — the TUI overlay described in DESIGN.md §2.4.
+
+| Sub-task | Status | Files |
+|----------|--------|-------|
+| Agent mode TUI overlay | TODO | `ua-core/src/display/` |
+| Plan approval controls ([a] Allow, [s] Step, [d] Deny, [e] Edit) | TODO | |
+| Step-through execution with inline output | TODO | |
+| Inline steering (`# new instruction` mid-plan) | TODO | |
+| Stream output mode (TTY vs NDJSON) | TODO | `ua-core/src/stream.rs` |
+
+**Exit criteria**: Complete interactive session works end-to-end. User can
+step through plans, edit commands, steer with inline `#` instructions.
+
+---
+
+## Phase 6: Vision — TODO
+
+Screen capture and accessibility API integration.
+
+| Sub-task | Status | Files |
+|----------|--------|-------|
+| macOS screencapture | TODO | `ua-core/src/vision.rs` |
+| macOS Accessibility API | TODO | |
+| Linux X11/Wayland screenshots | TODO | |
+| Linux AT-SPI2 | TODO | |
+| OCR | TODO | |
+
+**Exit criteria**: `# what's on screen` → agent describes visible windows.
+
+---
+
+## Phase 7: Audio — TODO
+
+Microphone, system audio, speech-to-text.
+
+**Exit criteria**: User speaks instruction → agent transcribes and executes.
+
+---
+
+## Phase 8: UI Interaction — TODO
+
+Input synthesis, window management, clipboard, accessibility-targeted actions.
+
+**Exit criteria**: `# close the Firefox tab playing music` → agent does it.
+
+---
+
+## Phase 9: Agent Spawning + Telemetry + Static Binary — TODO
+
+Child agents, policy inheritance, trace propagation, musl build, packaging.
+
+**Exit criteria**: Parent spawns child over SSH, trace links them. Static binary ships.
+
+---
+
+## Known Issues / Bugs
+
+| Issue | Severity | Notes |
+|-------|----------|-------|
+| ~~Plan commands not auto-executed~~ | ~~High~~ | FIXED — commands now written to PTY after plan display |
+| ~~Shell integration script echoed on startup~~ | ~~Low~~ | FIXED — temp file + source approach; script ends with `clear` to wipe the short source line |
+
+---
+
+## Architecture Decisions Log
+
+| Decision | Date | Rationale |
+|----------|------|-----------|
+| Sync/async bridge via `block_on` | 2026-02-07 | PTY reader and stdin threads continue buffering into mpsc channel while async backend call runs |
+| No backend trait yet | 2026-02-07 | Per DESIGN.md §4.5 — extract common interface in Phase 3 after second backend exists |
+| ~~Tool use for structured plans~~ | ~~2026-02-07~~ | ~~Replaced by plain text + OSC 133 sequencing~~ |
+| Plain text + OSC 133 sequencing | 2026-02-08 | LLM outputs commands in fenced code blocks; commands executed one-at-a-time via OSC 133 prompt detection. Simpler than tool calls, more robust than blasting all commands at once |
+| Extended thinking enabled | 2026-02-08 | Anthropic API with thinking budget (10k tokens), API version 2025-04-15 |
+| Approximate token counting (chars/4) | 2026-02-07 | Good enough for 200-line terminal history within 200k context window |
+| reqwest + rustls-tls | 2026-02-07 | No OpenSSL dependency, integrates with tokio |
+| Temp file + source for shell integration | 2026-02-07 | Writing scripts to PTY causes echo; temp file sourced via ` source /path` with `clear` at end |

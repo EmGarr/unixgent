@@ -3,10 +3,9 @@
 //! This crate provides a unified interface for communicating with LLM APIs
 //! (Anthropic, OpenAI, etc.) using streaming responses.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn backend_placeholder() {
-        assert!(true);
-    }
-}
+pub mod anthropic;
+pub mod mock;
+pub mod sse;
+
+pub use anthropic::AnthropicClient;
+pub use mock::{MockConfig, MockResponse};

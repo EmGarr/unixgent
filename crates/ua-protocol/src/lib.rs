@@ -3,10 +3,8 @@
 //! This crate defines the protocol types used between the core agent,
 //! LLM backends, and any future frontends.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn protocol_placeholder() {
-        assert!(true);
-    }
-}
+pub mod context;
+pub mod message;
+
+pub use context::{AgentRequest, ConversationMessage, Role, ShellContext, TerminalHistory};
+pub use message::StreamEvent;
