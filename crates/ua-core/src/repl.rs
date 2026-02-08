@@ -65,6 +65,8 @@ enum QueueEvent {
     Dispatch(String),
     /// All queued commands have finished executing.
     AllDone,
+    /// A command failed with a non-zero exit code. Queue is cleared.
+    Failed(i32),
     /// Nothing to do.
     None,
 }
@@ -81,6 +83,8 @@ struct CommandQueue {
     awaiting_ready: bool,
     /// True while commands are being executed (from enqueue until AllDone).
     executing: bool,
+    /// Exit code from the most recent 133;D event.
+    last_exit_code: Option<i32>,
 }
 
 impl CommandQueue {
@@ -89,6 +93,7 @@ impl CommandQueue {
             commands: VecDeque::new(),
             awaiting_ready: false,
             executing: false,
+            last_exit_code: None,
         }
     }
 
@@ -107,11 +112,17 @@ impl CommandQueue {
 
     /// Process an OSC event. Returns a `QueueEvent` indicating what to do.
     ///
+    /// - `133;D` (command done): stores exit code
     /// - `133;A` (prompt start): when executing, ALWAYS sets awaiting_ready
     ///   (even if queue is empty — this is how we detect last command done)
-    /// - `133;B` (prompt ready): dispatches next command, or signals AllDone
+    /// - `133;B` (prompt ready): checks exit code — if non-zero, clears queue
+    ///   and returns Failed; otherwise dispatches next command or signals AllDone
     fn handle_osc_event(&mut self, event: &OscEvent) -> QueueEvent {
         match event {
+            OscEvent::Osc133D { exit_code } => {
+                self.last_exit_code = *exit_code;
+                QueueEvent::None
+            }
             OscEvent::Osc133A => {
                 if self.executing {
                     self.awaiting_ready = true;
@@ -121,6 +132,21 @@ impl CommandQueue {
             OscEvent::Osc133B => {
                 if self.awaiting_ready {
                     self.awaiting_ready = false;
+
+                    // Check if last command failed
+                    if let Some(code) = self.last_exit_code {
+                        if code != 0 {
+                            let remaining = self.commands.len();
+                            self.clear();
+                            if remaining > 0 {
+                                return QueueEvent::Failed(code);
+                            }
+                            // Last command failed but queue was already empty —
+                            // treat as AllDone (the caller sees the failure in output)
+                            return QueueEvent::AllDone;
+                        }
+                    }
+
                     match self.commands.pop_front() {
                         Some(cmd) => QueueEvent::Dispatch(cmd),
                         None => {
@@ -146,6 +172,7 @@ impl CommandQueue {
         self.commands.clear();
         self.awaiting_ready = false;
         self.executing = false;
+        self.last_exit_code = None;
     }
 }
 
@@ -467,6 +494,12 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                             }
                             conversation.push(ConversationMessage::assistant(&response_text));
 
+                            // Evict oldest turns if over limit
+                            let max = config.context.max_conversation_turns;
+                            if conversation.len() > max {
+                                conversation.drain(..conversation.len() - max);
+                            }
+
                             if commands.is_empty() {
                                 // No commands — done
                                 state = AgentState::Idle;
@@ -579,6 +612,13 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                 }
                                 // else: no output or max iterations — stay Idle
                             }
+                        }
+                        QueueEvent::Failed(code) => {
+                            let _ = writeln!(
+                                stderr,
+                                "\r[ua] command failed (exit code {code}), stopping"
+                            );
+                            state = AgentState::Idle;
                         }
                         QueueEvent::None => {}
                     }
@@ -961,6 +1001,66 @@ mod tests {
         // Subsequent 133;A should NOT set awaiting_ready (not executing)
         queue.handle_osc_event(&OscEvent::Osc133A);
         assert!(!queue.awaiting_ready);
+    }
+
+    #[test]
+    fn command_queue_failed_exit_code_stops_queue() {
+        let mut queue = CommandQueue::new();
+        queue.enqueue(vec![
+            "cmd1".to_string(),
+            "cmd2".to_string(),
+            "cmd3".to_string(),
+        ]);
+
+        // First command dispatched immediately
+        assert_eq!(queue.pop_immediate(), Some("cmd1".to_string()));
+
+        // cmd1 fails with exit code 1
+        queue.handle_osc_event(&OscEvent::Osc133D { exit_code: Some(1) });
+        queue.handle_osc_event(&OscEvent::Osc133A);
+        assert_eq!(
+            queue.handle_osc_event(&OscEvent::Osc133B),
+            QueueEvent::Failed(1)
+        );
+
+        // Queue should be cleared
+        assert!(queue.is_empty());
+        assert!(!queue.executing);
+    }
+
+    #[test]
+    fn command_queue_last_command_fails_is_all_done() {
+        let mut queue = CommandQueue::new();
+        queue.enqueue(vec!["only_cmd".to_string()]);
+
+        // Dispatch the only command
+        assert_eq!(queue.pop_immediate(), Some("only_cmd".to_string()));
+
+        // Command fails — but queue is already empty, so AllDone (not Failed)
+        queue.handle_osc_event(&OscEvent::Osc133D {
+            exit_code: Some(127),
+        });
+        queue.handle_osc_event(&OscEvent::Osc133A);
+        assert_eq!(
+            queue.handle_osc_event(&OscEvent::Osc133B),
+            QueueEvent::AllDone
+        );
+    }
+
+    #[test]
+    fn command_queue_success_continues() {
+        let mut queue = CommandQueue::new();
+        queue.enqueue(vec!["cmd1".to_string(), "cmd2".to_string()]);
+
+        assert_eq!(queue.pop_immediate(), Some("cmd1".to_string()));
+
+        // cmd1 succeeds
+        queue.handle_osc_event(&OscEvent::Osc133D { exit_code: Some(0) });
+        queue.handle_osc_event(&OscEvent::Osc133A);
+        assert_eq!(
+            queue.handle_osc_event(&OscEvent::Osc133B),
+            QueueEvent::Dispatch("cmd2".to_string())
+        );
     }
 
     // --- End-to-end tests: mock StreamEvent deltas → commands → dispatch ---

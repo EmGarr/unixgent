@@ -312,6 +312,7 @@ mod tests {
     fn collect_env_vars_filters_sensitive() {
         let config = ContextConfig {
             max_terminal_lines: 100,
+            max_conversation_turns: 20,
             include_env: vec![
                 "PATH".to_string(),
                 "HOME".to_string(),

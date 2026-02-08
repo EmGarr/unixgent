@@ -94,6 +94,8 @@ impl AnthropicConfig {
 pub struct ContextConfig {
     /// Maximum number of terminal output lines to include in context.
     pub max_terminal_lines: usize,
+    /// Maximum number of conversation turns to keep before evicting oldest.
+    pub max_conversation_turns: usize,
     /// Environment variables to include in context.
     pub include_env: Vec<String>,
 }
@@ -102,6 +104,7 @@ impl Default for ContextConfig {
     fn default() -> Self {
         Self {
             max_terminal_lines: 200,
+            max_conversation_turns: 20,
             include_env: vec![
                 "PATH".to_string(),
                 "HOME".to_string(),
