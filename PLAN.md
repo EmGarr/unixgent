@@ -165,6 +165,7 @@ Child agents, policy inheritance, trace propagation, musl build, packaging.
 |-------|----------|-------|
 | ~~Plan commands not auto-executed~~ | ~~High~~ | FIXED — commands now written to PTY after plan display |
 | ~~Shell integration script echoed on startup~~ | ~~Low~~ | FIXED — temp file + source approach; script ends with `clear` to wipe the short source line |
+| ~~Double command display on multi-command plans~~ | ~~Medium~~ | FIXED — commands dispatched on 133;A arrived before ZLE/readline init causing canonical echo + ZLE re-echo. Fix: dispatch on 133;B (after prompt rendered, input ready). Zsh uses `zle-line-init` hook, bash embeds 133;B in PS1 |
 
 ---
 
@@ -176,7 +177,8 @@ Child agents, policy inheritance, trace propagation, musl build, packaging.
 | No backend trait yet | 2026-02-07 | Per DESIGN.md §4.5 — extract common interface in Phase 3 after second backend exists |
 | ~~Tool use for structured plans~~ | ~~2026-02-07~~ | ~~Replaced by plain text + OSC 133 sequencing~~ |
 | Plain text + OSC 133 sequencing | 2026-02-08 | LLM outputs commands in fenced code blocks; commands executed one-at-a-time via OSC 133 prompt detection. Simpler than tool calls, more robust than blasting all commands at once |
-| Extended thinking enabled | 2026-02-08 | Anthropic API with thinking budget (10k tokens), API version 2025-04-15 |
+| Extended thinking enabled | 2026-02-08 | Anthropic API with thinking budget (10k tokens), API version 2023-06-01 |
+| Dispatch commands on 133;B not 133;A | 2026-02-08 | 133;A fires in precmd before prompt rendering/ZLE init; dispatching there causes double-echo. 133;B fires after prompt is ready (zle-line-init for zsh, PS1 embedded for bash) |
 | Approximate token counting (chars/4) | 2026-02-07 | Good enough for 200-line terminal history within 200k context window |
 | reqwest + rustls-tls | 2026-02-07 | No OpenSSL dependency, integrates with tokio |
 | Temp file + source for shell integration | 2026-02-07 | Writing scripts to PTY causes echo; temp file sourced via ` source /path` with `clear` at end |

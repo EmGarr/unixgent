@@ -51,6 +51,13 @@ __ua_prompt_command() {
 }
 [[ "${PROMPT_COMMAND[*]}" =~ __ua_prompt_command ]] || PROMPT_COMMAND=("__ua_prompt_command" "${PROMPT_COMMAND[@]}")
 
+# Append 133;B to PS1 to mark end of prompt (start of user input).
+# This fires after PS1 is rendered and readline is ready for input.
+case "$PS1" in
+    *'133;B'*) ;;
+    *) PS1="${PS1}\[\e]133;B\a\]" ;;
+esac
+
 __ua_debug_trap() {
     [[ "$BASH_COMMAND" != "__ua_prompt_command" ]] && printf '\x1b]133;C\x07'
 }
@@ -65,9 +72,15 @@ __ua_precmd() {
     printf '\x1b]133;A\x07'
 }
 __ua_preexec() {
-    printf '\x1b]133;B\x07'
     printf '\x1b]133;C\x07'
 }
+# Emit 133;B after prompt is rendered and ZLE is initialized.
+# This ensures injected commands arrive when the terminal is in raw mode,
+# preventing double-echo from canonical mode.
+__ua_zle_line_init() {
+    printf '\x1b]133;B\x07'
+}
+zle -N zle-line-init __ua_zle_line_init
 (( ${precmd_functions[(Ie)__ua_precmd]} )) || precmd_functions=(__ua_precmd $precmd_functions)
 (( ${preexec_functions[(Ie)__ua_preexec]} )) || preexec_functions=(__ua_preexec $preexec_functions)
 clear
@@ -116,6 +129,7 @@ mod tests {
             let has_marker =
                 |m: &str| script.contains(m) || script.contains(&m.replace(';', "\\;"));
             assert!(has_marker("133;A"), "{kind:?} missing 133;A");
+            assert!(has_marker("133;B"), "{kind:?} missing 133;B");
             assert!(has_marker("133;D"), "{kind:?} missing 133;D");
             assert!(has_marker("133;C"), "{kind:?} missing 133;C");
         }

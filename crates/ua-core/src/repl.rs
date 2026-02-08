@@ -22,6 +22,71 @@ enum Event {
     Resize(u16, u16),
 }
 
+/// Manages queued commands for OSC 133 sequenced execution.
+///
+/// Commands are dispatched one at a time. After the first (immediate) dispatch,
+/// subsequent commands wait for the shell to signal readiness via OSC 133;B
+/// (prompt rendered, input ready) before sending the next command.
+/// This prevents double-echo that occurs when commands are sent before
+/// ZLE/readline initialization.
+struct CommandQueue {
+    commands: VecDeque<String>,
+    awaiting_ready: bool,
+}
+
+impl CommandQueue {
+    fn new() -> Self {
+        Self {
+            commands: VecDeque::new(),
+            awaiting_ready: false,
+        }
+    }
+
+    /// Queue commands for execution.
+    fn enqueue(&mut self, commands: impl IntoIterator<Item = String>) {
+        self.commands.extend(commands);
+    }
+
+    /// Pop the first command for immediate dispatch (shell is already at prompt).
+    fn pop_immediate(&mut self) -> Option<String> {
+        self.commands.pop_front()
+    }
+
+    /// Process an OSC event. Returns a command to dispatch if the shell is ready.
+    ///
+    /// - `133;A` (prompt start): sets awaiting flag, does NOT dispatch
+    /// - `133;B` (prompt ready): dispatches next command if awaiting
+    fn handle_osc_event(&mut self, event: &OscEvent) -> Option<String> {
+        match event {
+            OscEvent::Osc133A => {
+                if !self.commands.is_empty() {
+                    self.awaiting_ready = true;
+                }
+                None
+            }
+            OscEvent::Osc133B => {
+                if self.awaiting_ready {
+                    self.awaiting_ready = false;
+                    self.commands.pop_front()
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.commands.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.commands.clear();
+        self.awaiting_ready = false;
+    }
+}
+
 pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Result<()> {
     let shell_cmd = config.shell_command();
     let (mut session, pty_reader) = PtySession::spawn(&shell_cmd, config.shell.integration)?;
@@ -30,7 +95,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
     let mut output_history = OutputHistory::new(config.context.max_terminal_lines);
     let mut conversation: Vec<ConversationMessage> = Vec::new();
     let mut terminal_size = crossterm::terminal::size().unwrap_or((80, 24));
-    let mut pending_commands: VecDeque<String> = VecDeque::new();
+    let mut command_queue = CommandQueue::new();
 
     let (tx, rx) = mpsc::channel::<Event>();
 
@@ -107,11 +172,13 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
             Event::Stdin(data) => {
                 let mut handled_instruction = false;
 
-                // Track keystrokes in line buffer during Prompt or Idle state
-                // (Idle = after 133;D but before 133;A, a brief window)
+                // Track keystrokes in line buffer during prompt-related states:
+                // - Prompt = after 133;A (prompt start)
+                // - Input  = after 133;B (prompt rendered, ZLE/readline ready)
+                // - Idle   = after 133;D but before 133;A (brief window)
                 if matches!(
                     parser.terminal_state,
-                    TerminalState::Prompt | TerminalState::Idle
+                    TerminalState::Prompt | TerminalState::Input | TerminalState::Idle
                 ) {
                     for &b in &data {
                         match b {
@@ -142,13 +209,13 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                             ));
 
                                             if !commands.is_empty() {
-                                                // Queue all commands
-                                                pending_commands.extend(commands.into_iter());
+                                                command_queue.enqueue(commands);
 
                                                 // Clear shell's readline buffer (Ctrl+U),
-                                                // then send the first command
+                                                // then send the first command immediately
+                                                // (shell is already at prompt with ZLE ready)
                                                 let _ = session.write_all(b"\x15");
-                                                if let Some(cmd) = pending_commands.pop_front() {
+                                                if let Some(cmd) = command_queue.pop_immediate() {
                                                     let cmd = format!("{cmd}\n");
                                                     if let Err(e) =
                                                         session.write_all(cmd.as_bytes())
@@ -224,15 +291,15 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                 for evt in &events {
                     if *evt == OscEvent::Osc133A {
                         line_buf.clear();
+                    }
 
-                        // OSC 133 sequencing: if we have pending commands,
-                        // send the next one now that the shell is ready
-                        if let Some(cmd) = pending_commands.pop_front() {
-                            let cmd = format!("{cmd}\n");
-                            if let Err(e) = session.write_all(cmd.as_bytes()) {
-                                let _ = writeln!(stderr, "\r\n[ua] pty write error: {e}");
-                                pending_commands.clear();
-                            }
+                    // OSC 133 sequencing: dispatch next command on 133;B
+                    // (prompt rendered, ZLE/readline ready — no double-echo)
+                    if let Some(cmd) = command_queue.handle_osc_event(evt) {
+                        let cmd = format!("{cmd}\n");
+                        if let Err(e) = session.write_all(cmd.as_bytes()) {
+                            let _ = writeln!(stderr, "\r\n[ua] pty write error: {e}");
+                            command_queue.clear();
                         }
                     }
                 }
@@ -397,6 +464,9 @@ fn handle_instruction(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::display::PlanDisplay;
+
+    // --- extract_commands tests ---
 
     #[test]
     fn extract_single_command() {
@@ -457,5 +527,263 @@ mod tests {
                      And that shows disk usage.";
         let commands = extract_commands(text);
         assert_eq!(commands, vec!["uname -a", "df -h"]);
+    }
+
+    // --- CommandQueue tests ---
+
+    #[test]
+    fn command_queue_pop_immediate() {
+        let mut queue = CommandQueue::new();
+        queue.enqueue(vec!["ls".to_string(), "pwd".to_string()]);
+        assert_eq!(queue.pop_immediate(), Some("ls".to_string()));
+        assert!(!queue.is_empty()); // "pwd" still queued
+    }
+
+    #[test]
+    fn command_queue_does_not_dispatch_on_133a() {
+        let mut queue = CommandQueue::new();
+        queue.enqueue(vec!["pwd".to_string()]);
+
+        let result = queue.handle_osc_event(&OscEvent::Osc133A);
+        assert_eq!(result, None);
+        assert!(queue.awaiting_ready);
+    }
+
+    #[test]
+    fn command_queue_dispatches_on_133b() {
+        let mut queue = CommandQueue::new();
+        queue.enqueue(vec!["pwd".to_string()]);
+
+        queue.handle_osc_event(&OscEvent::Osc133A);
+        let result = queue.handle_osc_event(&OscEvent::Osc133B);
+        assert_eq!(result, Some("pwd".to_string()));
+        assert!(!queue.awaiting_ready);
+    }
+
+    #[test]
+    fn command_queue_sequential_dispatch() {
+        let mut queue = CommandQueue::new();
+        queue.enqueue(vec![
+            "cmd1".to_string(),
+            "cmd2".to_string(),
+            "cmd3".to_string(),
+        ]);
+
+        // First command: immediate dispatch (shell is at prompt)
+        assert_eq!(queue.pop_immediate(), Some("cmd1".to_string()));
+
+        // cmd1 finishes → 133;D, 133;A (prompt start), then 133;B (prompt ready)
+        assert_eq!(
+            queue.handle_osc_event(&OscEvent::Osc133D { exit_code: Some(0) }),
+            None
+        );
+        assert_eq!(queue.handle_osc_event(&OscEvent::Osc133A), None);
+        assert!(queue.awaiting_ready);
+        assert_eq!(
+            queue.handle_osc_event(&OscEvent::Osc133B),
+            Some("cmd2".to_string())
+        );
+
+        // cmd2 finishes → same cycle
+        assert_eq!(
+            queue.handle_osc_event(&OscEvent::Osc133D { exit_code: Some(0) }),
+            None
+        );
+        assert_eq!(queue.handle_osc_event(&OscEvent::Osc133A), None);
+        assert_eq!(
+            queue.handle_osc_event(&OscEvent::Osc133B),
+            Some("cmd3".to_string())
+        );
+
+        // No more commands
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn command_queue_133b_without_awaiting_is_noop() {
+        let mut queue = CommandQueue::new();
+        queue.enqueue(vec!["cmd".to_string()]);
+
+        // 133;B without preceding 133;A should not dispatch
+        let result = queue.handle_osc_event(&OscEvent::Osc133B);
+        assert_eq!(result, None);
+        assert!(!queue.is_empty());
+    }
+
+    #[test]
+    fn command_queue_empty_is_noop() {
+        let mut queue = CommandQueue::new();
+
+        // All events are no-ops when queue is empty
+        assert_eq!(queue.handle_osc_event(&OscEvent::Osc133A), None);
+        assert!(!queue.awaiting_ready);
+        assert_eq!(queue.handle_osc_event(&OscEvent::Osc133B), None);
+    }
+
+    #[test]
+    fn command_queue_clear_resets_state() {
+        let mut queue = CommandQueue::new();
+        queue.enqueue(vec!["cmd1".to_string(), "cmd2".to_string()]);
+        queue.handle_osc_event(&OscEvent::Osc133A);
+
+        queue.clear();
+        assert!(queue.is_empty());
+        assert!(!queue.awaiting_ready);
+    }
+
+    #[test]
+    fn command_queue_ignores_133c_and_133d() {
+        let mut queue = CommandQueue::new();
+        queue.enqueue(vec!["cmd".to_string()]);
+        queue.handle_osc_event(&OscEvent::Osc133A);
+
+        // 133;C and 133;D should not dispatch
+        assert_eq!(queue.handle_osc_event(&OscEvent::Osc133C), None);
+        assert_eq!(
+            queue.handle_osc_event(&OscEvent::Osc133D { exit_code: Some(0) }),
+            None
+        );
+        assert!(queue.awaiting_ready); // Still waiting for 133;B
+    }
+
+    // --- End-to-end tests: mock StreamEvent deltas → commands → dispatch ---
+
+    #[test]
+    fn mock_deltas_to_commands_single() {
+        let events = vec![
+            StreamEvent::TextDelta("Here's the command:\n\n```\nls /tmp\n```\n".to_string()),
+            StreamEvent::Done,
+        ];
+
+        let mut display = PlanDisplay::new();
+        for event in &events {
+            display.handle_event(event);
+        }
+
+        let commands = extract_commands(&display.streaming_text);
+        assert_eq!(commands, vec!["ls /tmp"]);
+    }
+
+    #[test]
+    fn mock_deltas_to_commands_with_thinking() {
+        let events = vec![
+            StreamEvent::ThinkingDelta("Let me analyze...".to_string()),
+            StreamEvent::TextDelta("I'll list the files:\n\n".to_string()),
+            StreamEvent::TextDelta("```bash\nls -la /tmp\n```\n".to_string()),
+            StreamEvent::Done,
+        ];
+
+        let mut display = PlanDisplay::new();
+        for event in &events {
+            display.handle_event(event);
+        }
+
+        let commands = extract_commands(&display.streaming_text);
+        assert_eq!(commands, vec!["ls -la /tmp"]);
+        // Thinking text should not leak into command extraction
+        assert!(!display.thinking_text.is_empty());
+        assert!(!display.streaming_text.contains("analyze"));
+    }
+
+    #[test]
+    fn mock_deltas_multiple_commands_sequenced() {
+        // Simulate LLM response with multiple commands
+        let events = vec![
+            StreamEvent::ThinkingDelta("I need to create and verify a file.".to_string()),
+            StreamEvent::TextDelta(
+                "First, create the file:\n\n```\ntouch /tmp/test.txt\n```\n\n".to_string(),
+            ),
+            StreamEvent::TextDelta(
+                "Then verify it exists:\n\n```\nls -la /tmp/test.txt\n```\n".to_string(),
+            ),
+            StreamEvent::Done,
+        ];
+
+        let mut display = PlanDisplay::new();
+        for event in &events {
+            display.handle_event(event);
+        }
+
+        let commands = extract_commands(&display.streaming_text);
+        assert_eq!(
+            commands,
+            vec!["touch /tmp/test.txt", "ls -la /tmp/test.txt"]
+        );
+
+        // Verify sequenced dispatch via CommandQueue
+        let mut queue = CommandQueue::new();
+        queue.enqueue(commands);
+
+        // First command dispatched immediately (shell at prompt)
+        assert_eq!(
+            queue.pop_immediate(),
+            Some("touch /tmp/test.txt".to_string())
+        );
+
+        // Second command waits for 133;A (prompt start) then 133;B (prompt ready)
+        assert_eq!(queue.handle_osc_event(&OscEvent::Osc133A), None);
+        assert_eq!(
+            queue.handle_osc_event(&OscEvent::Osc133B),
+            Some("ls -la /tmp/test.txt".to_string())
+        );
+
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn mock_deltas_no_commands() {
+        let events = vec![
+            StreamEvent::TextDelta(
+                "There are no files to list. The directory is empty.".to_string(),
+            ),
+            StreamEvent::Done,
+        ];
+
+        let mut display = PlanDisplay::new();
+        for event in &events {
+            display.handle_event(event);
+        }
+
+        let commands = extract_commands(&display.streaming_text);
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn mock_deltas_streamed_code_block() {
+        // Simulate text arriving in small chunks (like real SSE streaming)
+        let events = vec![
+            StreamEvent::TextDelta("Here".to_string()),
+            StreamEvent::TextDelta("'s the command".to_string()),
+            StreamEvent::TextDelta(":\n\n```".to_string()),
+            StreamEvent::TextDelta("\nls".to_string()),
+            StreamEvent::TextDelta(" /tmp\n".to_string()),
+            StreamEvent::TextDelta("```\n".to_string()),
+            StreamEvent::Done,
+        ];
+
+        let mut display = PlanDisplay::new();
+        for event in &events {
+            display.handle_event(event);
+        }
+
+        let commands = extract_commands(&display.streaming_text);
+        assert_eq!(commands, vec!["ls /tmp"]);
+    }
+
+    #[test]
+    fn mock_deltas_error_yields_no_commands() {
+        let events = vec![
+            StreamEvent::TextDelta("I'll help with".to_string()),
+            StreamEvent::Error("Rate limited".to_string()),
+        ];
+
+        let mut display = PlanDisplay::new();
+        for event in &events {
+            display.handle_event(event);
+        }
+
+        // On error, streaming_text is partial — extract_commands should handle gracefully
+        let commands = extract_commands(&display.streaming_text);
+        assert!(commands.is_empty()); // No complete code block
     }
 }
