@@ -105,6 +105,15 @@ ua-core/src/
   shell_scripts.rs Shell integration scripts (bash/zsh/fish)
 ```
 
+## SECURITY.md — Security Architecture
+
+**`SECURITY.md` is the security specification for the project.** It defines
+the threat model, defense-in-depth layers, OS-level sandbox architecture,
+command classification, approval model, and a 45-entry annotated bibliography
+of LLM agent security research.
+
+All security-related implementation decisions must reference SECURITY.md.
+
 ## Dependency Strategy
 
 Self-contained workspace. No path dependencies on external projects.

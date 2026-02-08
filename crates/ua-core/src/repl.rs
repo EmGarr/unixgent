@@ -9,10 +9,14 @@ use tokio::sync::oneshot;
 use ua_backend::AnthropicClient;
 use ua_protocol::{ConversationMessage, StreamEvent, ToolResultRecord, ToolUseRecord};
 
+use crate::audit::AuditLogger;
 use crate::config::Config;
-use crate::context::{build_agent_request, OutputHistory};
+use crate::context::{
+    build_agent_request, scrub_injection_markers, OutputHistory, TOOL_RESULT_PREFIX,
+};
 use crate::display::PlanDisplay;
 use crate::osc::{OscEvent, OscParser, TerminalState};
+use crate::policy::{analyze_pipe_chain, validate_arguments, ArgumentSafety, RiskLevel};
 use crate::pty::PtySession;
 
 enum Event {
@@ -53,6 +57,10 @@ enum AgentState {
         iteration: usize,
         /// Tool use IDs for building tool_result messages.
         tool_use_ids: Vec<String>,
+        /// Whether any command in the batch is Privileged.
+        has_privileged: bool,
+        /// Buffer for typing "yes" on privileged commands.
+        yes_buffer: String,
     },
     /// Commands are being executed in the PTY.
     Executing {
@@ -198,6 +206,23 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
     let mut state = AgentState::Idle;
     // Instruction text saved across the state transition (Idle → Streaming).
     let mut pending_instruction: Option<String> = None;
+
+    // Initialize audit logger
+    let mut audit = if config.security.audit_enabled {
+        let path = config.security.resolve_audit_path();
+        match AuditLogger::new(&path) {
+            Ok(logger) => logger,
+            Err(e) => {
+                eprintln!(
+                    "[ua] warning: failed to open audit log {}: {e}",
+                    path.display()
+                );
+                AuditLogger::noop()
+            }
+        }
+    } else {
+        AuditLogger::noop()
+    };
 
     let (tx, rx) = mpsc::channel::<Event>();
 
@@ -380,49 +405,154 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                         }
                         // Other input is ignored during streaming
                     }
-                    AgentState::Approving { .. } => {
-                        // Single keystroke approval in raw mode
-                        for &b in &data {
-                            match b {
-                                b'y' | b'Y' | b'\r' | b'\n' => {
-                                    // Approve: extract commands from state, execute
-                                    if let AgentState::Approving {
-                                        commands,
-                                        iteration,
-                                        tool_use_ids,
-                                        ..
-                                    } = std::mem::replace(&mut state, AgentState::Idle)
-                                    {
-                                        let _ = writeln!(stderr, "\r\n[ua] executing...\r");
+                    AgentState::Approving {
+                        ref has_privileged,
+                        ref mut yes_buffer,
+                        ..
+                    } => {
+                        let need_yes =
+                            *has_privileged && config.security.require_yes_for_privileged;
 
-                                        // Queue + dispatch first command
-                                        command_queue.enqueue(commands);
-                                        if let Some(cmd) = command_queue.pop_immediate() {
-                                            let cmd = format!("{cmd}\n");
-                                            if let Err(e) = session.write_all(cmd.as_bytes()) {
-                                                let _ = writeln!(
-                                                    stderr,
-                                                    "\r\n[ua] pty write error: {e}"
-                                                );
-                                                command_queue.clear();
-                                            } else {
-                                                state = AgentState::Executing {
+                        if need_yes {
+                            // Privileged: require typing "yes" + Enter
+                            for &b in &data {
+                                match b {
+                                    b'\r' | b'\n' => {
+                                        if yes_buffer.trim() == "yes" {
+                                            // Approved
+                                            if let AgentState::Approving {
+                                                commands,
+                                                iteration,
+                                                tool_use_ids,
+                                                ..
+                                            } = std::mem::replace(&mut state, AgentState::Idle)
+                                            {
+                                                audit.log_approved(
                                                     iteration,
-                                                    capture: OutputHistory::new(200),
-                                                    tool_use_ids,
-                                                };
+                                                    "typed_yes",
+                                                    "user typed yes",
+                                                );
+                                                let _ = writeln!(stderr, "\r\n[ua] executing...\r");
+
+                                                command_queue.enqueue(commands);
+                                                if let Some(cmd) = command_queue.pop_immediate() {
+                                                    let cmd = format!("{cmd}\n");
+                                                    if let Err(e) =
+                                                        session.write_all(cmd.as_bytes())
+                                                    {
+                                                        let _ = writeln!(
+                                                            stderr,
+                                                            "\r\n[ua] pty write error: {e}"
+                                                        );
+                                                        command_queue.clear();
+                                                    } else {
+                                                        state = AgentState::Executing {
+                                                            iteration,
+                                                            capture: OutputHistory::new(200),
+                                                            tool_use_ids,
+                                                        };
+                                                    }
+                                                }
                                             }
+                                        } else {
+                                            if let AgentState::Approving { iteration, .. } = &state
+                                            {
+                                                audit.log_denied(
+                                                    *iteration,
+                                                    "typed_no",
+                                                    "user did not type yes",
+                                                );
+                                            }
+                                            let _ = writeln!(
+                                                stderr,
+                                                "\r\n[ua] skipped (type 'yes' to approve)\r"
+                                            );
+                                            state = AgentState::Idle;
+                                        }
+                                        break;
+                                    }
+                                    0x7f | 0x08 => {
+                                        // Backspace
+                                        if yes_buffer.pop().is_some() {
+                                            let _ = write!(stderr, "\x08 \x08");
+                                            let _ = stderr.flush();
                                         }
                                     }
-                                    break;
+                                    0x03 => {
+                                        // Ctrl-C
+                                        if let AgentState::Approving { iteration, .. } = &state {
+                                            audit.log_denied(
+                                                *iteration,
+                                                "ctrl_c",
+                                                "user cancelled",
+                                            );
+                                        }
+                                        let _ = writeln!(stderr, "\r\n[ua] cancelled\r");
+                                        state = AgentState::Idle;
+                                        break;
+                                    }
+                                    b if b >= 0x20 => {
+                                        yes_buffer.push(b as char);
+                                        let _ = write!(stderr, "{}", b as char);
+                                        let _ = stderr.flush();
+                                    }
+                                    _ => {}
                                 }
-                                b'n' | b'N' | b'q' | b'Q' | 0x03 => {
-                                    let _ = writeln!(stderr, "\r\n[ua] skipped\r");
-                                    state = AgentState::Idle;
-                                    break;
-                                }
-                                _ => {
-                                    // Ignore other keys
+                            }
+                        } else {
+                            // Normal: single keystroke approval
+                            for &b in &data {
+                                match b {
+                                    b'y' | b'Y' | b'\r' | b'\n' => {
+                                        if let AgentState::Approving {
+                                            commands,
+                                            iteration,
+                                            tool_use_ids,
+                                            ..
+                                        } = std::mem::replace(&mut state, AgentState::Idle)
+                                        {
+                                            audit.log_approved(
+                                                iteration,
+                                                "keystroke",
+                                                "user pressed y",
+                                            );
+                                            let _ = writeln!(stderr, "\r\n[ua] executing...\r");
+
+                                            command_queue.enqueue(commands);
+                                            if let Some(cmd) = command_queue.pop_immediate() {
+                                                let cmd = format!("{cmd}\n");
+                                                if let Err(e) = session.write_all(cmd.as_bytes()) {
+                                                    let _ = writeln!(
+                                                        stderr,
+                                                        "\r\n[ua] pty write error: {e}"
+                                                    );
+                                                    command_queue.clear();
+                                                } else {
+                                                    state = AgentState::Executing {
+                                                        iteration,
+                                                        capture: OutputHistory::new(200),
+                                                        tool_use_ids,
+                                                    };
+                                                }
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    b'n' | b'N' | b'q' | b'Q' | 0x03 => {
+                                        if let AgentState::Approving { iteration, .. } = &state {
+                                            audit.log_denied(
+                                                *iteration,
+                                                "keystroke",
+                                                "user pressed n",
+                                            );
+                                        }
+                                        let _ = writeln!(stderr, "\r\n[ua] skipped\r");
+                                        state = AgentState::Idle;
+                                        break;
+                                    }
+                                    _ => {
+                                        // Ignore other keys
+                                    }
                                 }
                             }
                         }
@@ -553,20 +683,119 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                 // No commands — done
                                 state = AgentState::Idle;
                             } else {
-                                // Show proposed commands and ask for approval
-                                let _ = writeln!(stderr, "\r[ua] proposed:");
-                                for (i, cmd) in commands.iter().enumerate() {
-                                    let safe = cmd.replace('\n', "\r\n");
-                                    let _ = writeln!(stderr, "\r  {}. {safe}", i + 1);
-                                }
-                                let _ = write!(stderr, "\r[y] run  [n] skip  [q] quit ");
-                                let _ = stderr.flush();
+                                // Classify each command
+                                let risk_levels: Vec<RiskLevel> =
+                                    commands.iter().map(|cmd| analyze_pipe_chain(cmd)).collect();
+                                let risk_labels: Vec<&str> =
+                                    risk_levels.iter().map(|r| r.as_str()).collect();
 
-                                state = AgentState::Approving {
-                                    commands,
-                                    iteration,
-                                    tool_use_ids,
-                                };
+                                // Log proposed commands
+                                audit.log_proposed(iteration, &commands, &risk_labels, "llm");
+
+                                // Check for denied commands — block them
+                                let mut blocked = false;
+                                for (i, risk) in risk_levels.iter().enumerate() {
+                                    if *risk == RiskLevel::Denied {
+                                        let _ = writeln!(
+                                            stderr,
+                                            "\r  \x1b[31m[DENIED]\x1b[0m {}",
+                                            commands[i].replace('\n', "\r\n")
+                                        );
+                                        audit.log_blocked(
+                                            &commands[i],
+                                            risk.as_str(),
+                                            "denied by policy",
+                                        );
+                                        blocked = true;
+                                    }
+                                }
+
+                                if blocked {
+                                    // Push a tool_result explaining the denial
+                                    if !tool_use_ids.is_empty() {
+                                        let denial_msg = "Command was blocked by the security policy. \
+                                            The command is on the deny list and cannot be executed. \
+                                            Please suggest a safer alternative.";
+                                        let tool_results: Vec<ToolResultRecord> = tool_use_ids
+                                            .iter()
+                                            .map(|id| ToolResultRecord {
+                                                tool_use_id: id.clone(),
+                                                content: denial_msg.to_string(),
+                                            })
+                                            .collect();
+                                        conversation
+                                            .push(ConversationMessage::tool_result(tool_results));
+                                    }
+                                    let _ = writeln!(stderr, "\r[ua] command blocked by policy\r");
+                                    state = AgentState::Idle;
+                                    continue;
+                                }
+
+                                // Check for dangerous arguments
+                                for cmd in &commands {
+                                    if let ArgumentSafety::Dangerous(reason) =
+                                        validate_arguments(cmd)
+                                    {
+                                        let _ = writeln!(
+                                            stderr,
+                                            "\r  \x1b[33m[WARNING]\x1b[0m {reason}"
+                                        );
+                                    }
+                                }
+
+                                // Auto-approve if all read-only
+                                let all_read_only =
+                                    risk_levels.iter().all(|r| *r == RiskLevel::ReadOnly);
+                                let has_privileged = risk_levels.contains(&RiskLevel::Privileged);
+
+                                if all_read_only && config.security.auto_approve_read_only {
+                                    audit.log_approved(iteration, "auto", "all commands read-only");
+                                    let _ = writeln!(stderr, "\r[ua] auto-approved (read-only)\r");
+
+                                    command_queue.enqueue(commands);
+                                    if let Some(cmd) = command_queue.pop_immediate() {
+                                        let cmd = format!("{cmd}\n");
+                                        if let Err(e) = session.write_all(cmd.as_bytes()) {
+                                            let _ =
+                                                writeln!(stderr, "\r\n[ua] pty write error: {e}");
+                                            command_queue.clear();
+                                        } else {
+                                            state = AgentState::Executing {
+                                                iteration,
+                                                capture: OutputHistory::new(200),
+                                                tool_use_ids,
+                                            };
+                                        }
+                                    }
+                                } else {
+                                    // Show risk-aware prompt
+                                    let _ = writeln!(stderr, "\r[ua] proposed:");
+                                    for (i, cmd) in commands.iter().enumerate() {
+                                        let safe = cmd.replace('\n', "\r\n");
+                                        let label = risk_levels[i].label();
+                                        let _ = writeln!(
+                                            stderr,
+                                            "\r  {}. \x1b[33m[{label}]\x1b[0m {safe}",
+                                            i + 1
+                                        );
+                                    }
+
+                                    if has_privileged && config.security.require_yes_for_privileged
+                                    {
+                                        let _ = write!(stderr, "\rType 'yes' to approve: ");
+                                    } else {
+                                        let _ = write!(stderr, "\r[y] run  [n] skip  [q] quit ");
+                                    }
+                                    let _ = stderr.flush();
+
+                                    state = AgentState::Approving {
+                                        commands,
+                                        iteration,
+                                        tool_use_ids,
+                                        has_privileged,
+                                        yes_buffer: String::new(),
+                                    };
+                                }
                             }
                         }
                     }
@@ -624,11 +853,11 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                             {
                                 let captured_lines = capture.lines();
                                 if !captured_lines.is_empty() && iteration < MAX_AGENT_ITERATIONS {
-                                    // Build observation
-                                    let observation = format!(
-                                        "Command output:\n\n{}\n",
-                                        captured_lines.join("\n")
-                                    );
+                                    // Build observation with scrubbing
+                                    let raw_output = captured_lines.join("\n");
+                                    let scrubbed = scrub_injection_markers(&raw_output);
+                                    let observation =
+                                        format!("{}{}\n", TOOL_RESULT_PREFIX, scrubbed);
 
                                     // Push as tool_result if we have tool_use_ids,
                                     // otherwise fall back to plain user message.

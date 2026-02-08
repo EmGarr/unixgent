@@ -1,5 +1,7 @@
 //! Anthropic Claude API client with SSE streaming support.
 
+use std::time::Duration;
+
 use async_stream::stream;
 use futures::Stream;
 use reqwest::Client;
@@ -31,13 +33,23 @@ pub struct AnthropicClient {
     http: Client,
 }
 
+/// Build an HTTP client with appropriate timeouts and connection limits.
+fn build_http_client() -> Client {
+    Client::builder()
+        .timeout(Duration::from_secs(120))
+        .connect_timeout(Duration::from_secs(10))
+        .pool_max_idle_per_host(2)
+        .build()
+        .expect("failed to build HTTP client")
+}
+
 impl AnthropicClient {
     /// Create a new client with the given API key.
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             api_key: api_key.into(),
             model: DEFAULT_MODEL.to_string(),
-            http: Client::new(),
+            http: build_http_client(),
         }
     }
 
@@ -46,7 +58,7 @@ impl AnthropicClient {
         Self {
             api_key: api_key.into(),
             model: model.into(),
-            http: Client::new(),
+            http: build_http_client(),
         }
     }
 
@@ -837,6 +849,17 @@ mod tests {
         let content = ApiContent::Text("hello".to_string());
         let json = serde_json::to_value(&content).unwrap();
         assert_eq!(json, serde_json::json!("hello"));
+    }
+
+    #[test]
+    fn build_http_client_does_not_panic() {
+        let _client = build_http_client();
+    }
+
+    #[test]
+    fn new_client_does_not_panic() {
+        let _client = AnthropicClient::new("test-key");
+        let _client2 = AnthropicClient::with_model("test-key", "test-model");
     }
 
     #[test]
