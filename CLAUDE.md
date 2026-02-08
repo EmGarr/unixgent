@@ -6,8 +6,8 @@ UnixAgent is an AI-powered Unix shell agent. It connects to LLM backends
 (Anthropic Claude, etc.) and executes shell commands on the user's behalf
 through a PTY-based terminal session.
 
-**Current state:** Phase 2 — SSE backends + context management implemented,
-plan auto-execution not yet wired.
+**Current state:** Phase 2 complete — SSE backends, context management,
+plain text command extraction, and OSC 133 sequenced auto-execution.
 
 ## PLAN.md — Living Implementation Tracker
 
@@ -87,23 +87,22 @@ ua-core → ua-backend → ua-protocol
 ```
 ua-protocol/src/
   context.rs       ShellContext, TerminalHistory, ConversationMessage, AgentRequest
-  message.rs       Plan, PlanStep, StreamEvent
+  message.rs       StreamEvent
 
 ua-backend/src/
   sse.rs           Generic SSE stream parser
-  anthropic.rs     Anthropic API client with SSE + tool use
-  mock.rs          Mock provider for testing (SSE-level)
+  anthropic.rs     Anthropic API client with SSE streaming + extended thinking
+  mock.rs          Mock provider for testing (StreamEvent-level)
 
 ua-core/src/
   main.rs          Entry point, CLI args, tokio runtime
-  repl.rs          REPL loop with # detection + backend calls
+  repl.rs          REPL loop, # detection, command extraction, OSC 133 dispatch
   pty.rs           PTY session management
   osc.rs           OSC 133 parser + terminal state machine
   config.rs        Config loading (shell, backend, context)
   context.rs       OutputHistory ring buffer, ANSI stripping, context assembly
-  display/mod.rs   PlanDisplay TUI component
-  display/testing.rs  TestTui harness for TUI tests
-  shell_scripts.rs    Shell integration scripts (bash/zsh/fish)
+  display.rs       Response stream accumulator (PlanDisplay)
+  shell_scripts.rs Shell integration scripts (bash/zsh/fish)
 ```
 
 ## Dependency Strategy
@@ -112,8 +111,6 @@ Self-contained workspace. No path dependencies on external projects.
 
 Reference (not copy) patterns from `~/Documents/programming/zen-cli/` when needed:
 - `llm-client/src/providers/anthropic.rs` — Anthropic SSE event format
-- `llm-client/src/types.rs` — streaming type design
-- `zen-cli/src/tui/` — ratatui TUI patterns, TestTui harness
 - `native-shell/src/shell.rs` — shell session patterns
 
 ## Development Workflow
