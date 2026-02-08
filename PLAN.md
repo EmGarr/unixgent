@@ -168,17 +168,17 @@ Child agents, policy inheritance, trace propagation, musl build, packaging.
 | ~~Plan commands not auto-executed~~ | ~~High~~ | FIXED — commands now written to PTY after plan display |
 | ~~Shell integration script echoed on startup~~ | ~~Low~~ | FIXED — temp file + source approach; script ends with `clear` to wipe the short source line |
 | ~~Double command display on multi-command plans~~ | ~~Medium~~ | FIXED — commands dispatched on 133;A arrived before ZLE/readline init causing canonical echo + ZLE re-echo. Fix: dispatch on 133;B (after prompt rendered, input ready). Zsh uses `zle-line-init` hook, bash embeds 133;B in PS1 |
-| No Ctrl+C / interrupt handling | **Critical** | SIGINT during streaming sits in MPSC buffer until `block_on` returns. No signal handler registered. Safety bug for auto-executing agent. See DESIGN.md §19.2.2 |
-| No approval gate — auto-executes with zero safety | **Critical** | Commands go straight from LLM to PTY. No deny patterns, no confirmation prompt, no policy check. See DESIGN.md §19.2.3 |
-| `block_on` blocks main event loop during streaming | **Critical** | User cannot interact (Ctrl+C, see output, etc.) while LLM streams. Need async REPL or spawned backend task. See DESIGN.md §19.2.1 |
-| Command queue ignores exit codes | High | `133;D` exit code not checked — queue dispatches next command unconditionally. See DESIGN.md §19.2.4 |
-| Conversation history grows unbounded | High | `Vec<ConversationMessage>` with no eviction — will blow context window after ~20 turns. See DESIGN.md §19.2.7 |
+| ~~No Ctrl+C / interrupt handling~~ | ~~Critical~~ | FIXED — Ctrl+C cancels streaming via oneshot channel, kills execution and clears command queue. State-aware handling per AgentState. See DESIGN.md §19.2.2 |
+| ~~No approval gate — auto-executes with zero safety~~ | ~~Critical~~ | FIXED — Commands require explicit user approval (`[y] run [n] skip [q] quit`). Single keystroke in raw mode. See DESIGN.md §19.2.3 |
+| ~~`block_on` blocks main event loop during streaming~~ | ~~Critical~~ | FIXED — Replaced with async state machine. Backend streams via spawned tokio task, events flow through mpsc channel. Event loop processes Ctrl+C, PTY output, resize in real time. See DESIGN.md §19.2.1 |
+| ~~Command queue ignores exit codes~~ | ~~High~~ | FIXED — CommandQueue tracks last_exit_code from 133;D. Non-zero exit with remaining commands returns QueueEvent::Failed, clearing queue. See DESIGN.md §19.2.4 |
+| ~~Conversation history grows unbounded~~ | ~~High~~ | FIXED — max_conversation_turns (default 20) in ContextConfig. Oldest entries evicted after each push. See DESIGN.md §19.2.7 |
 | Shell integration sourcing unverified | Medium | No check that `source` succeeded; `clear` hack; temp file leak on panic. See DESIGN.md §19.2.5 |
-| `try_wait()` polled on every event | Medium | `waitpid(WNOHANG)` on every keystroke. Should use SIGCHLD. See DESIGN.md §19.2.6 |
-| Thread handles discarded (fire-and-forget) | Medium | stdin/PTY/resize threads not joined — panics swallowed silently. See DESIGN.md §19.2.8 |
-| `looks_like_secret()` insufficient | Medium | Misses AWS keys, JWTs, base64 tokens, SSH private keys. Needs comprehensive patterns or explicit opt-in. See DESIGN.md §19.2.9 |
-| SIGWINCH polled every 250ms | Low | Should use signal handler instead of polling thread. See DESIGN.md §19.2.10 |
-| No integration tests with real shells + OSC 133 | Medium | Only 1 PTY test with `/bin/sh` + echo. No bash/zsh/fish integration tests. See DESIGN.md §19.3 |
+| ~~`try_wait()` polled on every event~~ | ~~Medium~~ | FIXED — Moved to PtyEof arm only, used for diagnostic logging. See DESIGN.md §19.2.6 |
+| ~~Thread handles discarded (fire-and-forget)~~ | ~~Medium~~ | FIXED — PTY reader JoinHandle stored and joined on exit. Stdin thread blocks on read (can't join portably). See DESIGN.md §19.2.8 |
+| ~~`looks_like_secret()` insufficient~~ | ~~Medium~~ | FIXED — Expanded with AWS keys (AKIA), JWTs (eyJ), Slack/GitLab/npm tokens, SSH private key content, high-entropy base64 heuristic. See DESIGN.md §19.2.9 |
+| ~~SIGWINCH polled every 250ms~~ | ~~Low~~ | FIXED — Replaced with signal_hook SIGWINCH handler. Zero CPU when idle. See DESIGN.md §19.2.10 |
+| ~~No integration tests with real shells + OSC 133~~ | ~~Medium~~ | FIXED — 5 integration tests spawning real bash/zsh/fish in PTY, verifying OSC 133 A/B/C/D sequences and exit codes. See DESIGN.md §19.3 |
 
 ---
 
@@ -186,7 +186,8 @@ Child agents, policy inheritance, trace propagation, musl build, packaging.
 
 | Decision | Date | Rationale |
 |----------|------|-----------|
-| Sync/async bridge via `block_on` | 2026-02-07 | PTY reader and stdin threads continue buffering into mpsc channel while async backend call runs |
+| ~~Sync/async bridge via `block_on`~~ | ~~2026-02-07~~ | ~~Replaced by async state machine~~ |
+| Async state machine with spawned tokio task | 2026-02-08 | Backend streams forwarded through mpsc channel via spawned tokio task. AgentState enum (Idle/Streaming/Approving/Executing) drives the main event loop. Cancellation via oneshot channel. |
 | No backend trait yet | 2026-02-07 | Per DESIGN.md §4.5 — extract common interface in Phase 3 after second backend exists |
 | ~~Tool use for structured plans~~ | ~~2026-02-07~~ | ~~Replaced by plain text + OSC 133 sequencing~~ |
 | Plain text + OSC 133 sequencing | 2026-02-08 | LLM outputs commands in fenced code blocks; commands executed one-at-a-time via OSC 133 prompt detection. Simpler than tool calls, more robust than blasting all commands at once |

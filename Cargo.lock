@@ -1490,6 +1490,7 @@ dependencies = [
  "futures",
  "portable-pty",
  "serde",
+ "signal-hook",
  "tempfile",
  "tokio",
  "toml",
