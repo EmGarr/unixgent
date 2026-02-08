@@ -1097,3 +1097,165 @@ Child agent spawning, policy inheritance, trace context propagation. Trace sinks
 - **Golden tests**: Record expected NDJSON output for known instruction/context pairs. Regression test against them.
 - **Fuzz testing**: Feed random terminal output and instructions to the REPL parser.
 - **Platform tests**: On Linux CI, test real platform APIs. On macOS CI, test real platform APIs. No mocking of OS capabilities in platform tests.
+
+---
+
+## 19. External Review Notes (Linus Torvalds, Feb 2026)
+
+### 19.1 What's Validated
+
+The following design choices and implementations were confirmed as correct:
+
+| Area | Assessment |
+|------|-----------|
+| Core premise (PTY proxy wrapping existing shell) | Correct process model. Like `script(1)` or `screen(1)`. Nothing special from the kernel's perspective. |
+| OSC 133 state machine | Genuinely clever. Real state transitions instead of fragile prompt regex. `#` interception limited to PROMPT state makes heredocs/REPLs/vim safe. |
+| SSE parser (`sse.rs`) | Proper W3C-compliant parser. Byte-by-byte, handles CRLF, chunked data across boundaries, BEL and ST terminators. 11 tests. Small, focused, well-tested. |
+| OSC parser (`osc.rs`) | Disciplined state machine with clear transitions, 256-byte cap on parameter buffer, proper BEL and ESC-backslash handling. Non-133 sequences silently passed through. 10 tests. |
+| ANSI stripping state machine (`context.rs`) | Correct per ECMA-48. Proper state machine (Ground, Escape, CSI, OSC), not regex. CSI sequences consumed until final byte (0x40-0x7e). Ring buffer with eviction is the right data structure. |
+| Secret filtering (`looks_like_secret`) | Pragmatic and correct for a first pass (but see §19.2.9). |
+| Crate structure | Clean. `ua-protocol` has no internal deps. Dependency arrow points one way. Not over-engineered into 15 crates. |
+| Test discipline | 99 tests, `make check` runs fmt + clippy + test. Dockerfile on Debian Bookworm with bash, zsh, fish. |
+
+### 19.2 Critical Issues
+
+#### 19.2.1 `block_on` Sync/Async Bridge Blocks the Event Loop
+
+**Severity**: Critical — breaks interactivity during LLM streaming
+
+The synchronous event loop in `run_repl()` reads from an MPSC channel, then calls `rt_handle.block_on()` to synchronously consume the async Anthropic stream. This **blocks the main event loop** while the LLM streams its response. Consequences:
+
+- User presses Ctrl+C during streaming → nothing happens until the stream finishes.
+- Child shell produces output → queues up invisibly.
+- PTY buffer fills → child shell blocks.
+
+"Works in demos, breaks in production."
+
+**Required fix** (one of):
+1. Make the whole REPL async (`tokio::select!` over stdin, PTY, and the backend stream), or
+2. Spawn the backend call onto the runtime and poll its channel alongside the others.
+
+PTY reader and stdin threads buffering into the channel is **not sufficient** — processing events is what matters, not buffering them.
+
+*Ref: Architecture Decisions Log entry "Sync/async bridge via `block_on`"*
+
+#### 19.2.2 No Ctrl+C / Interrupt Handling
+
+**Severity**: Critical — safety bug for an auto-executing agent
+
+The design doc describes interrupt handling in §14.7 (double Ctrl+C, cancel during streaming, cancel during approval, cancel during execution). **None of it is implemented.** Right now:
+
+- Ctrl+C during streaming → goes into MPSC buffer, sits there until `block_on` returns.
+- Ctrl+C during execution → goes to child shell (correct, but by accident, not design).
+- No signal handler. No SIGINT registration.
+
+For a tool that auto-executes shell commands on behalf of the user, the inability to cancel is a **critical safety bug**, not a TODO.
+
+**Required fix**: Register a signal handler for SIGINT. Cancel the stream and return to prompt during streaming. Let SIGINT reach the child during execution (natural PTY behavior). Clear the command queue during queued execution.
+
+#### 19.2.3 Command Extraction is Naive — No Safety Gates
+
+**Severity**: Critical — auto-execution with zero approval
+
+`extract_commands()` does string-level fenced code block parsing: split on lines starting with triple backticks. If the LLM outputs:
+
+```
+Here's a harmless explanation:
+```bash
+rm -rf /
+```‎
+```
+
+...the agent extracts `rm -rf /` and queues it for auto-execution. There is:
+- No policy engine
+- No deny patterns
+- No approval prompt
+- No human confirmation gate
+
+Commands go straight from the LLM to the PTY. The design doc describes an entire approval model (§5) with policy files, hooks, deny patterns, human confirmation, and step-through mode. **None of it exists yet.** This is not Phase 5 material — this is Phase 0.
+
+**Required fix**: At minimum, print each command before execution and wait for the user to press Enter or `y`. The fancy approval TUI can come later. An auto-executing agent with no human gate is an `rm -rf /` waiting to happen.
+
+#### 19.2.4 Command Queue Ignores Exit Codes
+
+**Severity**: High — blind execution after failure
+
+`CommandQueue.handle_osc_event()` checks for `133;B` and dispatches the next command unconditionally. It never looks at the exit code in `133;D`. A three-step plan where step 1 fails should not blindly execute steps 2 and 3.
+
+**Required fix**: Check the exit code from `133;D`. Stop the queue on non-zero exit code. Tell the user. Let them decide whether to continue.
+
+#### 19.2.5 Shell Integration Sourcing is Fragile
+
+**Severity**: Medium
+
+The integration script is written to a `NamedTempFile`, then ` source /tmp/xxx\n` is sent to the PTY. Issues:
+
+1. **No verification that source succeeded.** If the temp file is cleaned up by the OS (some distros clean `/tmp` aggressively), or if the shell can't read it, shell integration is silently absent.
+2. **`clear` as the last command is a hack.** If the terminal is slow, the user sees a flash. If the terminal doesn't support `clear`, they see garbage.
+3. **Temp file leak on panic.** The file is kept alive by `_integration_file` in `PtySession`. If the session panics before the guard runs, the file leaks. Minor, but sloppy.
+
+#### 19.2.6 `try_wait()` Polled After Every Event
+
+**Severity**: Medium — unnecessary syscall overhead
+
+Every time a stdin byte, PTY output chunk, or resize event arrives, `session.try_wait()` is called. This is a `waitpid(WNOHANG)` syscall on every keystroke.
+
+**Required fix**: Listen for SIGCHLD instead, or at least only check after PTY EOF.
+
+#### 19.2.7 Conversation History Grows Unbounded
+
+**Severity**: High — will blow context window
+
+`conversation` is a `Vec<ConversationMessage>` that gets pushed to on every instruction. There's no sliding window, no summarization, no eviction. The design doc (§8.1) says "Last N turns. Older turns summarized into a single context block." This isn't implemented. After ~20 turns, the context window overflows and the API returns an error.
+
+**Required fix**: Cap at N turns. This is trivial and prevents context window blow-up.
+
+#### 19.2.8 Thread Spawning Without Join Handles
+
+**Severity**: Medium — silent panic swallowing
+
+The stdin, PTY reader, and resize threads in `run_repl()` are spawned and the handles are thrown away. If the PTY reader thread panics, the main loop eventually sees no more events and exits, but the panic is swallowed.
+
+**Required fix**: Join the threads on cleanup.
+
+#### 19.2.9 `looks_like_secret()` is Insufficient for Production
+
+**Severity**: Medium — false sense of security
+
+Checking for `sk-`, `pk-`, `ghp_` prefixes and "longer than 100 chars with no spaces" catches a handful of API keys. It misses:
+- AWS keys (`AKIA...`)
+- JWTs
+- Base64-encoded tokens
+- SSH private keys
+- Anything that doesn't match the three hard-coded prefixes
+
+**Required fix**: Either do it properly (comprehensive pattern list) or document that it's best-effort and make the user explicitly opt-in to which env vars get sent.
+
+#### 19.2.10 SIGWINCH Handling via Polling
+
+**Severity**: Low — wasteful but functional
+
+Terminal size is polled every 250ms in a thread. Every terminal program since `vi` in 1976 uses a signal handler for SIGWINCH instead.
+
+**Required fix**: Use a SIGWINCH signal handler.
+
+### 19.3 Required Actions (Priority Order)
+
+Per the review, these must be addressed before the agent is usable:
+
+1. **Implement Ctrl+C handling** — register SIGINT handler, cancel streams, clear queue. Non-negotiable for an auto-executing agent.
+2. **Add minimal approval gate** — print each command, wait for Enter/`y`. Not Phase 5 — Phase 0.
+3. **Fix sync/async bridge** — user must be able to interact while LLM streams.
+4. **Check exit codes between queued commands** — stop queue on non-zero `133;D`.
+5. **Implement conversation history eviction** — cap at N turns.
+6. **Join threads** — don't fire-and-forget spawned threads.
+7. **Handle SIGWINCH properly** — signal handler, not polling.
+8. **Integration tests with real shells** — bash/zsh/fish with OSC 133. Unit tests on the state machine are necessary but not sufficient.
+
+### 19.4 Overall Assessment
+
+> "The bones are good. Now put some safety on it."
+
+The foundation is correct: PTY proxy model, OSC 133 state machine, crate structure, SSE parser. The code is readable, focused, and tested. No frameworks, no excess dependencies.
+
+The critical gap is between the **design doc's safety promises** (policy engines, hooks, approval cascades, audit trails) and the **code's actual behavior** (auto-executes LLM-generated commands with no gate). Shipping to users before closing that gap means someone loses data.
