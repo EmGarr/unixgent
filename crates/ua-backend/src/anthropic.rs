@@ -22,8 +22,6 @@ pub enum AnthropicError {
     Json(#[from] serde_json::Error),
     #[error("API error: {0}")]
     Api(String),
-    #[error("Missing API key")]
-    MissingApiKey,
 }
 
 /// Anthropic API client.

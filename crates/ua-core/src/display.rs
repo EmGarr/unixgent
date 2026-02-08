@@ -1,11 +1,5 @@
-//! TUI display components for response visualization.
+//! Streaming response accumulator.
 
-pub mod testing;
-
-use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use ua_protocol::StreamEvent;
 
 /// Current display status.
@@ -17,13 +11,10 @@ pub enum DisplayStatus {
     Error(String),
 }
 
-/// TUI component for displaying agent responses.
+/// Accumulates streaming response data from the backend.
 pub struct PlanDisplay {
-    /// Accumulated thinking text.
     pub thinking_text: String,
-    /// Accumulated response text.
     pub streaming_text: String,
-    /// Current display status.
     pub status: DisplayStatus,
 }
 
@@ -66,53 +57,6 @@ impl PlanDisplay {
         self.thinking_text.clear();
         self.streaming_text.clear();
         self.status = DisplayStatus::Idle;
-    }
-
-    /// Render the display into a buffer area.
-    pub fn render(&self, area: Rect, buf: &mut Buffer) {
-        match &self.status {
-            DisplayStatus::Idle => {}
-            DisplayStatus::Thinking => {
-                self.render_thinking(area, buf);
-            }
-            DisplayStatus::Streaming => {
-                self.render_streaming(area, buf);
-            }
-            DisplayStatus::Error(msg) => {
-                self.render_error(msg, area, buf);
-            }
-        }
-    }
-
-    fn render_thinking(&self, area: Rect, buf: &mut Buffer) {
-        let text = if self.thinking_text.is_empty() {
-            "Thinking...".to_string()
-        } else {
-            self.thinking_text.clone()
-        };
-
-        let paragraph = Paragraph::new(text)
-            .style(Style::default().fg(Color::Yellow))
-            .block(Block::default().borders(Borders::NONE));
-
-        paragraph.render(area, buf);
-    }
-
-    fn render_streaming(&self, area: Rect, buf: &mut Buffer) {
-        let paragraph = Paragraph::new(self.streaming_text.as_str())
-            .style(Style::default().fg(Color::White))
-            .block(Block::default().borders(Borders::NONE));
-
-        paragraph.render(area, buf);
-    }
-
-    fn render_error(&self, msg: &str, area: Rect, buf: &mut Buffer) {
-        let text = format!("Error: {msg}");
-        let paragraph = Paragraph::new(text)
-            .style(Style::default().fg(Color::Red))
-            .block(Block::default().borders(Borders::NONE));
-
-        paragraph.render(area, buf);
     }
 }
 

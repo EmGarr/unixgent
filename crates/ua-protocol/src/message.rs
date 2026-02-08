@@ -21,24 +21,3 @@ pub enum StreamEvent {
     /// An error occurred during streaming.
     Error(String),
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stream_event_variants() {
-        let events = vec![
-            StreamEvent::ThinkingDelta("hmm".to_string()),
-            StreamEvent::TextDelta("hello".to_string()),
-            StreamEvent::Usage {
-                input_tokens: 100,
-                output_tokens: 50,
-            },
-            StreamEvent::Done,
-            StreamEvent::Error("something went wrong".to_string()),
-        ];
-
-        assert_eq!(events.len(), 5);
-    }
-}
