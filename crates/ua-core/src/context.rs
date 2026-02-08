@@ -164,16 +164,50 @@ fn collect_env_vars(config: &ContextConfig) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Known secret prefixes (API keys, tokens, etc.)
+const SECRET_PREFIXES: &[&str] = &[
+    "sk-",    // Anthropic, OpenAI, Stripe
+    "pk-",    // Stripe public key
+    "ghp_",   // GitHub personal access token
+    "gho_",   // GitHub OAuth token
+    "ghs_",   // GitHub server token
+    "AKIA",   // AWS access key ID
+    "eyJ",    // JWT (base64-encoded JSON header)
+    "xoxb-",  // Slack bot token
+    "xoxp-",  // Slack user token
+    "xoxa-",  // Slack app token
+    "glpat-", // GitLab personal access token
+    "npm_",   // npm token
+];
+
 /// Heuristic to detect if a value looks like a secret.
 fn looks_like_secret(value: &str) -> bool {
-    // Skip if it's a very long string with no spaces (likely a key/token)
+    // Long spaceless string — likely a key or token
     if value.len() > 100 && !value.contains(' ') {
         return true;
     }
-    // Skip if it starts with common secret prefixes
-    if value.starts_with("sk-") || value.starts_with("pk-") || value.starts_with("ghp_") {
+
+    // Known secret prefixes
+    if SECRET_PREFIXES.iter().any(|p| value.starts_with(p)) {
         return true;
     }
+
+    // SSH private key content
+    if value.contains("PRIVATE KEY") {
+        return true;
+    }
+
+    // High-entropy base64 heuristic: 40+ chars, >90% alphanumeric+base64
+    if value.len() >= 40 && !value.contains(' ') {
+        let base64_chars = value
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '+' || *c == '/' || *c == '=')
+            .count();
+        if base64_chars as f64 / value.len() as f64 > 0.9 {
+            return true;
+        }
+    }
+
     false
 }
 
@@ -300,12 +334,32 @@ mod tests {
 
     #[test]
     fn looks_like_secret_detects_api_keys() {
+        // Known prefixes
         assert!(looks_like_secret("sk-ant-api03-xxxxx"));
         assert!(looks_like_secret(
             "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
         ));
+        assert!(looks_like_secret("AKIAIOSFODNN7EXAMPLE"));
+        assert!(looks_like_secret(
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.test"
+        ));
+        assert!(looks_like_secret("xoxb-123-456-abc"));
+        assert!(looks_like_secret("glpat-xxxxxxxxxxxxxxxxxxxx"));
+        assert!(looks_like_secret("npm_xxxxxxxxxxxxxxxxxxxx"));
+
+        // SSH private key content
+        assert!(looks_like_secret("-----BEGIN RSA PRIVATE KEY-----"));
+
+        // High-entropy base64
+        assert!(looks_like_secret(
+            "dGhpcyBpcyBhIHZlcnkgbG9uZyBiYXNlNjQgZW5jb2RlZCBzdHJpbmc="
+        ));
+
+        // Not secrets
         assert!(!looks_like_secret("/usr/local/bin"));
         assert!(!looks_like_secret("xterm-256color"));
+        assert!(!looks_like_secret("hello world"));
+        assert!(!looks_like_secret("short"));
     }
 
     #[test]
