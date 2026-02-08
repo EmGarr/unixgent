@@ -42,6 +42,13 @@ enum AgentState {
         /// Current agentic loop iteration (0-based).
         iteration: usize,
     },
+    /// Awaiting user approval of proposed commands.
+    Approving {
+        /// Commands extracted from the LLM response.
+        commands: Vec<String>,
+        /// Current agentic loop iteration.
+        iteration: usize,
+    },
     /// Commands are being executed in the PTY.
     Executing {
         /// Current agentic loop iteration.
@@ -337,6 +344,51 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                         }
                         // Other input is ignored during streaming
                     }
+                    AgentState::Approving { .. } => {
+                        // Single keystroke approval in raw mode
+                        for &b in &data {
+                            match b {
+                                b'y' | b'Y' | b'\r' | b'\n' => {
+                                    // Approve: extract commands from state, execute
+                                    if let AgentState::Approving {
+                                        commands,
+                                        iteration,
+                                        ..
+                                    } = std::mem::replace(&mut state, AgentState::Idle)
+                                    {
+                                        let _ = writeln!(stderr, "\r\n[ua] executing...\r");
+
+                                        // Queue + dispatch first command
+                                        command_queue.enqueue(commands);
+                                        if let Some(cmd) = command_queue.pop_immediate() {
+                                            let cmd = format!("{cmd}\n");
+                                            if let Err(e) = session.write_all(cmd.as_bytes()) {
+                                                let _ = writeln!(
+                                                    stderr,
+                                                    "\r\n[ua] pty write error: {e}"
+                                                );
+                                                command_queue.clear();
+                                            } else {
+                                                state = AgentState::Executing {
+                                                    iteration,
+                                                    capture: OutputHistory::new(200),
+                                                };
+                                            }
+                                        }
+                                    }
+                                    break;
+                                }
+                                b'n' | b'N' | b'q' | b'Q' | 0x03 => {
+                                    let _ = writeln!(stderr, "\r\n[ua] skipped\r");
+                                    state = AgentState::Idle;
+                                    break;
+                                }
+                                _ => {
+                                    // Ignore other keys
+                                }
+                            }
+                        }
+                    }
                     AgentState::Executing { .. } => {
                         // Check for Ctrl+C — forward to PTY and abort agent loop
                         if data.contains(&0x03) {
@@ -419,30 +471,19 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                 // No commands — done
                                 state = AgentState::Idle;
                             } else {
-                                // Show commands and execute immediately
-                                // (approval gate will be added in Commit 3)
-                                let _ = writeln!(stderr, "\r[ua] commands:");
+                                // Show proposed commands and ask for approval
+                                let _ = writeln!(stderr, "\r[ua] proposed:");
                                 for (i, cmd) in commands.iter().enumerate() {
                                     let safe = cmd.replace('\n', "\r\n");
                                     let _ = writeln!(stderr, "\r  {}. {safe}", i + 1);
                                 }
-                                let _ = writeln!(stderr, "\r[ua] executing...");
+                                let _ = write!(stderr, "\r[y] run  [n] skip  [q] quit ");
+                                let _ = stderr.flush();
 
-                                // Queue + dispatch first command
-                                command_queue.enqueue(commands);
-                                if let Some(cmd) = command_queue.pop_immediate() {
-                                    let cmd = format!("{cmd}\n");
-                                    if let Err(e) = session.write_all(cmd.as_bytes()) {
-                                        let _ = writeln!(stderr, "\r\n[ua] pty write error: {e}");
-                                        command_queue.clear();
-                                        state = AgentState::Idle;
-                                    } else {
-                                        state = AgentState::Executing {
-                                            iteration,
-                                            capture: OutputHistory::new(200),
-                                        };
-                                    }
-                                }
+                                state = AgentState::Approving {
+                                    commands,
+                                    iteration,
+                                };
                             }
                         }
                     }
