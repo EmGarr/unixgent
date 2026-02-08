@@ -22,15 +22,12 @@ enum Event {
     PtyEof,
     Resize(u16, u16),
     /// A streaming event from the backend (forwarded from a spawned tokio task).
-    #[allow(dead_code)]
     BackendChunk(StreamEvent),
     /// The backend stream has finished (either completed or was cancelled).
-    #[allow(dead_code)]
     BackendDone,
 }
 
 /// Agent state machine — drives the main event loop.
-#[allow(dead_code)]
 enum AgentState {
     /// Waiting for user input. Normal shell operation.
     Idle,
@@ -40,16 +37,9 @@ enum AgentState {
         cancel_tx: Option<oneshot::Sender<()>>,
         /// Accumulates the streamed response.
         display: PlanDisplay,
+        /// Whether we're currently in thinking mode (for display).
+        is_thinking: bool,
         /// Current agentic loop iteration (0-based).
-        iteration: usize,
-    },
-    /// Awaiting user approval of proposed commands.
-    Approving {
-        /// Commands extracted from the LLM response.
-        commands: Vec<String>,
-        /// Full response text from the LLM.
-        response_text: String,
-        /// Current agentic loop iteration.
         iteration: usize,
     },
     /// Commands are being executed in the PTY.
@@ -58,8 +48,6 @@ enum AgentState {
         iteration: usize,
         /// Captures output during execution for observation.
         capture: OutputHistory,
-        /// Full response text from the LLM (for conversation history).
-        response_text: String,
     },
 }
 
@@ -154,6 +142,9 @@ impl CommandQueue {
     }
 }
 
+/// Maximum number of agentic loop iterations before stopping.
+const MAX_AGENT_ITERATIONS: usize = 10;
+
 pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Result<()> {
     let shell_cmd = config.shell_command();
     let (mut session, pty_reader) = PtySession::spawn(&shell_cmd, config.shell.integration)?;
@@ -163,8 +154,14 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
     let mut conversation: Vec<ConversationMessage> = Vec::new();
     let mut terminal_size = crossterm::terminal::size().unwrap_or((80, 24));
     let mut command_queue = CommandQueue::new();
+    let mut state = AgentState::Idle;
+    // Instruction text saved across the state transition (Idle → Streaming).
+    let mut pending_instruction: Option<String> = None;
 
     let (tx, rx) = mpsc::channel::<Event>();
+
+    // Keep one sender alive for start_streaming() to clone from.
+    let tx_for_streaming = tx.clone();
 
     // Stdin reader thread
     let tx_stdin = tx.clone();
@@ -237,117 +234,217 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
     while let Ok(event) = rx.recv() {
         match event {
             Event::Stdin(data) => {
-                let mut handled_instruction = false;
+                match state {
+                    AgentState::Idle => {
+                        let mut handled_instruction = false;
 
-                // Track keystrokes in line buffer during prompt-related states:
-                // - Prompt = after 133;A (prompt start)
-                // - Input  = after 133;B (prompt rendered, ZLE/readline ready)
-                // - Idle   = after 133;D but before 133;A (brief window)
-                if matches!(
-                    parser.terminal_state,
-                    TerminalState::Prompt | TerminalState::Input | TerminalState::Idle
-                ) {
-                    for &b in &data {
-                        match b {
-                            b'\r' | b'\n' => {
-                                let trimmed = line_buf.trim();
-                                if let Some(instruction) = trimmed.strip_prefix('#') {
-                                    let instruction = instruction.trim();
-                                    if !instruction.is_empty() {
-                                        handled_instruction = true;
+                        // Track keystrokes in line buffer during prompt-related states:
+                        // - Prompt = after 133;A (prompt start)
+                        // - Input  = after 133;B (prompt rendered, ZLE/readline ready)
+                        // - Idle   = after 133;D but before 133;A (brief window)
+                        if matches!(
+                            parser.terminal_state,
+                            TerminalState::Prompt | TerminalState::Input | TerminalState::Idle
+                        ) {
+                            for &b in &data {
+                                match b {
+                                    b'\r' | b'\n' => {
+                                        let trimmed = line_buf.trim();
+                                        if let Some(instruction) = trimmed.strip_prefix('#') {
+                                            let instruction = instruction.trim();
+                                            if !instruction.is_empty() {
+                                                handled_instruction = true;
+                                                pending_instruction = Some(instruction.to_string());
 
-                                        // Handle instruction via backend
-                                        let result = handle_instruction(
-                                            rt_handle,
-                                            config,
-                                            instruction,
-                                            &output_history,
-                                            &conversation,
-                                            terminal_size,
-                                            &mut stderr,
-                                        );
+                                                // Clear shell readline (removes the # text)
+                                                let _ = session.write_all(b"\x15");
 
-                                        // Always clear shell readline after instruction
-                                        // (removes the # instruction text from prompt)
-                                        let _ = session.write_all(b"\x15");
-
-                                        // Extract commands and start agentic loop
-                                        if let Ok(Some((commands, response_text))) = result {
-                                            conversation
-                                                .push(ConversationMessage::user(instruction));
-                                            conversation.push(ConversationMessage::assistant(
-                                                &response_text,
-                                            ));
-
-                                            run_agentic_loop(
-                                                commands,
-                                                &mut session,
-                                                &mut parser,
-                                                &mut command_queue,
-                                                &mut output_history,
-                                                &mut conversation,
-                                                &mut line_buf,
-                                                &mut terminal_size,
-                                                &rx,
-                                                &mut stdout,
-                                                &mut stderr,
-                                                rt_handle,
-                                                config,
-                                                debug_osc,
-                                            )?;
+                                                // Start streaming from the backend
+                                                state = start_streaming(
+                                                    rt_handle,
+                                                    config,
+                                                    instruction,
+                                                    &output_history,
+                                                    &conversation,
+                                                    terminal_size,
+                                                    0,
+                                                    &tx_for_streaming,
+                                                    &mut stderr,
+                                                );
+                                            }
+                                        }
+                                        line_buf.clear();
+                                    }
+                                    0x7f | 0x08 => {
+                                        line_buf.pop();
+                                    }
+                                    0x15 => {
+                                        // Ctrl+U
+                                        line_buf.clear();
+                                    }
+                                    0x17 => {
+                                        // Ctrl+W
+                                        let trimmed = line_buf.trim_end();
+                                        if let Some(pos) = trimmed.rfind(' ') {
+                                            line_buf.truncate(pos + 1);
+                                        } else {
+                                            line_buf.clear();
                                         }
                                     }
-                                }
-                                line_buf.clear();
-                            }
-                            0x7f | 0x08 => {
-                                line_buf.pop();
-                            }
-                            0x15 => {
-                                // Ctrl+U
-                                line_buf.clear();
-                            }
-                            0x17 => {
-                                // Ctrl+W
-                                let trimmed = line_buf.trim_end();
-                                if let Some(pos) = trimmed.rfind(' ') {
-                                    line_buf.truncate(pos + 1);
-                                } else {
-                                    line_buf.clear();
+                                    b if b >= 0x20 => {
+                                        line_buf.push(b as char);
+                                    }
+                                    _ => {}
                                 }
                             }
-                            b if b >= 0x20 => {
-                                line_buf.push(b as char);
+                        } else {
+                            if debug_osc {
+                                for &b in &data {
+                                    if b == b'#' {
+                                        let _ = writeln!(
+                                            stderr,
+                                            "\r[ua:osc] '#' ignored (state={:?})",
+                                            parser.terminal_state
+                                        );
+                                    }
+                                }
                             }
-                            _ => {}
+                            line_buf.clear();
                         }
-                    }
-                } else {
-                    if debug_osc {
-                        // Log when keystrokes are ignored due to terminal state
-                        // (helps diagnose instruction detection issues)
-                        for &b in &data {
-                            if b == b'#' {
-                                let _ = writeln!(
-                                    stderr,
-                                    "\r[ua:osc] '#' ignored (state={:?})",
-                                    parser.terminal_state
-                                );
-                            }
-                        }
-                    }
-                    line_buf.clear();
-                }
 
-                // Forward input to PTY — but skip if we handled an instruction,
-                // since we already sent the plan commands and don't want the
-                // original Enter key to execute the # comment line.
-                if !handled_instruction {
-                    if let Err(e) = session.write_all(&data) {
-                        if debug_osc {
-                            let _ = writeln!(stderr, "\r[ua] pty write error: {e}");
+                        // Forward input to PTY unless we handled an instruction
+                        if !handled_instruction {
+                            if let Err(e) = session.write_all(&data) {
+                                if debug_osc {
+                                    let _ = writeln!(stderr, "\r[ua] pty write error: {e}");
+                                }
+                                break;
+                            }
                         }
-                        break;
+                    }
+                    AgentState::Streaming {
+                        ref mut cancel_tx, ..
+                    } => {
+                        // Check for Ctrl+C (0x03)
+                        if data.contains(&0x03) {
+                            // Cancel the backend task
+                            if let Some(tx) = cancel_tx.take() {
+                                let _ = tx.send(());
+                            }
+                            let _ = writeln!(stderr, "\r\n[ua] cancelled\r");
+                            state = AgentState::Idle;
+                            pending_instruction = None;
+                        }
+                        // Other input is ignored during streaming
+                    }
+                    AgentState::Executing { .. } => {
+                        // Check for Ctrl+C — forward to PTY and abort agent loop
+                        if data.contains(&0x03) {
+                            let _ = session.write_all(&[0x03]);
+                            command_queue.clear();
+                            let _ = writeln!(stderr, "\r\n[ua] cancelled\r");
+                            state = AgentState::Idle;
+                            pending_instruction = None;
+                        } else {
+                            // Forward other input to PTY (user may interact with commands)
+                            let _ = session.write_all(&data);
+                        }
+                    }
+                }
+            }
+            Event::BackendChunk(stream_event) => {
+                if let AgentState::Streaming {
+                    ref mut display,
+                    ref mut is_thinking,
+                    ..
+                } = state
+                {
+                    match &stream_event {
+                        StreamEvent::ThinkingDelta(text) => {
+                            if !*is_thinking {
+                                *is_thinking = true;
+                                let _ = write!(stderr, "\r\x1b[K\x1b[2m");
+                                let _ = stderr.flush();
+                            }
+                            let raw_safe = text.replace('\n', "\r\n");
+                            let _ = write!(stderr, "\x1b[2m{raw_safe}\x1b[0m");
+                            let _ = stderr.flush();
+                        }
+                        StreamEvent::TextDelta(text) => {
+                            if *is_thinking {
+                                *is_thinking = false;
+                                let _ = write!(stderr, "\x1b[0m\r\n");
+                            } else if display.streaming_text.is_empty() {
+                                let _ = write!(stderr, "\r\x1b[K");
+                            }
+                            let raw_safe = text.replace('\n', "\r\n");
+                            let _ = write!(stderr, "{raw_safe}");
+                            let _ = stderr.flush();
+                        }
+                        StreamEvent::Error(_) => {
+                            if display.streaming_text.is_empty() {
+                                let _ = write!(stderr, "\r\x1b[K");
+                                let _ = stderr.flush();
+                            }
+                        }
+                        _ => {}
+                    }
+                    display.handle_event(&stream_event);
+                }
+            }
+            Event::BackendDone => {
+                if let AgentState::Streaming {
+                    display, iteration, ..
+                } = std::mem::replace(&mut state, AgentState::Idle)
+                {
+                    // Trailing newline
+                    let _ = writeln!(stderr, "\r");
+
+                    match display.status {
+                        crate::display::DisplayStatus::Error(ref msg) => {
+                            let _ = writeln!(stderr, "\r\n[ua] error: {msg}");
+                            pending_instruction = None;
+                        }
+                        _ => {
+                            let response_text = display.streaming_text.clone();
+                            let commands = extract_commands(&response_text);
+
+                            // Push conversation history
+                            if let Some(instruction) = pending_instruction.take() {
+                                conversation.push(ConversationMessage::user(&instruction));
+                            }
+                            conversation.push(ConversationMessage::assistant(&response_text));
+
+                            if commands.is_empty() {
+                                // No commands — done
+                                state = AgentState::Idle;
+                            } else {
+                                // Show commands and execute immediately
+                                // (approval gate will be added in Commit 3)
+                                let _ = writeln!(stderr, "\r[ua] commands:");
+                                for (i, cmd) in commands.iter().enumerate() {
+                                    let safe = cmd.replace('\n', "\r\n");
+                                    let _ = writeln!(stderr, "\r  {}. {safe}", i + 1);
+                                }
+                                let _ = writeln!(stderr, "\r[ua] executing...");
+
+                                // Queue + dispatch first command
+                                command_queue.enqueue(commands);
+                                if let Some(cmd) = command_queue.pop_immediate() {
+                                    let cmd = format!("{cmd}\n");
+                                    if let Err(e) = session.write_all(cmd.as_bytes()) {
+                                        let _ = writeln!(stderr, "\r\n[ua] pty write error: {e}");
+                                        command_queue.clear();
+                                        state = AgentState::Idle;
+                                    } else {
+                                        state = AgentState::Executing {
+                                            iteration,
+                                            capture: OutputHistory::new(200),
+                                        };
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -357,6 +454,14 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
 
                 // Feed to output history
                 output_history.feed(&data);
+
+                // Also feed to execution capture if we're executing
+                if let AgentState::Executing {
+                    ref mut capture, ..
+                } = state
+                {
+                    capture.feed(&data);
+                }
 
                 let events = parser.feed_bytes(&data);
                 if debug_osc {
@@ -375,16 +480,66 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                     }
 
                     // OSC 133 sequencing: dispatch next command on 133;B
-                    // (prompt rendered, ZLE/readline ready — no double-echo)
                     match command_queue.handle_osc_event(evt) {
                         QueueEvent::Dispatch(cmd) => {
                             let cmd = format!("{cmd}\n");
                             if let Err(e) = session.write_all(cmd.as_bytes()) {
                                 let _ = writeln!(stderr, "\r\n[ua] pty write error: {e}");
                                 command_queue.clear();
+                                state = AgentState::Idle;
                             }
                         }
-                        QueueEvent::AllDone | QueueEvent::None => {}
+                        QueueEvent::AllDone => {
+                            // Commands finished executing
+                            if let AgentState::Executing {
+                                iteration, capture, ..
+                            } = std::mem::replace(&mut state, AgentState::Idle)
+                            {
+                                let captured_lines = capture.lines();
+                                if !captured_lines.is_empty() && iteration < MAX_AGENT_ITERATIONS {
+                                    // Build observation and call LLM again
+                                    let observation = format!(
+                                        "Command output:\n\n{}\n",
+                                        captured_lines.join("\n")
+                                    );
+                                    conversation.push(ConversationMessage::user(&observation));
+
+                                    // Clear readline before next LLM call
+                                    let _ = session.write_all(b"\x15");
+
+                                    // Don't set pending_instruction — we already pushed
+                                    // the observation as a user message above. The
+                                    // BackendDone handler only needs pending_instruction
+                                    // for the initial user instruction.
+
+                                    let next_iteration = iteration + 1;
+                                    if next_iteration >= MAX_AGENT_ITERATIONS {
+                                        let _ = writeln!(
+                                            stderr,
+                                            "\r[ua] max iterations ({MAX_AGENT_ITERATIONS}) reached"
+                                        );
+                                    } else {
+                                        let _ = writeln!(
+                                            stderr,
+                                            "\r[ua] observing output ({next_iteration}/{MAX_AGENT_ITERATIONS})..."
+                                        );
+                                        state = start_streaming(
+                                            rt_handle,
+                                            config,
+                                            &observation,
+                                            &output_history,
+                                            &conversation,
+                                            terminal_size,
+                                            next_iteration,
+                                            &tx_for_streaming,
+                                            &mut stderr,
+                                        );
+                                    }
+                                }
+                                // else: no output or max iterations — stay Idle
+                            }
+                        }
+                        QueueEvent::None => {}
                     }
                 }
             }
@@ -397,8 +552,6 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                     }
                 }
             }
-            // These variants are used by the state machine (not yet active).
-            Event::BackendChunk(_) | Event::BackendDone => {}
         }
 
         // Check if child has exited
@@ -413,160 +566,74 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
     Ok(())
 }
 
-/// Maximum number of agentic loop iterations before stopping.
-const MAX_AGENT_ITERATIONS: usize = 10;
-
-/// Run the agentic loop: execute commands, observe output, call LLM again.
-///
-/// Continues until the LLM responds without code blocks or max iterations reached.
+/// Spawn a tokio task to stream from the backend, forwarding events through the mpsc channel.
+/// Returns the initial AgentState::Streaming.
 #[allow(clippy::too_many_arguments)]
-fn run_agentic_loop(
-    initial_commands: Vec<String>,
-    session: &mut PtySession,
-    parser: &mut OscParser,
-    command_queue: &mut CommandQueue,
-    output_history: &mut OutputHistory,
-    conversation: &mut Vec<ConversationMessage>,
-    line_buf: &mut String,
-    terminal_size: &mut (u16, u16),
-    rx: &mpsc::Receiver<Event>,
-    stdout: &mut io::StdoutLock<'_>,
-    stderr: &mut io::Stderr,
+fn start_streaming(
     rt_handle: &Handle,
     config: &Config,
-    debug_osc: bool,
-) -> io::Result<()> {
-    let mut current_commands = initial_commands;
-    let mut iteration = 0;
-
-    while !current_commands.is_empty() && iteration < MAX_AGENT_ITERATIONS {
-        iteration += 1;
-
-        if iteration > 1 {
-            let _ = writeln!(
-                stderr,
-                "\r[ua] running commands ({iteration}/{MAX_AGENT_ITERATIONS})..."
-            );
+    instruction: &str,
+    history: &OutputHistory,
+    conversation: &[ConversationMessage],
+    terminal_size: (u16, u16),
+    iteration: usize,
+    tx: &mpsc::Sender<Event>,
+    stderr: &mut io::Stderr,
+) -> AgentState {
+    // Resolve API key
+    let api_key = match config.backend.anthropic.resolve_api_key() {
+        Ok(key) => key,
+        Err(e) => {
+            let _ = writeln!(stderr, "\r\n[ua] error: {e}");
+            return AgentState::Idle;
         }
+    };
 
-        // Queue + dispatch first command
-        command_queue.enqueue(current_commands);
-        if let Some(cmd) = command_queue.pop_immediate() {
-            let cmd = format!("{cmd}\n");
-            if let Err(e) = session.write_all(cmd.as_bytes()) {
-                let _ = writeln!(stderr, "\r\n[ua] pty write error: {e}");
-                command_queue.clear();
-                return Ok(());
-            }
-        }
+    // Build request
+    let request = build_agent_request(
+        instruction,
+        config,
+        history,
+        conversation.to_vec(),
+        terminal_size,
+    );
 
-        // Inner event loop: process events until AllDone
-        let mut capture = OutputHistory::new(200);
-        let mut pty_eof = false;
+    // Create client and stream
+    let client = AnthropicClient::with_model(&api_key, &config.backend.anthropic.model);
+    let stream = client.send(&request);
 
-        'commands: loop {
-            match rx.recv() {
-                Ok(Event::PtyOutput(data)) => {
-                    stdout.write_all(&data)?;
-                    stdout.flush()?;
-                    output_history.feed(&data);
-                    capture.feed(&data);
+    // Show immediate feedback
+    let _ = write!(stderr, "\r\n[ua] thinking...");
+    let _ = stderr.flush();
 
-                    let events = parser.feed_bytes(&data);
-                    if debug_osc {
-                        for evt in &events {
-                            let _ = writeln!(
-                                stderr,
-                                "\r[ua:osc] {evt:?} -> state={:?}",
-                                parser.terminal_state
-                            );
-                        }
-                    }
+    // Cancellation channel
+    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
 
-                    for evt in &events {
-                        if *evt == OscEvent::Osc133A {
-                            line_buf.clear();
-                        }
-                        match command_queue.handle_osc_event(evt) {
-                            QueueEvent::Dispatch(cmd) => {
-                                let cmd = format!("{cmd}\n");
-                                if let Err(e) = session.write_all(cmd.as_bytes()) {
-                                    let _ = writeln!(stderr, "\r\n[ua] pty write error: {e}");
-                                    command_queue.clear();
-                                    break 'commands;
-                                }
-                            }
-                            QueueEvent::AllDone => break 'commands,
-                            QueueEvent::None => {}
-                        }
+    // Spawn tokio task that forwards stream events through the mpsc channel
+    let tx_clone = tx.clone();
+    rt_handle.spawn(async move {
+        let mut stream = std::pin::pin!(stream);
+        tokio::select! {
+            _ = async {
+                while let Some(event) = stream.next().await {
+                    if tx_clone.send(Event::BackendChunk(event)).is_err() {
+                        break;
                     }
                 }
-                Ok(Event::Resize(cols, rows)) => {
-                    *terminal_size = (cols, rows);
-                    if let Err(e) = session.resize(cols, rows) {
-                        if debug_osc {
-                            let _ = writeln!(stderr, "\r[ua] resize error: {e}");
-                        }
-                    }
-                }
-                Ok(Event::Stdin(data)) => {
-                    // Forward to PTY (user may need to interact with commands)
-                    let _ = session.write_all(&data);
-                }
-                Ok(Event::BackendChunk(_)) | Ok(Event::BackendDone) => {
-                    // Not used in blocking agentic loop path
-                }
-                Ok(Event::PtyEof) | Err(_) => {
-                    pty_eof = true;
-                    break 'commands;
-                }
+            } => {}
+            _ = cancel_rx => {
+                // Cancelled — stop streaming
             }
         }
+        let _ = tx_clone.send(Event::BackendDone);
+    });
 
-        if pty_eof {
-            break;
-        }
-
-        // Build observation from captured output
-        let captured_lines = capture.lines();
-        if captured_lines.is_empty() {
-            break;
-        }
-
-        let observation = format!("Command output:\n\n{}\n", captured_lines.join("\n"));
-        conversation.push(ConversationMessage::user(&observation));
-
-        // Clear readline before next LLM call
-        let _ = session.write_all(b"\x15");
-
-        // Call LLM again
-        let result = handle_instruction(
-            rt_handle,
-            config,
-            &observation,
-            output_history,
-            conversation,
-            *terminal_size,
-            stderr,
-        );
-
-        match result {
-            Ok(Some((new_commands, new_response))) => {
-                conversation.push(ConversationMessage::assistant(&new_response));
-                current_commands = new_commands;
-            }
-            _ => break,
-        }
+    AgentState::Streaming {
+        cancel_tx: Some(cancel_tx),
+        display: PlanDisplay::new(),
+        is_thinking: false,
+        iteration,
     }
-
-    if iteration >= MAX_AGENT_ITERATIONS {
-        let _ = writeln!(
-            stderr,
-            "\r[ua] max iterations ({MAX_AGENT_ITERATIONS}) reached"
-        );
-    }
-
-    Ok(())
 }
 
 /// Extract shell commands from fenced code blocks in text.
@@ -600,114 +667,6 @@ fn extract_commands(text: &str) -> Vec<String> {
     }
 
     commands
-}
-
-/// Handle an instruction by calling the backend.
-/// Returns extracted commands and the full response text on success.
-fn handle_instruction(
-    rt_handle: &Handle,
-    config: &Config,
-    instruction: &str,
-    history: &OutputHistory,
-    conversation: &[ConversationMessage],
-    terminal_size: (u16, u16),
-    stderr: &mut io::Stderr,
-) -> io::Result<Option<(Vec<String>, String)>> {
-    // Resolve API key
-    let api_key = match config.backend.anthropic.resolve_api_key() {
-        Ok(key) => key,
-        Err(e) => {
-            let _ = writeln!(stderr, "\r\n[ua] error: {e}");
-            return Ok(None);
-        }
-    };
-
-    // Build request
-    let request = build_agent_request(
-        instruction,
-        config,
-        history,
-        conversation.to_vec(),
-        terminal_size,
-    );
-
-    // Create client and send request
-    let client = AnthropicClient::with_model(&api_key, &config.backend.anthropic.model);
-    let stream = client.send(&request);
-
-    // Show immediate feedback
-    let _ = write!(stderr, "\r\n[ua] thinking...");
-    let _ = stderr.flush();
-
-    // Process stream
-    let mut display = PlanDisplay::new();
-    let mut is_thinking = false;
-
-    rt_handle.block_on(async {
-        let mut stream = std::pin::pin!(stream);
-        while let Some(event) = stream.next().await {
-            match &event {
-                StreamEvent::ThinkingDelta(text) => {
-                    if !is_thinking {
-                        is_thinking = true;
-                        // Clear the early "thinking..." and start dimmed thinking output
-                        let _ = write!(stderr, "\r\x1b[K\x1b[2m");
-                        let _ = stderr.flush();
-                    }
-                    let raw_safe = text.replace('\n', "\r\n");
-                    let _ = write!(stderr, "\x1b[2m{raw_safe}\x1b[0m");
-                    let _ = stderr.flush();
-                }
-                StreamEvent::TextDelta(text) => {
-                    if is_thinking {
-                        is_thinking = false;
-                        let _ = write!(stderr, "\x1b[0m\r\n");
-                    } else if display.streaming_text.is_empty() {
-                        // First text delta — clear the "thinking..." indicator
-                        let _ = write!(stderr, "\r\x1b[K");
-                    }
-                    let raw_safe = text.replace('\n', "\r\n");
-                    let _ = write!(stderr, "{raw_safe}");
-                    let _ = stderr.flush();
-                }
-                StreamEvent::Error(_) => {
-                    // Clear "thinking..." indicator so the error is visible
-                    if display.streaming_text.is_empty() {
-                        let _ = write!(stderr, "\r\x1b[K");
-                        let _ = stderr.flush();
-                    }
-                }
-                _ => {}
-            }
-
-            display.handle_event(&event);
-        }
-    });
-
-    // Trailing newline
-    let _ = writeln!(stderr, "\r");
-
-    match display.status {
-        crate::display::DisplayStatus::Error(msg) => {
-            let _ = writeln!(stderr, "\r\n[ua] error: {msg}");
-            Ok(None)
-        }
-        _ => {
-            let response_text = display.streaming_text.clone();
-            let commands = extract_commands(&response_text);
-
-            if !commands.is_empty() {
-                let _ = writeln!(stderr, "\r[ua] commands:");
-                for (i, cmd) in commands.iter().enumerate() {
-                    let safe = cmd.replace('\n', "\r\n");
-                    let _ = writeln!(stderr, "\r  {}. {safe}", i + 1);
-                }
-                let _ = writeln!(stderr, "\r[ua] executing...");
-            }
-
-            Ok(Some((commands, response_text)))
-        }
-    }
 }
 
 #[cfg(test)]
