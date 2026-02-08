@@ -166,6 +166,107 @@ If the child shell doesn't support OSC 133 injection (unusual shell, user disabl
 integration = true    # inject OSC 133 prompt markers (default: true)
 ```
 
+### 2.10 Command Protocol: LLM-to-PTY
+
+How the LLM's intent to execute a command reaches the PTY. This is the
+critical boundary between "text for the user" and "command for the shell."
+
+#### 2.10.1 Current: API-Level Tool Use
+
+The LLM backend's structured output protocol (Anthropic tool_use, OpenAI
+function_calling) provides the delimiter. No text parsing required.
+
+The agent defines a single tool:
+
+```json
+{
+  "name": "shell",
+  "description": "Execute a shell command. The command is sent to the user's shell via PTY.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "command": { "type": "string", "description": "Shell command to execute" }
+    },
+    "required": ["command"]
+  }
+}
+```
+
+The LLM response contains two types of content blocks:
+- **Text blocks** → display to user (reasoning, explanations)
+- **Tool use blocks** → extract `.input.command`, route to PTY
+
+```
+LLM response stream:
+  [text]     "I'll check the project structure."
+  [tool_use] { "name": "shell", "command": "cat Cargo.toml && head -30 PLAN.md" }
+  [text]     "Let me look at the config next."
+  [tool_use] { "name": "shell", "command": "cat ~/.config/unixagent/config.toml" }
+```
+
+What the user sees on stderr: the text blocks, streamed naturally. Commands
+are invisible in the text — they arrive through the API's structured channel
+and go directly to the PTY. After each tool_use, the agent captures output
+and sends it back as a `tool_result` for the next turn.
+
+This is the "translate to native" approach: the API's tool call boundary
+IS the ECMA-48 APC boundary, conceptually. We just map one protocol to
+the other.
+
+#### 2.10.2 Future: Native APC Tokens (Custom Tokenizer)
+
+With control over the model's tokenizer, the delimiter moves from the API
+protocol layer into the token stream itself, using ECMA-48 APC (Application
+Program Command) — the control sequence literally designed for this purpose.
+
+**Two special tokens added to the vocabulary:**
+
+| Token | Bytes | ECMA-48 |
+|-------|-------|---------|
+| `<cmd>` | `ESC _` (0x1B 0x5F) | APC — Application Program Command |
+| `</cmd>` | `ESC \` (0x1B 0x5C) | ST — String Terminator |
+
+**Model output becomes a single stream:**
+
+```
+I'll check the project structure.
+\x1b_cat Cargo.toml && head -30 PLAN.md\x1b\
+Let me look at the config next.
+\x1b_cat ~/.config/unixagent/config.toml\x1b\
+```
+
+**Terminal behavior:** APC sequences are invisible per ECMA-48. Every
+terminal emulator swallows them. The user sees:
+
+```
+I'll check the project structure.
+Let me look at the config next.
+```
+
+**Architecture collapses to almost nothing:**
+- Stream LLM output directly to stdout (it IS the terminal output)
+- Parse for APC boundaries in the byte stream
+- On APC open: buffer command bytes
+- On ST: write buffered command to PTY, wait for OSC 133 AllDone
+- Resume streaming
+
+No `extract_commands()`. No separate stderr display path. No tool_use
+JSON parsing. The LLM's output stream and the terminal are unified.
+
+**Requirements:**
+- Open-weight model (Llama, Mistral, Qwen, etc.)
+- Custom tokenizer with APC/ST special tokens
+- Fine-tuning on conversations that use `<cmd>`/`</cmd>` boundaries
+- Inference via vLLM, llama.cpp, or custom serving stack
+
+**Why APC specifically:**
+- ECMA-48 §8.3.2: "used as the opening delimiter of a control string
+  for application program use" — this is its literal purpose
+- Terminals ignore it (invisible by spec, not by hack)
+- No collision with existing OSC 133 sequences (different namespace)
+- ST (String Terminator) is shared with OSC, so the parser already
+  handles `ESC \` termination
+
 ---
 
 ## 3. Capabilities

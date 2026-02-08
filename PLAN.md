@@ -57,7 +57,8 @@ management. Plan display. Agentic loop.
 | **Auto-execute plan commands via PTY** | DONE | `ua-core/src/repl.rs` |
 | Silent shell integration injection (single-line eval + clear) | DONE | `ua-core/src/shell_scripts.rs` |
 | **Agentic loop (execute → observe → iterate)** | DONE | `ua-core/src/repl.rs`, `ua-backend/src/anthropic.rs` |
-| 104 unit tests pass, `make check` clean | DONE | |
+| **Tool use API for command delivery** | DONE | `ua-protocol/src/message.rs`, `ua-backend/src/anthropic.rs`, `ua-backend/src/mock.rs`, `ua-core/src/repl.rs` |
+| 110 unit tests pass, `make check` clean | DONE | |
 
 **Exit criteria met**:
 - `# what's in /tmp` → backend returns plan with `ls /tmp` ✅
@@ -65,6 +66,7 @@ management. Plan display. Agentic loop.
 - Context stays within token limits across multiple turns ✅
 - Commands are auto-executed after displaying the plan ✅
 - Agentic loop: commands execute, output fed back, LLM iterates until done ✅
+- Commands delivered via tool_use API (no text parsing) ✅
 
 ---
 
@@ -189,8 +191,8 @@ Child agents, policy inheritance, trace propagation, musl build, packaging.
 | ~~Sync/async bridge via `block_on`~~ | ~~2026-02-07~~ | ~~Replaced by async state machine~~ |
 | Async state machine with spawned tokio task | 2026-02-08 | Backend streams forwarded through mpsc channel via spawned tokio task. AgentState enum (Idle/Streaming/Approving/Executing) drives the main event loop. Cancellation via oneshot channel. |
 | No backend trait yet | 2026-02-07 | Per DESIGN.md §4.5 — extract common interface in Phase 3 after second backend exists |
-| ~~Tool use for structured plans~~ | ~~2026-02-07~~ | ~~Replaced by plain text + OSC 133 sequencing~~ |
-| Plain text + OSC 133 sequencing | 2026-02-08 | LLM outputs commands in fenced code blocks; commands executed one-at-a-time via OSC 133 prompt detection. Simpler than tool calls, more robust than blasting all commands at once |
+| ~~Plain text code block parsing~~ | ~~2026-02-08~~ | ~~Replaced by tool_use API~~ |
+| Tool use API for commands | 2026-02-08 | Commands delivered via Anthropic tool_use (shell tool) instead of parsing fenced code blocks from text. Truly invisible delimiter — structured API channel, not text. SseProcessor accumulates tool blocks across SSE events. See DESIGN.md §2.10 |
 | Extended thinking enabled | 2026-02-08 | Anthropic API with thinking budget (10k tokens), API version 2023-06-01 |
 | Dispatch commands on 133;B not 133;A | 2026-02-08 | 133;A fires in precmd before prompt rendering/ZLE init; dispatching there causes double-echo. 133;B fires after prompt is ready (zle-line-init for zsh, PS1 embedded for bash) |
 | Agentic loop via inner event loop | 2026-02-08 | After commands execute, output is captured and fed back to LLM. Loop continues until LLM responds without code blocks or max 10 iterations. Inner loop reads from same mpsc channel, keeping event-driven model intact |

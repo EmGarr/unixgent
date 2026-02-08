@@ -44,6 +44,7 @@ impl PlanDisplay {
                 self.status = DisplayStatus::Streaming;
                 self.streaming_text.push_str(text);
             }
+            StreamEvent::ToolUse { .. } => {}
             StreamEvent::Usage { .. } => {}
             StreamEvent::Done => {}
             StreamEvent::Error(msg) => {

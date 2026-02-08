@@ -40,6 +40,8 @@ enum AgentState {
         is_thinking: bool,
         /// Current agentic loop iteration (0-based).
         iteration: usize,
+        /// Commands captured from tool_use events.
+        tool_commands: Vec<String>,
     },
     /// Awaiting user approval of proposed commands.
     Approving {
@@ -436,6 +438,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                 if let AgentState::Streaming {
                     ref mut display,
                     ref mut is_thinking,
+                    ref mut tool_commands,
                     ..
                 } = state
                 {
@@ -461,6 +464,15 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                             let _ = write!(stderr, "{raw_safe}");
                             let _ = stderr.flush();
                         }
+                        StreamEvent::ToolUse { input_json, .. } => {
+                            // Parse the tool input to extract the command
+                            if let Ok(input) = serde_json::from_str::<serde_json::Value>(input_json)
+                            {
+                                if let Some(cmd) = input.get("command").and_then(|c| c.as_str()) {
+                                    tool_commands.push(cmd.to_string());
+                                }
+                            }
+                        }
                         StreamEvent::Error(_) => {
                             if display.streaming_text.is_empty() {
                                 let _ = write!(stderr, "\r\x1b[K");
@@ -474,7 +486,10 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
             }
             Event::BackendDone => {
                 if let AgentState::Streaming {
-                    display, iteration, ..
+                    display,
+                    iteration,
+                    tool_commands,
+                    ..
                 } = std::mem::replace(&mut state, AgentState::Idle)
                 {
                     // Trailing newline
@@ -487,7 +502,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                         }
                         _ => {
                             let response_text = display.streaming_text.clone();
-                            let commands = extract_commands(&response_text);
+                            let commands = tool_commands;
 
                             // Push conversation history
                             if let Some(instruction) = pending_instruction.take() {
@@ -718,108 +733,55 @@ fn start_streaming(
         display: PlanDisplay::new(),
         is_thinking: false,
         iteration,
+        tool_commands: Vec::new(),
     }
-}
-
-/// Extract shell commands from fenced code blocks in text.
-///
-/// Parses ``` blocks (with optional language tag like ```bash).
-/// Returns the content of each code block as a separate command string.
-fn extract_commands(text: &str) -> Vec<String> {
-    let mut commands = Vec::new();
-    let mut in_block = false;
-    let mut current_block = String::new();
-
-    for line in text.lines() {
-        if !in_block {
-            if line.starts_with("```") {
-                in_block = true;
-                current_block.clear();
-            }
-        } else if line.starts_with("```") {
-            // End of block
-            let trimmed = current_block.trim().to_string();
-            if !trimmed.is_empty() {
-                commands.push(trimmed);
-            }
-            in_block = false;
-        } else {
-            if !current_block.is_empty() {
-                current_block.push('\n');
-            }
-            current_block.push_str(line);
-        }
-    }
-
-    commands
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::display::PlanDisplay;
 
-    // --- extract_commands tests ---
+    // --- Tool use command extraction tests ---
 
-    #[test]
-    fn extract_single_command() {
-        let text = "Here's how to list files:\n\n```\nls /tmp\n```\n";
-        let commands = extract_commands(text);
-        assert_eq!(commands, vec!["ls /tmp"]);
+    /// Helper: parse a tool_use input JSON to extract the command, same as REPL does.
+    fn extract_tool_command(input_json: &str) -> Option<String> {
+        let input: serde_json::Value = serde_json::from_str(input_json).ok()?;
+        input
+            .get("command")
+            .and_then(|c| c.as_str())
+            .map(|s| s.to_string())
     }
 
     #[test]
-    fn extract_multiple_commands() {
-        let text =
-            "First list, then show:\n\n```\nls /tmp\n```\n\nThen:\n\n```\ncat foo.txt\n```\n";
-        let commands = extract_commands(text);
-        assert_eq!(commands, vec!["ls /tmp", "cat foo.txt"]);
+    fn tool_use_extracts_command() {
+        let json = r#"{"command":"ls /tmp"}"#;
+        assert_eq!(extract_tool_command(json), Some("ls /tmp".to_string()));
     }
 
     #[test]
-    fn extract_with_language_tag() {
-        let text = "```bash\nls -la\n```\n";
-        let commands = extract_commands(text);
-        assert_eq!(commands, vec!["ls -la"]);
+    fn tool_use_extracts_chained_command() {
+        let json = r#"{"command":"cat Cargo.toml && head -30 PLAN.md"}"#;
+        assert_eq!(
+            extract_tool_command(json),
+            Some("cat Cargo.toml && head -30 PLAN.md".to_string())
+        );
     }
 
     #[test]
-    fn extract_multiline_command() {
-        let text = "```\nfor f in *.txt; do\n  echo $f\ndone\n```\n";
-        let commands = extract_commands(text);
-        assert_eq!(commands, vec!["for f in *.txt; do\n  echo $f\ndone"]);
+    fn tool_use_missing_command_field() {
+        let json = r#"{"cmd":"ls"}"#;
+        assert_eq!(extract_tool_command(json), None);
     }
 
     #[test]
-    fn extract_no_commands() {
-        let text = "There are no commands to run here. Just an explanation.";
-        let commands = extract_commands(text);
-        assert!(commands.is_empty());
+    fn tool_use_invalid_json() {
+        assert_eq!(extract_tool_command("not json"), None);
     }
 
     #[test]
-    fn extract_empty_code_block() {
-        let text = "```\n```\n";
-        let commands = extract_commands(text);
-        assert!(commands.is_empty());
-    }
-
-    #[test]
-    fn extract_skips_unclosed_block() {
-        let text = "```\nls /tmp\n";
-        let commands = extract_commands(text);
-        assert!(commands.is_empty());
-    }
-
-    #[test]
-    fn extract_mixed_content() {
-        let text = "I'll check the system.\n\n\
-                     ```\nuname -a\n```\n\n\
-                     This shows the kernel info.\n\n\
-                     ```sh\ndf -h\n```\n\n\
-                     And that shows disk usage.";
-        let commands = extract_commands(text);
-        assert_eq!(commands, vec!["uname -a", "df -h"]);
+    fn tool_use_empty_command() {
+        let json = r#"{"command":""}"#;
+        assert_eq!(extract_tool_command(json), Some(String::new()));
     }
 
     // --- CommandQueue tests ---
@@ -1067,144 +1029,101 @@ mod tests {
         );
     }
 
-    // --- End-to-end tests: mock StreamEvent deltas → commands → dispatch ---
+    // --- End-to-end tests: mock StreamEvent with tool_use ---
 
     #[test]
-    fn mock_deltas_to_commands_single() {
+    fn mock_tool_use_single_command() {
+        // Text + tool_use: command comes via ToolUse event, not code blocks
         let events = vec![
-            StreamEvent::TextDelta("Here's the command:\n\n```\nls /tmp\n```\n".to_string()),
+            StreamEvent::TextDelta("I'll list the files.".to_string()),
+            StreamEvent::ToolUse {
+                id: "toolu_123".to_string(),
+                name: "shell".to_string(),
+                input_json: r#"{"command":"ls /tmp"}"#.to_string(),
+            },
             StreamEvent::Done,
         ];
 
-        let mut display = PlanDisplay::new();
+        let mut commands = Vec::new();
         for event in &events {
-            display.handle_event(event);
+            if let StreamEvent::ToolUse { input_json, .. } = event {
+                if let Some(cmd) = extract_tool_command(input_json) {
+                    commands.push(cmd);
+                }
+            }
         }
 
-        let commands = extract_commands(&display.streaming_text);
         assert_eq!(commands, vec!["ls /tmp"]);
     }
 
     #[test]
-    fn mock_deltas_to_commands_with_thinking() {
+    fn mock_tool_use_with_thinking() {
         let events = vec![
             StreamEvent::ThinkingDelta("Let me analyze...".to_string()),
-            StreamEvent::TextDelta("I'll list the files:\n\n".to_string()),
-            StreamEvent::TextDelta("```bash\nls -la /tmp\n```\n".to_string()),
+            StreamEvent::TextDelta("I'll check the project.".to_string()),
+            StreamEvent::ToolUse {
+                id: "toolu_456".to_string(),
+                name: "shell".to_string(),
+                input_json: r#"{"command":"cat Cargo.toml && head -30 PLAN.md"}"#.to_string(),
+            },
             StreamEvent::Done,
         ];
 
         let mut display = PlanDisplay::new();
+        let mut commands = Vec::new();
         for event in &events {
             display.handle_event(event);
+            if let StreamEvent::ToolUse { input_json, .. } = event {
+                if let Some(cmd) = extract_tool_command(input_json) {
+                    commands.push(cmd);
+                }
+            }
         }
 
-        let commands = extract_commands(&display.streaming_text);
-        assert_eq!(commands, vec!["ls -la /tmp"]);
-        // Thinking text should not leak into command extraction
+        assert_eq!(commands, vec!["cat Cargo.toml && head -30 PLAN.md"]);
+        // Text and thinking are separate from commands
         assert!(!display.thinking_text.is_empty());
-        assert!(!display.streaming_text.contains("analyze"));
+        assert!(display.streaming_text.contains("check the project"));
+        // No code blocks in the text
+        assert!(!display.streaming_text.contains("```"));
     }
 
     #[test]
-    fn mock_deltas_multiple_commands_sequenced() {
-        // Simulate LLM response with multiple commands
+    fn mock_text_only_no_tool_use() {
+        // Final answer: text only, no tool_use
         let events = vec![
-            StreamEvent::ThinkingDelta("I need to create and verify a file.".to_string()),
-            StreamEvent::TextDelta(
-                "First, create the file:\n\n```\ntouch /tmp/test.txt\n```\n\n".to_string(),
-            ),
-            StreamEvent::TextDelta(
-                "Then verify it exists:\n\n```\nls -la /tmp/test.txt\n```\n".to_string(),
-            ),
+            StreamEvent::TextDelta("The directory is empty. Nothing to do.".to_string()),
             StreamEvent::Done,
         ];
 
-        let mut display = PlanDisplay::new();
+        let mut commands = Vec::new();
         for event in &events {
-            display.handle_event(event);
+            if let StreamEvent::ToolUse { input_json, .. } = event {
+                if let Some(cmd) = extract_tool_command(input_json) {
+                    commands.push(cmd);
+                }
+            }
         }
 
-        let commands = extract_commands(&display.streaming_text);
-        assert_eq!(
-            commands,
-            vec!["touch /tmp/test.txt", "ls -la /tmp/test.txt"]
-        );
-
-        // Verify sequenced dispatch via CommandQueue
-        let mut queue = CommandQueue::new();
-        queue.enqueue(commands);
-
-        // First command dispatched immediately (shell at prompt)
-        assert_eq!(
-            queue.pop_immediate(),
-            Some("touch /tmp/test.txt".to_string())
-        );
-
-        // Second command waits for 133;A (prompt start) then 133;B (prompt ready)
-        assert_eq!(queue.handle_osc_event(&OscEvent::Osc133A), QueueEvent::None);
-        assert_eq!(
-            queue.handle_osc_event(&OscEvent::Osc133B),
-            QueueEvent::Dispatch("ls -la /tmp/test.txt".to_string())
-        );
-
-        assert!(queue.is_empty());
-    }
-
-    #[test]
-    fn mock_deltas_no_commands() {
-        let events = vec![
-            StreamEvent::TextDelta(
-                "There are no files to list. The directory is empty.".to_string(),
-            ),
-            StreamEvent::Done,
-        ];
-
-        let mut display = PlanDisplay::new();
-        for event in &events {
-            display.handle_event(event);
-        }
-
-        let commands = extract_commands(&display.streaming_text);
         assert!(commands.is_empty());
     }
 
     #[test]
-    fn mock_deltas_streamed_code_block() {
-        // Simulate text arriving in small chunks (like real SSE streaming)
-        let events = vec![
-            StreamEvent::TextDelta("Here".to_string()),
-            StreamEvent::TextDelta("'s the command".to_string()),
-            StreamEvent::TextDelta(":\n\n```".to_string()),
-            StreamEvent::TextDelta("\nls".to_string()),
-            StreamEvent::TextDelta(" /tmp\n".to_string()),
-            StreamEvent::TextDelta("```\n".to_string()),
-            StreamEvent::Done,
-        ];
-
-        let mut display = PlanDisplay::new();
-        for event in &events {
-            display.handle_event(event);
-        }
-
-        let commands = extract_commands(&display.streaming_text);
-        assert_eq!(commands, vec!["ls /tmp"]);
-    }
-
-    #[test]
-    fn mock_deltas_error_yields_no_commands() {
+    fn mock_error_yields_no_commands() {
         let events = vec![
             StreamEvent::TextDelta("I'll help with".to_string()),
             StreamEvent::Error("Rate limited".to_string()),
         ];
 
-        let mut display = PlanDisplay::new();
+        let mut commands = Vec::new();
         for event in &events {
-            display.handle_event(event);
+            if let StreamEvent::ToolUse { input_json, .. } = event {
+                if let Some(cmd) = extract_tool_command(input_json) {
+                    commands.push(cmd);
+                }
+            }
         }
 
-        // On error, streaming_text is partial — extract_commands should handle gracefully
-        let commands = extract_commands(&display.streaming_text);
-        assert!(commands.is_empty()); // No complete code block
+        assert!(commands.is_empty());
     }
 }

@@ -62,13 +62,14 @@ impl AnthropicClient {
                 Ok(response) => {
                     let byte_stream = response.bytes_stream();
                     let mut sse_stream = parse_sse_stream(byte_stream);
+                    let mut processor = SseProcessor::new();
 
                     use futures::StreamExt;
 
                     while let Some(result) = sse_stream.next().await {
                         match result {
                             Ok(sse_event) => {
-                                for stream_event in process_sse_event(&sse_event) {
+                                for stream_event in processor.process(&sse_event) {
                                     yield stream_event;
                                 }
                             }
@@ -104,6 +105,7 @@ async fn send_request(
         stream: true,
         system: system_prompt,
         messages,
+        tools: vec![build_shell_tool()],
         thinking: ApiThinking {
             thinking_type: "enabled".to_string(),
             budget_tokens: 10000,
@@ -126,6 +128,24 @@ async fn send_request(
     }
 
     Ok(response)
+}
+
+fn build_shell_tool() -> ApiTool {
+    ApiTool {
+        name: "shell".to_string(),
+        description: "Execute a shell command. The command runs in the user's terminal via PTY."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "Shell command to execute. Chain multiple commands with && if needed."
+                }
+            },
+            "required": ["command"]
+        }),
+    }
 }
 
 fn build_system_prompt(request: &AgentRequest) -> String {
@@ -157,10 +177,10 @@ Terminal: {}x{}",
     }
 
     prompt.push_str(
-        "\n\nWhen you need to run commands, output them in fenced code blocks (```). \
-         Each code block will be executed and you will see the output. \
+        "\n\nUse the shell tool to execute commands. \
+         Each command runs and you will see the output. \
          You may then run more commands or provide your final answer. \
-         When you are done, respond without any code blocks.",
+         When you are done, respond with text only (no tool calls).",
     );
 
     prompt
@@ -189,75 +209,141 @@ fn build_messages(request: &AgentRequest) -> Vec<ApiMessage> {
     messages
 }
 
-fn process_sse_event(event: &SseEvent) -> Vec<StreamEvent> {
-    let mut events = Vec::new();
+/// Tracks state across SSE events for tool_use accumulation.
+///
+/// Tool use blocks arrive as:
+///   content_block_start (type=tool_use, id, name)
+///   content_block_delta* (input_json_delta chunks)
+///   content_block_stop
+struct SseProcessor {
+    /// Active tool_use block being accumulated.
+    active_tool: Option<ToolAccumulator>,
+}
 
-    // Parse the SSE data as JSON
-    let data: Value = match serde_json::from_str(&event.data) {
-        Ok(v) => v,
-        Err(_) => return events,
-    };
+struct ToolAccumulator {
+    id: String,
+    name: String,
+    input_json: String,
+}
 
-    let event_type = event.event_type.as_deref().unwrap_or("");
-
-    match event_type {
-        "message_start" => {
-            // Extract usage from message_start if present
-            if let Some(usage) = data.get("message").and_then(|m| m.get("usage")) {
-                if let (Some(input), Some(output)) = (
-                    usage.get("input_tokens").and_then(|v| v.as_u64()),
-                    usage.get("output_tokens").and_then(|v| v.as_u64()),
-                ) {
-                    events.push(StreamEvent::Usage {
-                        input_tokens: input as u32,
-                        output_tokens: output as u32,
-                    });
-                }
-            }
-        }
-        "content_block_delta" => {
-            if let Some(delta) = data.get("delta") {
-                let delta_type = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
-
-                match delta_type {
-                    "text_delta" => {
-                        if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
-                            events.push(StreamEvent::TextDelta(text.to_string()));
-                        }
-                    }
-                    "thinking_delta" => {
-                        if let Some(text) = delta.get("thinking").and_then(|t| t.as_str()) {
-                            events.push(StreamEvent::ThinkingDelta(text.to_string()));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        "message_delta" => {
-            // Extract final usage from message_delta
-            if let Some(usage) = data.get("usage") {
-                if let Some(output) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
-                    events.push(StreamEvent::Usage {
-                        input_tokens: 0,
-                        output_tokens: output as u32,
-                    });
-                }
-            }
-        }
-        "error" => {
-            let error_msg = data
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(|m| m.as_str())
-                .unwrap_or("Unknown error")
-                .to_string();
-            events.push(StreamEvent::Error(error_msg));
-        }
-        _ => {}
+impl SseProcessor {
+    fn new() -> Self {
+        Self { active_tool: None }
     }
 
-    events
+    fn process(&mut self, event: &SseEvent) -> Vec<StreamEvent> {
+        let mut events = Vec::new();
+
+        let data: Value = match serde_json::from_str(&event.data) {
+            Ok(v) => v,
+            Err(_) => return events,
+        };
+
+        let event_type = event.event_type.as_deref().unwrap_or("");
+
+        match event_type {
+            "message_start" => {
+                if let Some(usage) = data.get("message").and_then(|m| m.get("usage")) {
+                    if let (Some(input), Some(output)) = (
+                        usage.get("input_tokens").and_then(|v| v.as_u64()),
+                        usage.get("output_tokens").and_then(|v| v.as_u64()),
+                    ) {
+                        events.push(StreamEvent::Usage {
+                            input_tokens: input as u32,
+                            output_tokens: output as u32,
+                        });
+                    }
+                }
+            }
+            "content_block_start" => {
+                // Check if this is a tool_use block
+                if let Some(content_block) = data.get("content_block") {
+                    let block_type = content_block
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("");
+                    if block_type == "tool_use" {
+                        let id = content_block
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = content_block
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        self.active_tool = Some(ToolAccumulator {
+                            id,
+                            name,
+                            input_json: String::new(),
+                        });
+                    }
+                }
+            }
+            "content_block_delta" => {
+                if let Some(delta) = data.get("delta") {
+                    let delta_type = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+                    match delta_type {
+                        "text_delta" => {
+                            if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
+                                events.push(StreamEvent::TextDelta(text.to_string()));
+                            }
+                        }
+                        "thinking_delta" => {
+                            if let Some(text) = delta.get("thinking").and_then(|t| t.as_str()) {
+                                events.push(StreamEvent::ThinkingDelta(text.to_string()));
+                            }
+                        }
+                        "input_json_delta" => {
+                            // Accumulate tool input JSON chunks
+                            if let Some(partial) =
+                                delta.get("partial_json").and_then(|t| t.as_str())
+                            {
+                                if let Some(ref mut tool) = self.active_tool {
+                                    tool.input_json.push_str(partial);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "content_block_stop" => {
+                // If we were accumulating a tool_use, emit it now
+                if let Some(tool) = self.active_tool.take() {
+                    events.push(StreamEvent::ToolUse {
+                        id: tool.id,
+                        name: tool.name,
+                        input_json: tool.input_json,
+                    });
+                }
+            }
+            "message_delta" => {
+                if let Some(usage) = data.get("usage") {
+                    if let Some(output) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
+                        events.push(StreamEvent::Usage {
+                            input_tokens: 0,
+                            output_tokens: output as u32,
+                        });
+                    }
+                }
+            }
+            "error" => {
+                let error_msg = data
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("Unknown error")
+                    .to_string();
+                events.push(StreamEvent::Error(error_msg));
+            }
+            _ => {}
+        }
+
+        events
+    }
 }
 
 // API request/response types
@@ -269,7 +355,15 @@ struct ApiRequest {
     stream: bool,
     system: String,
     messages: Vec<ApiMessage>,
+    tools: Vec<ApiTool>,
     thinking: ApiThinking,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiTool {
+    name: String,
+    description: String,
+    input_schema: Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -317,7 +411,7 @@ mod tests {
         assert!(prompt.contains("Shell: bash"));
         assert!(prompt.contains("Platform: linux (x86_64)"));
         assert!(prompt.contains("Terminal: 80x24"));
-        assert!(prompt.contains("fenced code blocks"));
+        assert!(prompt.contains("shell tool"));
     }
 
     #[test]
@@ -404,7 +498,8 @@ mod tests {
                 .to_string(),
         };
 
-        let events = process_sse_event(&event);
+        let mut processor = SseProcessor::new();
+        let events = processor.process(&event);
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0], StreamEvent::TextDelta("Hello".to_string()));
@@ -418,7 +513,8 @@ mod tests {
                 .to_string(),
         };
 
-        let events = process_sse_event(&event);
+        let mut processor = SseProcessor::new();
+        let events = processor.process(&event);
 
         assert_eq!(events.len(), 1);
         assert_eq!(
@@ -436,9 +532,111 @@ mod tests {
                     .to_string(),
         };
 
-        let events = process_sse_event(&event);
+        let mut processor = SseProcessor::new();
+        let events = processor.process(&event);
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0], StreamEvent::Error("Rate limited".to_string()));
+    }
+
+    #[test]
+    fn process_tool_use_block() {
+        let mut processor = SseProcessor::new();
+
+        // content_block_start with tool_use
+        let start = SseEvent {
+            event_type: Some("content_block_start".to_string()),
+            data: r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_123","name":"shell","input":{}}}"#.to_string(),
+        };
+        assert!(processor.process(&start).is_empty());
+        assert!(processor.active_tool.is_some());
+
+        // input_json_delta chunks
+        let delta1 = SseEvent {
+            event_type: Some("content_block_delta".to_string()),
+            data: r#"{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"command\":"}}"#.to_string(),
+        };
+        assert!(processor.process(&delta1).is_empty());
+
+        let delta2 = SseEvent {
+            event_type: Some("content_block_delta".to_string()),
+            data: r#"{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"\"ls /tmp\"}"}}"#.to_string(),
+        };
+        assert!(processor.process(&delta2).is_empty());
+
+        // content_block_stop emits the ToolUse event
+        let stop = SseEvent {
+            event_type: Some("content_block_stop".to_string()),
+            data: r#"{"type":"content_block_stop","index":1}"#.to_string(),
+        };
+        let events = processor.process(&stop);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0],
+            StreamEvent::ToolUse {
+                id: "toolu_123".to_string(),
+                name: "shell".to_string(),
+                input_json: r#"{"command":"ls /tmp"}"#.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn process_text_then_tool_use() {
+        let mut processor = SseProcessor::new();
+
+        // Text block first
+        let text = SseEvent {
+            event_type: Some("content_block_delta".to_string()),
+            data: r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"I'll check the files."}}"#.to_string(),
+        };
+        let events = processor.process(&text);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0],
+            StreamEvent::TextDelta("I'll check the files.".to_string())
+        );
+
+        // Then tool_use
+        let start = SseEvent {
+            event_type: Some("content_block_start".to_string()),
+            data: r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_456","name":"shell","input":{}}}"#.to_string(),
+        };
+        processor.process(&start);
+
+        let delta = SseEvent {
+            event_type: Some("content_block_delta".to_string()),
+            data: r#"{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"command\":\"cat Cargo.toml\"}"}}"#.to_string(),
+        };
+        processor.process(&delta);
+
+        let stop = SseEvent {
+            event_type: Some("content_block_stop".to_string()),
+            data: r#"{"type":"content_block_stop","index":1}"#.to_string(),
+        };
+        let events = processor.process(&stop);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0],
+            StreamEvent::ToolUse {
+                id: "toolu_456".to_string(),
+                name: "shell".to_string(),
+                input_json: r#"{"command":"cat Cargo.toml"}"#.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn build_shell_tool_structure() {
+        let tool = build_shell_tool();
+        assert_eq!(tool.name, "shell");
+        assert!(tool.input_schema.get("properties").is_some());
+        assert!(tool
+            .input_schema
+            .get("properties")
+            .unwrap()
+            .get("command")
+            .is_some());
     }
 }

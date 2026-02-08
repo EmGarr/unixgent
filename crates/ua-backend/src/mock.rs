@@ -17,6 +17,12 @@ pub enum MockResponse {
     Thinking { content: String },
     /// Emit a text delta.
     Text { content: String },
+    /// Emit a tool use event.
+    ToolUse {
+        id: String,
+        name: String,
+        input_json: String,
+    },
     /// Emit usage information.
     Usage {
         input_tokens: u32,
@@ -72,6 +78,9 @@ pub fn mock_stream(config: MockConfig) -> impl Stream<Item = StreamEvent> {
                 MockResponse::Usage { input_tokens, output_tokens } => {
                     yield StreamEvent::Usage { input_tokens, output_tokens };
                 }
+                MockResponse::ToolUse { id, name, input_json } => {
+                    yield StreamEvent::ToolUse { id, name, input_json };
+                }
                 MockResponse::Error { message } => {
                     yield StreamEvent::Error(message);
                 }
@@ -90,22 +99,24 @@ pub fn mock_stream(config: MockConfig) -> impl Stream<Item = StreamEvent> {
 pub mod fixtures {
     use super::*;
 
-    /// Create a mock config for a text response with embedded commands.
+    /// Create a mock config for a text response with tool_use commands.
     pub fn text_with_commands(explanation: &str, commands: &[&str]) -> MockConfig {
         let mut responses = vec![MockResponse::Text {
             content: format!("{explanation}\n\n"),
         }];
 
-        for cmd in commands {
-            responses.push(MockResponse::Text {
-                content: format!("```\n{cmd}\n```\n\n"),
+        for (i, cmd) in commands.iter().enumerate() {
+            responses.push(MockResponse::ToolUse {
+                id: format!("toolu_mock_{i}"),
+                name: "shell".to_string(),
+                input_json: format!(r#"{{"command":"{cmd}"}}"#),
             });
         }
 
         MockConfig::new().with_responses(responses)
     }
 
-    /// Create a mock config with thinking followed by text with commands.
+    /// Create a mock config with thinking followed by text with tool_use commands.
     pub fn thinking_then_commands(
         thinking: &str,
         explanation: &str,
@@ -120,9 +131,11 @@ pub mod fixtures {
             },
         ];
 
-        for cmd in commands {
-            responses.push(MockResponse::Text {
-                content: format!("```\n{cmd}\n```\n\n"),
+        for (i, cmd) in commands.iter().enumerate() {
+            responses.push(MockResponse::ToolUse {
+                id: format!("toolu_mock_{i}"),
+                name: "shell".to_string(),
+                input_json: format!(r#"{{"command":"{cmd}"}}"#),
             });
         }
 
@@ -210,7 +223,7 @@ mod tests {
         let config = fixtures::text_with_commands("I'll list files", &["ls /tmp", "cat foo.txt"]);
         let events: Vec<_> = mock_stream(config).collect().await;
 
-        // explanation + 2 command blocks + Done
+        // explanation + 2 tool_use + Done
         assert_eq!(events.len(), 4);
         assert_eq!(
             events[0],
@@ -218,11 +231,19 @@ mod tests {
         );
         assert_eq!(
             events[1],
-            StreamEvent::TextDelta("```\nls /tmp\n```\n\n".to_string())
+            StreamEvent::ToolUse {
+                id: "toolu_mock_0".to_string(),
+                name: "shell".to_string(),
+                input_json: r#"{"command":"ls /tmp"}"#.to_string(),
+            }
         );
         assert_eq!(
             events[2],
-            StreamEvent::TextDelta("```\ncat foo.txt\n```\n\n".to_string())
+            StreamEvent::ToolUse {
+                id: "toolu_mock_1".to_string(),
+                name: "shell".to_string(),
+                input_json: r#"{"command":"cat foo.txt"}"#.to_string(),
+            }
         );
     }
 
@@ -235,11 +256,19 @@ mod tests {
         );
         let events: Vec<_> = mock_stream(config).collect().await;
 
-        // thinking + explanation + 1 command block + Done
+        // thinking + explanation + 1 tool_use + Done
         assert_eq!(events.len(), 4);
         assert_eq!(
             events[0],
             StreamEvent::ThinkingDelta("The user wants to see files".to_string())
+        );
+        assert_eq!(
+            events[2],
+            StreamEvent::ToolUse {
+                id: "toolu_mock_0".to_string(),
+                name: "shell".to_string(),
+                input_json: r#"{"command":"ls /tmp"}"#.to_string(),
+            }
         );
     }
 
