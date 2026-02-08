@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use tokio::runtime::Handle;
+use tokio::sync::oneshot;
 use ua_backend::AnthropicClient;
 use ua_protocol::{ConversationMessage, StreamEvent};
 
@@ -20,6 +21,46 @@ enum Event {
     PtyOutput(Vec<u8>),
     PtyEof,
     Resize(u16, u16),
+    /// A streaming event from the backend (forwarded from a spawned tokio task).
+    #[allow(dead_code)]
+    BackendChunk(StreamEvent),
+    /// The backend stream has finished (either completed or was cancelled).
+    #[allow(dead_code)]
+    BackendDone,
+}
+
+/// Agent state machine — drives the main event loop.
+#[allow(dead_code)]
+enum AgentState {
+    /// Waiting for user input. Normal shell operation.
+    Idle,
+    /// Streaming response from the LLM backend.
+    Streaming {
+        /// Send on this channel to cancel the backend task.
+        cancel_tx: Option<oneshot::Sender<()>>,
+        /// Accumulates the streamed response.
+        display: PlanDisplay,
+        /// Current agentic loop iteration (0-based).
+        iteration: usize,
+    },
+    /// Awaiting user approval of proposed commands.
+    Approving {
+        /// Commands extracted from the LLM response.
+        commands: Vec<String>,
+        /// Full response text from the LLM.
+        response_text: String,
+        /// Current agentic loop iteration.
+        iteration: usize,
+    },
+    /// Commands are being executed in the PTY.
+    Executing {
+        /// Current agentic loop iteration.
+        iteration: usize,
+        /// Captures output during execution for observation.
+        capture: OutputHistory,
+        /// Full response text from the LLM (for conversation history).
+        response_text: String,
+    },
 }
 
 /// Result of processing an OSC event through the command queue.
@@ -356,6 +397,8 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                     }
                 }
             }
+            // These variants are used by the state machine (not yet active).
+            Event::BackendChunk(_) | Event::BackendDone => {}
         }
 
         // Check if child has exited
@@ -469,6 +512,9 @@ fn run_agentic_loop(
                 Ok(Event::Stdin(data)) => {
                     // Forward to PTY (user may need to interact with commands)
                     let _ = session.write_all(&data);
+                }
+                Ok(Event::BackendChunk(_)) | Ok(Event::BackendDone) => {
+                    // Not used in blocking agentic loop path
                 }
                 Ok(Event::PtyEof) | Err(_) => {
                     pty_eof = true;
