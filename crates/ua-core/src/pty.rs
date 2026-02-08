@@ -47,6 +47,10 @@ impl PtySession {
         let mut cmd = CommandBuilder::new(shell_cmd);
         // Pass -l for login shell behavior (profile sourcing).
         cmd.arg("-l");
+        // Start in the user's current directory.
+        if let Ok(cwd) = std::env::current_dir() {
+            cmd.cwd(cwd);
+        }
         cmd.env(
             "TERM",
             std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()),

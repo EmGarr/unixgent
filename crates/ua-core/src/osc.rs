@@ -109,7 +109,7 @@ impl OscParser {
                     event
                 } else {
                     self.param_buf.push(byte);
-                    if self.param_buf.len() > 32 {
+                    if self.param_buf.len() > 256 {
                         // Prevent unbounded growth on malformed sequences
                         self.state = ParseState::Ground;
                         self.param_buf.clear();

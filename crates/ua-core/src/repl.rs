@@ -200,6 +200,10 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                             &mut stderr,
                                         );
 
+                                        // Always clear shell readline after instruction
+                                        // (removes the # instruction text from prompt)
+                                        let _ = session.write_all(b"\x15");
+
                                         // Extract commands and queue for execution
                                         if let Ok(Some((commands, response_text))) = result {
                                             conversation
@@ -211,10 +215,8 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                             if !commands.is_empty() {
                                                 command_queue.enqueue(commands);
 
-                                                // Clear shell's readline buffer (Ctrl+U),
-                                                // then send the first command immediately
+                                                // Send the first command immediately
                                                 // (shell is already at prompt with ZLE ready)
-                                                let _ = session.write_all(b"\x15");
                                                 if let Some(cmd) = command_queue.pop_immediate() {
                                                     let cmd = format!("{cmd}\n");
                                                     if let Err(e) =
@@ -255,6 +257,19 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                         }
                     }
                 } else {
+                    if debug_osc {
+                        // Log when keystrokes are ignored due to terminal state
+                        // (helps diagnose instruction detection issues)
+                        for &b in &data {
+                            if b == b'#' {
+                                let _ = writeln!(
+                                    stderr,
+                                    "\r[ua:osc] '#' ignored (state={:?})",
+                                    parser.terminal_state
+                                );
+                            }
+                        }
+                    }
                     line_buf.clear();
                 }
 
@@ -427,6 +442,13 @@ fn handle_instruction(
                     let raw_safe = text.replace('\n', "\r\n");
                     let _ = write!(stderr, "{raw_safe}");
                     let _ = stderr.flush();
+                }
+                StreamEvent::Error(_) => {
+                    // Clear "thinking..." indicator so the error is visible
+                    if display.streaming_text.is_empty() {
+                        let _ = write!(stderr, "\r\x1b[K");
+                        let _ = stderr.flush();
+                    }
                 }
                 _ => {}
             }
