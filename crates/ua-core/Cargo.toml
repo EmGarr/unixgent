@@ -18,3 +18,4 @@ portable-pty.workspace = true
 crossterm.workspace = true
 toml.workspace = true
 tempfile.workspace = true
+signal-hook.workspace = true

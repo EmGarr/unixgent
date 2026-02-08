@@ -1,8 +1,7 @@
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
+use std::thread::{self, JoinHandle};
 
 use futures::StreamExt;
 use tokio::runtime::Handle;
@@ -216,9 +215,9 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
         }
     });
 
-    // PTY reader thread
+    // PTY reader thread (store handle for join on exit)
     let tx_pty = tx.clone();
-    thread::spawn(move || {
+    let pty_reader_handle: JoinHandle<()> = thread::spawn(move || {
         let mut reader = pty_reader;
         let mut buf = [0u8; 4096];
         loop {
@@ -240,20 +239,22 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
         }
     });
 
-    // Resize poller thread
+    // SIGWINCH handler thread (replaces 250ms polling)
     #[cfg(unix)]
     {
+        use signal_hook::consts::SIGWINCH;
+        use signal_hook::iterator::Signals;
+
         let tx_sig = tx.clone();
         thread::spawn(move || {
-            let mut last_size = crossterm::terminal::size().unwrap_or((80, 24));
-            loop {
-                thread::sleep(Duration::from_millis(250));
+            let mut signals = match Signals::new([SIGWINCH]) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            for _ in signals.forever() {
                 if let Ok(size) = crossterm::terminal::size() {
-                    if size != last_size {
-                        last_size = size;
-                        if tx_sig.send(Event::Resize(size.0, size.1)).is_err() {
-                            break;
-                        }
+                    if tx_sig.send(Event::Resize(size.0, size.1)).is_err() {
+                        break;
                     }
                 }
             }
@@ -624,7 +625,15 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                     }
                 }
             }
-            Event::PtyEof => break,
+            Event::PtyEof => {
+                // PTY closed — check exit code for diagnostics
+                if debug_osc {
+                    if let Ok(Some(code)) = session.try_wait() {
+                        let _ = writeln!(stderr, "\r[ua] child exited with code {code}");
+                    }
+                }
+                break;
+            }
             Event::Resize(cols, rows) => {
                 terminal_size = (cols, rows);
                 if let Err(e) = session.resize(cols, rows) {
@@ -634,15 +643,10 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                 }
             }
         }
-
-        // Check if child has exited
-        if let Ok(Some(code)) = session.try_wait() {
-            if debug_osc {
-                let _ = writeln!(stderr, "\r[ua] child exited with code {code}");
-            }
-            break;
-        }
     }
+
+    // Join PTY reader thread (stdin thread blocks on read — can't join portably)
+    let _ = pty_reader_handle.join();
 
     Ok(())
 }
