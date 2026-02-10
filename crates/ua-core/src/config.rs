@@ -129,6 +129,12 @@ pub struct SecurityConfig {
     pub audit_enabled: bool,
     /// Custom audit log path. Defaults to ~/.local/share/unixagent/audit.jsonl.
     pub audit_log_path: Option<String>,
+    /// Enable LLM-based security judge for non-read-only commands.
+    /// Adds latency (1-3s) and doubles API costs for evaluated batches.
+    pub judge_enabled: bool,
+    /// Maximum nesting depth for batch-mode agent delegation.
+    /// Verified via process tree inspection (tamper-proof).
+    pub max_agent_depth: u32,
 }
 
 impl Default for SecurityConfig {
@@ -138,6 +144,8 @@ impl Default for SecurityConfig {
             require_yes_for_privileged: true,
             audit_enabled: true,
             audit_log_path: None,
+            judge_enabled: false,
+            max_agent_depth: 3,
         }
     }
 }
@@ -294,6 +302,7 @@ include_env = ["PATH", "HOME"]
         assert!(cfg.require_yes_for_privileged);
         assert!(cfg.audit_enabled);
         assert!(cfg.audit_log_path.is_none());
+        assert!(!cfg.judge_enabled);
     }
 
     #[test]
@@ -304,6 +313,7 @@ auto_approve_read_only = false
 require_yes_for_privileged = false
 audit_enabled = false
 audit_log_path = "/tmp/audit.jsonl"
+judge_enabled = true
 "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert!(!cfg.security.auto_approve_read_only);
@@ -313,6 +323,17 @@ audit_log_path = "/tmp/audit.jsonl"
             cfg.security.audit_log_path.as_deref(),
             Some("/tmp/audit.jsonl")
         );
+        assert!(cfg.security.judge_enabled);
+    }
+
+    #[test]
+    fn parse_security_config_judge_defaults_false() {
+        let toml_str = r#"
+[security]
+auto_approve_read_only = true
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(!cfg.security.judge_enabled);
     }
 
     #[test]

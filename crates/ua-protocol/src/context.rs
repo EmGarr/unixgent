@@ -124,6 +124,10 @@ pub struct AgentRequest {
     pub context: ShellContext,
     pub terminal_history: TerminalHistory,
     pub conversation: Vec<ConversationMessage>,
+    /// Extra text appended to the system prompt (e.g. batch-mode instructions).
+    /// The backend appends this if present; callers compose it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt_extra: Option<String>,
 }
 
 impl AgentRequest {
@@ -133,6 +137,7 @@ impl AgentRequest {
             context,
             terminal_history: TerminalHistory::new(),
             conversation: Vec::new(),
+            system_prompt_extra: None,
         }
     }
 

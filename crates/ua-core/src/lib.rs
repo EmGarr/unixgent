@@ -1,7 +1,10 @@
 pub mod audit;
+pub mod batch;
 pub mod config;
 pub mod context;
+pub mod depth;
 pub mod display;
+pub mod judge;
 pub mod osc;
 pub mod policy;
 pub mod pty;

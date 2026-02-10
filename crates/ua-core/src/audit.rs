@@ -93,6 +93,18 @@ impl AuditLogger {
         }));
     }
 
+    /// Log the result of the LLM security judge evaluation.
+    pub fn log_judge_result(&mut self, iteration: usize, safe: bool, reasoning: &str) {
+        self.write_event(serde_json::json!({
+            "ts": epoch_secs(),
+            "session": self.session_id,
+            "type": "judge_result",
+            "iteration": iteration,
+            "safe": safe,
+            "reasoning": reasoning,
+        }));
+    }
+
     /// Log a command execution result.
     pub fn log_executed(&mut self, command: &str, exit_code: Option<i32>, duration_ms: u64) {
         self.write_event(serde_json::json!({
@@ -273,6 +285,38 @@ mod tests {
         let lines = read_log_lines(&path);
         assert!(lines[0]["ts"].is_u64());
         assert!(lines[0]["ts"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn log_judge_result_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut logger = AuditLogger::new(&path).unwrap();
+
+        logger.log_judge_result(0, true, "Commands are read-only");
+
+        let lines = read_log_lines(&path);
+        assert_eq!(lines[0]["type"], "judge_result");
+        assert_eq!(lines[0]["iteration"], 0);
+        assert_eq!(lines[0]["safe"], true);
+        assert_eq!(lines[0]["reasoning"], "Commands are read-only");
+    }
+
+    #[test]
+    fn log_judge_result_unsafe() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut logger = AuditLogger::new(&path).unwrap();
+
+        logger.log_judge_result(2, false, "Downloads and executes remote script");
+
+        let lines = read_log_lines(&path);
+        assert_eq!(lines[0]["type"], "judge_result");
+        assert_eq!(lines[0]["safe"], false);
+        assert_eq!(
+            lines[0]["reasoning"],
+            "Downloads and executes remote script"
+        );
     }
 
     #[test]

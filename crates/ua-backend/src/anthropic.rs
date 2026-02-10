@@ -5,7 +5,7 @@ use std::time::Duration;
 use async_stream::stream;
 use futures::Stream;
 use reqwest::Client;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use ua_protocol::{AgentRequest, StreamEvent};
@@ -60,6 +60,49 @@ impl AnthropicClient {
             model: model.into(),
             http: build_http_client(),
         }
+    }
+
+    /// Send a non-streaming request with a system prompt and user message.
+    /// Returns the text content of the response. No tools or thinking block.
+    pub async fn send_non_streaming(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+    ) -> Result<String, AnthropicError> {
+        let body = NonStreamingRequest {
+            model: self.model.clone(),
+            max_tokens: 1024,
+            system: system_prompt.to_string(),
+            messages: vec![ApiMessage {
+                role: "user".to_string(),
+                content: ApiContent::Text(user_message.to_string()),
+            }],
+        };
+
+        let response = self
+            .http
+            .post(API_URL)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", API_VERSION)
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AnthropicError::Api(format!("{status}: {body}")));
+        }
+
+        let resp: NonStreamingResponse = response.json().await?;
+        resp.content
+            .into_iter()
+            .map(|block| match block {
+                ResponseContentBlock::Text { text } => text,
+            })
+            .next()
+            .ok_or_else(|| AnthropicError::Api("no text content in response".to_string()))
     }
 
     /// Send a request and return a stream of events.
@@ -194,6 +237,11 @@ Terminal: {}x{}",
          You may then run more commands or provide your final answer. \
          When you are done, respond with text only (no tool calls).",
     );
+
+    if let Some(ref extra) = request.system_prompt_extra {
+        prompt.push_str("\n\n");
+        prompt.push_str(extra);
+    }
 
     prompt
 }
@@ -458,6 +506,26 @@ enum ApiContent {
     Blocks(Vec<ApiContentBlock>),
 }
 
+#[derive(Debug, Serialize)]
+struct NonStreamingRequest {
+    model: String,
+    max_tokens: u32,
+    system: String,
+    messages: Vec<ApiMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NonStreamingResponse {
+    content: Vec<ResponseContentBlock>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum ResponseContentBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,6 +547,7 @@ mod tests {
             },
             terminal_history: TerminalHistory::new(),
             conversation: vec![],
+            system_prompt_extra: None,
         };
 
         let prompt = build_system_prompt(&request);
@@ -506,6 +575,7 @@ mod tests {
             },
             terminal_history: TerminalHistory::new(),
             conversation: vec![],
+            system_prompt_extra: None,
         };
 
         let prompt = build_system_prompt(&request);
@@ -524,6 +594,7 @@ mod tests {
                 "file1.txt  file2.txt".to_string(),
             ]),
             conversation: vec![],
+            system_prompt_extra: None,
         };
 
         let prompt = build_system_prompt(&request);
@@ -539,6 +610,7 @@ mod tests {
             context: ShellContext::default(),
             terminal_history: TerminalHistory::new(),
             conversation: vec![],
+            system_prompt_extra: None,
         };
 
         let messages = build_messages(&request);
@@ -556,6 +628,7 @@ mod tests {
                 ConversationMessage::user("list files"),
                 ConversationMessage::assistant("I'll use ls to list files"),
             ],
+            system_prompt_extra: None,
         };
 
         let messages = build_messages(&request);
@@ -732,6 +805,7 @@ mod tests {
                     }],
                 ),
             ],
+            system_prompt_extra: None,
         };
 
         let messages = build_messages(&request);
@@ -758,6 +832,7 @@ mod tests {
                 tool_use_id: "toolu_123".to_string(),
                 content: "file1.txt\nfile2.txt".to_string(),
             }])],
+            system_prompt_extra: None,
         };
 
         let messages = build_messages(&request);
@@ -793,6 +868,7 @@ mod tests {
                     content: "file.txt".to_string(),
                 }]),
             ],
+            system_prompt_extra: None,
         };
 
         let messages = build_messages(&request);
@@ -813,6 +889,7 @@ mod tests {
                 ConversationMessage::user("hi"),
                 ConversationMessage::assistant("hello"),
             ],
+            system_prompt_extra: None,
         };
 
         let messages = build_messages(&request);
@@ -834,6 +911,7 @@ mod tests {
                     input_json: r#"{"command":"pwd"}"#.to_string(),
                 }],
             )],
+            system_prompt_extra: None,
         };
 
         let messages = build_messages(&request);
@@ -860,6 +938,41 @@ mod tests {
     fn new_client_does_not_panic() {
         let _client = AnthropicClient::new("test-key");
         let _client2 = AnthropicClient::with_model("test-key", "test-model");
+    }
+
+    #[test]
+    fn non_streaming_request_has_no_tools_or_thinking() {
+        let req = NonStreamingRequest {
+            model: "test-model".to_string(),
+            max_tokens: 1024,
+            system: "You are a judge.".to_string(),
+            messages: vec![ApiMessage {
+                role: "user".to_string(),
+                content: ApiContent::Text("evaluate this".to_string()),
+            }],
+        };
+
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("tools").is_none());
+        assert!(json.get("thinking").is_none());
+        assert!(json.get("stream").is_none());
+        assert_eq!(json["max_tokens"], 1024);
+        assert_eq!(json["system"], "You are a judge.");
+    }
+
+    #[test]
+    fn non_streaming_response_text_extraction() {
+        let json = r#"{"content":[{"type":"text","text":"Hello world"}]}"#;
+        let resp: NonStreamingResponse = serde_json::from_str(json).unwrap();
+        let text = resp
+            .content
+            .into_iter()
+            .map(|block| match block {
+                ResponseContentBlock::Text { text } => text,
+            })
+            .next()
+            .unwrap();
+        assert_eq!(text, "Hello world");
     }
 
     #[test]

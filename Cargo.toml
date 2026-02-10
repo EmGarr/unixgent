@@ -21,5 +21,6 @@ bytes = "1"
 async-stream = "0.3"
 tempfile = "3"
 signal-hook = "0.3"
+libc = "0.2"
 ua-protocol = { path = "crates/ua-protocol" }
 ua-backend = { path = "crates/ua-backend" }

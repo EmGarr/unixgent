@@ -253,6 +253,53 @@ pub fn scrub_injection_markers(output: &str) -> String {
 }
 
 /// Build an AgentRequest from the current state.
+/// Build the delegation instructions for the system prompt.
+///
+/// When `depth + 1 < max_depth`, the LLM is told it can spawn subagents.
+/// Returns `None` if delegation is not available (at depth limit).
+pub fn build_delegation_prompt(depth: u32, max_depth: u32) -> Option<String> {
+    if depth + 1 >= max_depth {
+        return None;
+    }
+
+    let exe_path =
+        std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("unixagent"));
+
+    Some(format!(
+        "You can delegate subtasks to subagents by running:\n\
+         \n\
+         \x20 {exe} \"instruction\"\n\
+         \n\
+         Each subagent is a separate process that runs non-interactively, executes \
+         shell commands, and prints its final answer to stdout. Use subagents for:\n\
+         - Parallel independent tasks (launch multiple in background with &, then wait)\n\
+         - Focused research or analysis that would clutter the main conversation\n\
+         - Subtasks that need their own multi-step tool use loops\n\
+         \n\
+         Subagent patterns:\n\
+         \n\
+         \x20 # Sequential:\n\
+         \x20 {exe} \"find all TODO comments in src/\"\n\
+         \n\
+         \x20 # Parallel (background + wait):\n\
+         \x20 {exe} \"analyze test coverage\" > /tmp/coverage.txt 2>/dev/null &\n\
+         \x20 {exe} \"list all public API functions\" > /tmp/api.txt 2>/dev/null &\n\
+         \x20 wait\n\
+         \x20 cat /tmp/coverage.txt /tmp/api.txt\n\
+         \n\
+         \x20 # Piped:\n\
+         \x20 echo \"summarize this\" | {exe}\n\
+         \n\
+         Subagents share the working directory, filesystem, and audit log. \
+         They enforce the same security policy (deny list). \
+         They exit 0 on success, 1 on error. \
+         Nesting depth is limited to {max_depth} levels (currently at depth {depth}).",
+        exe = exe_path.display(),
+        max_depth = max_depth,
+        depth = depth,
+    ))
+}
+
 pub fn build_agent_request(
     instruction: &str,
     config: &Config,
@@ -263,11 +310,15 @@ pub fn build_agent_request(
     let context = build_shell_context(config, terminal_size);
     let terminal_history = TerminalHistory::from_lines(history.lines());
 
+    // REPL is always depth 0 — add delegation instructions if allowed
+    let system_prompt_extra = build_delegation_prompt(0, config.security.max_agent_depth);
+
     AgentRequest {
         instruction: instruction.to_string(),
         context,
         terminal_history,
         conversation,
+        system_prompt_extra,
     }
 }
 
