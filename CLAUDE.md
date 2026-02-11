@@ -100,8 +100,9 @@ ua-core/src/
   pty.rs           PTY session management
   osc.rs           OSC 133 parser + terminal state machine
   config.rs        Config loading (shell, backend, context)
-  context.rs       OutputHistory ring buffer, ANSI stripping, context assembly
+  context.rs       OutputHistory ring buffer, ANSI stripping, context assembly, compaction
   display.rs       Response stream accumulator (PlanDisplay)
+  process.rs       Process introspection: depth counting, child CWD resolution
   shell_scripts.rs Shell integration scripts (bash/zsh/fish)
 ```
 

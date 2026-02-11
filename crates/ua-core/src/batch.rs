@@ -21,7 +21,7 @@ use crate::context::{
 };
 use crate::policy::{analyze_pipe_chain, RiskLevel};
 
-const MAX_ITERATIONS: usize = 10;
+const MAX_ITERATIONS: usize = 50;
 const MAX_OUTPUT_BYTES: usize = 100_000;
 const MAX_CONSECUTIVE_DENIALS: usize = 3;
 
@@ -232,7 +232,9 @@ fn build_batch_system_prompt(depth: u32, max_depth: u32) -> String {
          4. Your stdout is consumed by the caller. Make answers complete and \
          self-contained.\n\
          5. If running low on iterations, provide the best answer you have \
-         rather than exploring further."
+         rather than exploring further.\n\
+         6. You have significantly more iterations available than a typical session needs. \
+         Use as many as required to complete the task thoroughly."
     );
 
     if let Some(delegation) = build_delegation_prompt(depth, max_depth) {
@@ -295,6 +297,7 @@ pub async fn run_batch(config: &Config, instruction: &str, depth: u32) -> i32 {
             &empty_history,
             conversation.clone(),
             (80, 24),
+            None, // No PTY child in batch mode
         );
         request.system_prompt_extra = Some(system_extra.clone());
 
@@ -510,7 +513,7 @@ mod tests {
         out.emit_thinking(2);
         let s = output_str(&out);
         assert!(s.starts_with("\r\x1b[K"), "should start with line clear");
-        assert!(s.contains("(3/10)"), "should show iteration count");
+        assert!(s.contains("(3/50)"), "should show iteration count");
         assert!(s.contains("thinking"), "should say thinking");
         assert!(
             !s.ends_with('\n'),
@@ -525,7 +528,7 @@ mod tests {
         let s = output_str(&out);
         assert!(s.starts_with("\r\x1b[K"), "should start with line clear");
         assert!(s.contains("[ua:d2]"), "should have depth prefix");
-        assert!(s.contains("(4/10)"), "should show iteration");
+        assert!(s.contains("(4/50)"), "should show iteration");
         assert!(s.contains("grep -rn TODO src/"), "should have command");
         assert!(
             !s.ends_with('\n'),
@@ -575,7 +578,7 @@ mod tests {
         let s = output_str(&out);
         assert!(s.contains("\x1b[33m"), "should be yellow");
         assert!(s.contains("max iterations"), "should say max iterations");
-        assert!(s.contains("10"), "should show count");
+        assert!(s.contains("50"), "should show count");
         assert!(s.ends_with('\n'), "max iterations should persist");
     }
 
@@ -598,7 +601,7 @@ mod tests {
         out.emit_thinking(2);
         let s = output_str(&out);
         assert!(!s.contains("\r\x1b[K"), "non-TTY should not use line clear");
-        assert!(s.contains("(3/10)"), "should show iteration");
+        assert!(s.contains("(3/50)"), "should show iteration");
         assert!(s.ends_with('\n'), "non-TTY should use newline");
     }
 
@@ -709,7 +712,7 @@ mod tests {
     #[test]
     fn batch_system_prompt_mentions_budget() {
         let prompt = build_batch_system_prompt(0, 3);
-        assert!(prompt.contains("10 tool calls"), "should mention budget");
+        assert!(prompt.contains("50 tool calls"), "should mention budget");
         assert!(prompt.contains("Be efficient"), "should mention efficiency");
         assert!(
             prompt.contains("Combine commands"),

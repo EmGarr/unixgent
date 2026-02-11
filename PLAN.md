@@ -1,6 +1,6 @@
 # UnixAgent — Implementation Plan
 
-**Last updated**: 2026-02-08
+**Last updated**: 2026-02-11
 
 This document tracks the implementation status of every phase and sub-task.
 It is the single source of truth for "where are we at". See DESIGN.md for
@@ -59,7 +59,7 @@ management. Plan display. Agentic loop.
 | **Agentic loop (execute → observe → iterate)** | DONE | `ua-core/src/repl.rs`, `ua-backend/src/anthropic.rs` |
 | **Tool use API for command delivery** | DONE | `ua-protocol/src/message.rs`, `ua-backend/src/anthropic.rs`, `ua-backend/src/mock.rs`, `ua-core/src/repl.rs` |
 | **Proper tool_use/tool_result conversation format** | DONE | `ua-protocol/src/context.rs`, `ua-backend/src/anthropic.rs`, `ua-core/src/repl.rs` |
-| 128 unit tests pass (now 147 with Phase 4), `make check` clean | DONE | |
+| 128 unit tests pass (now 210), `make check` clean | DONE | |
 
 **Exit criteria met**:
 - `# what's in /tmp` → backend returns plan with `ls /tmp` ✅
@@ -119,7 +119,7 @@ implementation — no OS-level sandbox yet (that's Phase 4.5).
 | Policy file parsing (`policy.toml`) | TODO | `ua-core/src/policy.rs` |
 | Extract `classify_and_gate()` + `handle_judge_verdict()` for testability | DONE | `ua-core/src/repl.rs` |
 | Judge flow mock tests (11 tests: gate, verdict, pipeline) | DONE | `ua-core/src/repl.rs` |
-| 176 tests pass, `make check` clean | DONE | |
+| 210 tests pass, `make check` clean | DONE | |
 
 **Exit criteria met**:
 - Deny list blocks `rm -rf /` with `[DENIED]` display ✅
@@ -235,6 +235,8 @@ Child agents, policy inheritance, trace propagation, musl build, packaging.
 | ~~Conversation history grows unbounded~~ | ~~High~~ | FIXED — max_conversation_turns (default 20) in ContextConfig. Oldest entries evicted after each push. See DESIGN.md §19.2.7 |
 | ~~API 400 on third agentic iteration~~ | ~~Critical~~ | FIXED — Three bugs: (1) empty assistant messages when LLM responds with only tool_use, (2) conversation history stored as plain text instead of tool_use/tool_result content blocks, (3) duplicate observation pushed to both conversation and instruction. Fixed with ToolUseRecord/ToolResultRecord types, ApiContentBlock enum, and empty instruction for agentic continuations. |
 | ~~Batch mode UX floods parent terminal~~ | ~~Medium~~ | FIXED — BatchOutput abstraction with TTY-aware formatting. Progress lines overwritten with `\r\x1b[K`, persistent start/done boundaries in dim cyan. Non-TTY mode has no ANSI. System prompt instructs efficiency. Background subagents redirect stderr. |
+| ~~CWD stale — shows parent process directory~~ | ~~High~~ | FIXED — `build_shell_context()` now queries child shell CWD via OS APIs (`proc_pidinfo` with `PROC_PIDVNODEPATHINFO` on macOS, `readlink /proc/{pid}/cwd` on Linux). Falls back to parent's `current_dir()` if unavailable. |
+| ~~Hard iteration cap + no compaction~~ | ~~High~~ | FIXED — Removed `MAX_AGENT_ITERATIONS` in REPL (unbounded, continues until model stops). Batch mode raised from 10 to 50. Token-aware compaction via `compact_conversation()` triggers when `input_tokens > 100k`. Summarizes old turns via non-streaming LLM call, preserves recent 4 turns. API overflow errors trigger compaction + retry. |
 | Shell integration sourcing unverified | Medium | No check that `source` succeeded; `clear` hack; temp file leak on panic. See DESIGN.md §19.2.5 |
 | ~~`try_wait()` polled on every event~~ | ~~Medium~~ | FIXED — Moved to PtyEof arm only, used for diagnostic logging. See DESIGN.md §19.2.6 |
 | ~~Thread handles discarded (fire-and-forget)~~ | ~~Medium~~ | FIXED — PTY reader JoinHandle stored and joined on exit. Stdin thread blocks on read (can't join portably). See DESIGN.md §19.2.8 |
@@ -266,3 +268,5 @@ Child agents, policy inheritance, trace propagation, musl build, packaging.
 | reqwest + rustls-tls | 2026-02-07 | No OpenSSL dependency, integrates with tokio |
 | Temp file + source for shell integration | 2026-02-07 | Writing scripts to PTY causes echo; temp file sourced via ` source /path` with `clear` at end |
 | BatchOutput abstraction for batch UX | 2026-02-10 | Generic `BatchOutput<W: Write>` struct replaces all inline `eprint!` calls in `run_batch()`. TTY mode uses `\r\x1b[K` overwriting with dim cyan progress between persistent start/done boundaries. Non-TTY mode emits plain lines (no ANSI). Writes to `Vec<u8>` in tests for format verification. Batch system prompt updated with iteration budget awareness and efficiency rules. Delegation prompt silences background subagent stderr with `2>/dev/null`. |
+| Child shell CWD via OS APIs | 2026-02-11 | `cwd_of_pid()` queries child shell's current directory via `proc_pidinfo(PROC_PIDVNODEPATHINFO)` on macOS and `readlink /proc/{pid}/cwd` on Linux. `build_shell_context()` accepts `child_pid: Option<u32>` and prefers child CWD over parent's stale `current_dir()`. `depth.rs` renamed to `process.rs` to house both process-tree depth and CWD resolution. |
+| Token-aware conversation compaction | 2026-02-11 | `compact_conversation()` summarizes old conversation turns via `send_non_streaming()` when `input_tokens > 100k` (from `StreamEvent::Usage`). Keeps 4 most recent turns verbatim, replaces older turns with a summary message. Triggered in the agentic loop continuation and on API overflow errors. REPL iteration cap removed entirely; batch mode raised to 50. |

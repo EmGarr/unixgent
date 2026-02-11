@@ -1,8 +1,12 @@
-//! Process-tree depth counting for batch-mode recursion control.
+//! Process introspection: depth counting and CWD resolution.
 //!
-//! Instead of trusting an environment variable (which the LLM could reset),
-//! we walk the real process tree maintained by the kernel. Count how many
-//! ancestor processes are the same binary as us — that's our depth.
+//! Depth counting: Instead of trusting an environment variable (which the LLM
+//! could reset), we walk the real process tree maintained by the kernel. Count
+//! how many ancestor processes are the same binary as us — that's our depth.
+//!
+//! CWD resolution: Query the working directory of a child process via OS APIs
+//! (proc_pidinfo on macOS, /proc on Linux). Used to track the PTY child shell's
+//! current directory instead of the parent process's stale CWD.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -67,6 +71,16 @@ pub fn check_depth(max: u32) -> Result<u32, u32> {
     }
 }
 
+/// Query the current working directory of a process by PID.
+///
+/// Uses OS-specific APIs:
+/// - **macOS**: `proc_pidinfo` with `PROC_PIDVNODEPATHINFO`
+/// - **Linux**: `readlink /proc/{pid}/cwd`
+/// - **Other**: returns `None`
+pub fn cwd_of_pid(pid: u32) -> Option<String> {
+    platform::cwd_of(pid)
+}
+
 // --- Platform-specific process info ---
 
 #[cfg(target_os = "macos")]
@@ -74,6 +88,7 @@ mod platform {
     use std::path::PathBuf;
 
     const PROC_PIDTBSDINFO: libc::c_int = 3;
+    const PROC_PIDVNODEPATHINFO: libc::c_int = 9;
 
     /// Minimal repr(C) layout of `struct proc_bsdinfo` from <sys/proc_info.h>.
     /// We only read `pbi_ppid`; trailing fields are opaque padding so the
@@ -86,6 +101,22 @@ mod platform {
         pbi_pid: u32,
         pbi_ppid: u32,
         _rest: [u8; 136 - 20],
+    }
+
+    /// Layout of `struct vnode_info_path` (152 bytes).
+    /// We only need `vip_path` — the rest is opaque padding.
+    #[repr(C)]
+    struct VnodeInfoPath {
+        _vnode_info: [u8; 152], // struct vnode_info (opaque)
+        vip_path: [u8; 1024],   // MAXPATHLEN
+    }
+
+    /// Layout of `struct proc_vnodepathinfo`.
+    /// Contains two VnodeInfoPath structs: cdir (current dir) and rdir (root dir).
+    #[repr(C)]
+    struct ProcVnodePathInfo {
+        pvi_cdir: VnodeInfoPath,
+        _pvi_rdir: VnodeInfoPath,
     }
 
     extern "C" {
@@ -107,6 +138,35 @@ mod platform {
         let ppid = ppid_of(pid)?;
         let exe = exe_of(pid)?;
         Some((ppid, exe))
+    }
+
+    pub fn cwd_of(pid: u32) -> Option<String> {
+        let mut info: ProcVnodePathInfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<ProcVnodePathInfo>() as libc::c_int;
+        let ret = unsafe {
+            proc_pidinfo(
+                pid as libc::c_int,
+                PROC_PIDVNODEPATHINFO,
+                0,
+                &mut info as *mut _ as *mut libc::c_void,
+                size,
+            )
+        };
+        if ret == size {
+            let path_bytes = &info.pvi_cdir.vip_path;
+            let nul_pos = path_bytes
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(path_bytes.len());
+            let path = std::str::from_utf8(&path_bytes[..nul_pos]).ok()?;
+            if path.is_empty() {
+                None
+            } else {
+                Some(path.to_string())
+            }
+        } else {
+            None
+        }
     }
 
     fn exe_of(pid: u32) -> Option<PathBuf> {
@@ -157,6 +217,11 @@ mod platform {
         Some((ppid, exe))
     }
 
+    pub fn cwd_of(pid: u32) -> Option<String> {
+        let link = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
+        Some(link.to_string_lossy().to_string())
+    }
+
     fn exe_of(pid: u32) -> Option<PathBuf> {
         let link = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
         Some(link.canonicalize().unwrap_or(link))
@@ -179,6 +244,10 @@ mod platform {
 
     pub fn process_info(_pid: u32) -> Option<(u32, PathBuf)> {
         None // Can't introspect process tree on this platform
+    }
+
+    pub fn cwd_of(_pid: u32) -> Option<String> {
+        None // Can't introspect process CWD on this platform
     }
 }
 
@@ -333,5 +402,25 @@ mod tests {
         // PID 999999999 almost certainly doesn't exist
         let info = platform::process_info(999_999_999);
         assert!(info.is_none());
+    }
+
+    #[test]
+    fn cwd_of_pid_returns_current_process_cwd() {
+        let cwd = cwd_of_pid(std::process::id());
+        assert!(cwd.is_some(), "should be able to read own CWD");
+        let cwd = cwd.unwrap();
+        assert!(!cwd.is_empty(), "CWD should not be empty");
+        // Should match std::env::current_dir
+        let expected = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(cwd, expected);
+    }
+
+    #[test]
+    fn cwd_of_pid_returns_none_for_nonexistent() {
+        let cwd = cwd_of_pid(999_999_999);
+        assert!(cwd.is_none());
     }
 }

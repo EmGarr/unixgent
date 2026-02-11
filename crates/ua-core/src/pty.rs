@@ -84,6 +84,11 @@ impl PtySession {
         Ok((session, reader))
     }
 
+    /// Return the PID of the child shell process (if available).
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child.process_id()
+    }
+
     pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
         self.master
             .resize(PtySize {
