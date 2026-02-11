@@ -81,6 +81,60 @@ pub fn cwd_of_pid(pid: u32) -> Option<String> {
     platform::cwd_of(pid)
 }
 
+/// Count how many descendant processes of `ancestor_pid` are running the same
+/// binary as `my_exe`.
+///
+/// This is the testable core — tests provide a fake `info_fn`, production
+/// provides the real OS-level one.
+fn count_descendant_agents_core(
+    my_exe: &Path,
+    ancestor_pid: u32,
+    all_pids: &[u32],
+    info_fn: &dyn Fn(u32) -> Option<(u32, PathBuf)>,
+) -> u32 {
+    let mut count = 0;
+    for &pid in all_pids {
+        if pid == ancestor_pid {
+            continue;
+        }
+        // Quick filter: only consider processes with the same executable
+        let (ppid, exe) = match info_fn(pid) {
+            Some(info) => info,
+            None => continue,
+        };
+        if exe != my_exe {
+            continue;
+        }
+        // Walk the parent chain to see if ancestor_pid is an ancestor
+        let mut current = ppid;
+        let mut seen = HashSet::new();
+        seen.insert(pid);
+        while current > 1 && seen.insert(current) {
+            if current == ancestor_pid {
+                count += 1;
+                break;
+            }
+            match info_fn(current) {
+                Some((next_ppid, _)) => current = next_ppid,
+                None => break,
+            }
+        }
+    }
+    count
+}
+
+/// Count how many descendant agent processes are running under `ancestor_pid`.
+///
+/// Returns 0 if we can't determine our exe or enumerate processes.
+pub fn count_descendant_agents(ancestor_pid: u32) -> u32 {
+    let my_exe = match std::env::current_exe().and_then(|p| p.canonicalize()) {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+    let all_pids = platform::list_all_pids();
+    count_descendant_agents_core(&my_exe, ancestor_pid, &all_pids, &platform::process_info)
+}
+
 // --- Platform-specific process info ---
 
 #[cfg(target_os = "macos")]
@@ -132,6 +186,7 @@ mod platform {
             buffer: *mut libc::c_void,
             buffersize: libc::c_int,
         ) -> libc::c_int;
+        fn proc_listallpids(buffer: *mut libc::c_void, buffersize: libc::c_int) -> libc::c_int;
     }
 
     pub fn process_info(pid: u32) -> Option<(u32, PathBuf)> {
@@ -205,6 +260,27 @@ mod platform {
             None
         }
     }
+
+    pub fn list_all_pids() -> Vec<u32> {
+        // First call with null buffer to get the count
+        let count = unsafe { proc_listallpids(std::ptr::null_mut(), 0) };
+        if count <= 0 {
+            return Vec::new();
+        }
+        // Allocate with some extra room for new processes
+        let capacity = (count as usize) + 64;
+        let mut buf: Vec<libc::c_int> = vec![0; capacity];
+        let buf_size = (capacity * std::mem::size_of::<libc::c_int>()) as libc::c_int;
+        let actual = unsafe { proc_listallpids(buf.as_mut_ptr() as *mut libc::c_void, buf_size) };
+        if actual <= 0 {
+            return Vec::new();
+        }
+        buf.truncate(actual as usize);
+        buf.into_iter()
+            .filter(|&p| p > 0)
+            .map(|p| p as u32)
+            .collect()
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -236,6 +312,16 @@ mod platform {
         // fields[0] = state, fields[1] = ppid
         fields.get(1)?.parse().ok()
     }
+
+    pub fn list_all_pids() -> Vec<u32> {
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+            .collect()
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -248,6 +334,10 @@ mod platform {
 
     pub fn cwd_of(_pid: u32) -> Option<String> {
         None // Can't introspect process CWD on this platform
+    }
+
+    pub fn list_all_pids() -> Vec<u32> {
+        Vec::new()
     }
 }
 
@@ -422,5 +512,141 @@ mod tests {
     fn cwd_of_pid_returns_none_for_nonexistent() {
         let cwd = cwd_of_pid(999_999_999);
         assert!(cwd.is_none());
+    }
+
+    // --- Descendant counting tests ---
+
+    #[test]
+    fn descendants_none() {
+        // No other processes → count 0
+        let table: HashMap<u32, (u32, PathBuf)> =
+            [(100, (1, PathBuf::from("/usr/bin/unixagent")))].into();
+        let count = count_descendant_agents_core(
+            Path::new("/usr/bin/unixagent"),
+            100,
+            &[100],
+            &fake_info(&table),
+        );
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn descendants_direct_child() {
+        // ancestor(100) → sh(101) → ua(102)
+        let ua = PathBuf::from("/usr/bin/unixagent");
+        let table: HashMap<u32, (u32, PathBuf)> = [
+            (100, (1, ua.clone())),
+            (101, (100, PathBuf::from("/bin/sh"))),
+            (102, (101, ua.clone())),
+        ]
+        .into();
+        let count = count_descendant_agents_core(&ua, 100, &[100, 101, 102], &fake_info(&table));
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn descendants_nested() {
+        // ancestor(100) → sh(101) → ua(102) → sh(103) → ua(104)
+        let ua = PathBuf::from("/usr/bin/unixagent");
+        let table: HashMap<u32, (u32, PathBuf)> = [
+            (100, (1, ua.clone())),
+            (101, (100, PathBuf::from("/bin/sh"))),
+            (102, (101, ua.clone())),
+            (103, (102, PathBuf::from("/bin/sh"))),
+            (104, (103, ua.clone())),
+        ]
+        .into();
+        let count =
+            count_descendant_agents_core(&ua, 100, &[100, 101, 102, 103, 104], &fake_info(&table));
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn descendants_non_matching_exe() {
+        // ancestor(100) → sh(101) → python(102) — different exe
+        let ua = PathBuf::from("/usr/bin/unixagent");
+        let table: HashMap<u32, (u32, PathBuf)> = [
+            (100, (1, ua.clone())),
+            (101, (100, PathBuf::from("/bin/sh"))),
+            (102, (101, PathBuf::from("/usr/bin/python"))),
+        ]
+        .into();
+        let count = count_descendant_agents_core(&ua, 100, &[100, 101, 102], &fake_info(&table));
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn descendants_unrelated_agent() {
+        // ancestor(100), unrelated ua(200) with parent 1 — not a descendant
+        let ua = PathBuf::from("/usr/bin/unixagent");
+        let table: HashMap<u32, (u32, PathBuf)> =
+            [(100, (1, ua.clone())), (200, (1, ua.clone()))].into();
+        let count = count_descendant_agents_core(&ua, 100, &[100, 200], &fake_info(&table));
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn descendants_ancestor_not_counted() {
+        // ancestor(100) itself should never be counted
+        let ua = PathBuf::from("/usr/bin/unixagent");
+        let table: HashMap<u32, (u32, PathBuf)> = [(100, (1, ua.clone()))].into();
+        let count = count_descendant_agents_core(&ua, 100, &[100], &fake_info(&table));
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn descendants_empty_pid_list() {
+        let ua = PathBuf::from("/usr/bin/unixagent");
+        let table: HashMap<u32, (u32, PathBuf)> = HashMap::new();
+        let count = count_descendant_agents_core(&ua, 100, &[], &fake_info(&table));
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn descendants_missing_ancestor() {
+        // ancestor_pid not in the table — descendants can't find it
+        let ua = PathBuf::from("/usr/bin/unixagent");
+        let table: HashMap<u32, (u32, PathBuf)> = [
+            (102, (101, ua.clone())),
+            (101, (999, PathBuf::from("/bin/sh"))),
+        ]
+        .into();
+        let count = count_descendant_agents_core(&ua, 100, &[101, 102], &fake_info(&table));
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn descendants_mixed() {
+        // ancestor(100) → sh(101) → ua(102) → sh(103) → python(104)
+        //                         → sh(105) → ua(106)
+        let ua = PathBuf::from("/usr/bin/unixagent");
+        let table: HashMap<u32, (u32, PathBuf)> = [
+            (100, (1, ua.clone())),
+            (101, (100, PathBuf::from("/bin/sh"))),
+            (102, (101, ua.clone())),
+            (103, (102, PathBuf::from("/bin/sh"))),
+            (104, (103, PathBuf::from("/usr/bin/python"))),
+            (105, (100, PathBuf::from("/bin/sh"))),
+            (106, (105, ua.clone())),
+        ]
+        .into();
+        let count = count_descendant_agents_core(
+            &ua,
+            100,
+            &[100, 101, 102, 103, 104, 105, 106],
+            &fake_info(&table),
+        );
+        // 102 and 106 are descendant agents
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn list_all_pids_includes_self() {
+        let pids = platform::list_all_pids();
+        let my_pid = std::process::id();
+        assert!(
+            pids.contains(&my_pid),
+            "list_all_pids should include our own PID ({my_pid})"
+        );
     }
 }

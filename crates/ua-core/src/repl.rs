@@ -1068,7 +1068,11 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                             }
                         }
                         QueueEvent::AllDone => {
-                            // Commands finished executing
+                            // Commands finished executing — clear line buffer
+                            // so stale content (e.g. background job notifications)
+                            // doesn't block # detection.
+                            line_buf.clear();
+
                             if let AgentState::Executing {
                                 iteration,
                                 capture,
@@ -1157,6 +1161,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                 stderr,
                                 "\r[ua] command failed (exit code {code}), stopping"
                             );
+                            line_buf.clear();
                             state = AgentState::Idle;
                         }
                         QueueEvent::None => {}

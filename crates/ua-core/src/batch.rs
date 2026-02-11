@@ -21,7 +21,6 @@ use crate::context::{
 };
 use crate::policy::{analyze_pipe_chain, RiskLevel};
 
-const MAX_ITERATIONS: usize = 50;
 const MAX_OUTPUT_BYTES: usize = 100_000;
 const MAX_CONSECUTIVE_DENIALS: usize = 3;
 
@@ -118,14 +117,14 @@ impl<W: Write> BatchOutput<W> {
         if self.is_tty {
             let _ = write!(
                 self.writer,
-                "\r\x1b[K{} \x1b[2m({}/{MAX_ITERATIONS}) thinking...\x1b[0m",
+                "\r\x1b[K{} \x1b[2m({}) thinking...\x1b[0m",
                 self.colored_prefix(),
                 iteration + 1,
             );
         } else {
             let _ = writeln!(
                 self.writer,
-                "{} ({}/{MAX_ITERATIONS}) thinking...",
+                "{} ({}) thinking...",
                 self.prefix(),
                 iteration + 1,
             );
@@ -140,7 +139,7 @@ impl<W: Write> BatchOutput<W> {
         if self.is_tty {
             let _ = write!(
                 self.writer,
-                "\r\x1b[K{} \x1b[2m({}/{MAX_ITERATIONS}) {}\x1b[0m",
+                "\r\x1b[K{} \x1b[2m({}) {}\x1b[0m",
                 self.colored_prefix(),
                 iteration + 1,
                 display_cmd,
@@ -199,30 +198,12 @@ impl<W: Write> BatchOutput<W> {
             );
         }
     }
-
-    /// Emit max iterations warning (persists — yellow).
-    pub fn emit_max_iterations(&mut self) {
-        if self.is_tty {
-            let _ = writeln!(
-                self.writer,
-                "\r\x1b[K{} \x1b[33mmax iterations ({MAX_ITERATIONS}) reached\x1b[0m",
-                self.colored_prefix(),
-            );
-        } else {
-            let _ = writeln!(
-                self.writer,
-                "{} max iterations ({MAX_ITERATIONS}) reached",
-                self.prefix(),
-            );
-        }
-    }
 }
 
 /// Build the batch-mode system prompt.
 fn build_batch_system_prompt(depth: u32, max_depth: u32) -> String {
-    let mut prompt = format!(
-        "You are running in non-interactive batch mode with a budget of \
-         {MAX_ITERATIONS} tool calls.\n\
+    let mut prompt = String::from(
+        "You are running in non-interactive batch mode.\n\
          \n\
          RULES:\n\
          1. Each shell tool call costs one iteration. Be efficient.\n\
@@ -231,10 +212,7 @@ fn build_batch_system_prompt(depth: u32, max_depth: u32) -> String {
          your final answer as plain text.\n\
          4. Your stdout is consumed by the caller. Make answers complete and \
          self-contained.\n\
-         5. If running low on iterations, provide the best answer you have \
-         rather than exploring further.\n\
-         6. You have significantly more iterations available than a typical session needs. \
-         Use as many as required to complete the task thoroughly."
+         5. Use as many iterations as required to complete the task thoroughly.",
     );
 
     if let Some(delegation) = build_delegation_prompt(depth, max_depth) {
@@ -289,7 +267,8 @@ pub async fn run_batch(config: &Config, instruction: &str, depth: u32) -> i32 {
 
     output.emit_start();
 
-    for iteration in 0..MAX_ITERATIONS {
+    let mut iteration: usize = 0;
+    loop {
         // Build request
         let mut request = build_agent_request(
             &current_instruction,
@@ -472,10 +451,9 @@ pub async fn run_batch(config: &Config, instruction: &str, depth: u32) -> i32 {
         if conversation.len() > max {
             conversation.drain(..conversation.len() - max);
         }
-    }
 
-    output.emit_max_iterations();
-    1
+        iteration += 1;
+    }
 }
 
 // Need IsTerminal for `std::io::stderr().is_terminal()`
@@ -513,7 +491,7 @@ mod tests {
         out.emit_thinking(2);
         let s = output_str(&out);
         assert!(s.starts_with("\r\x1b[K"), "should start with line clear");
-        assert!(s.contains("(3/50)"), "should show iteration count");
+        assert!(s.contains("(3)"), "should show iteration count");
         assert!(s.contains("thinking"), "should say thinking");
         assert!(
             !s.ends_with('\n'),
@@ -528,7 +506,7 @@ mod tests {
         let s = output_str(&out);
         assert!(s.starts_with("\r\x1b[K"), "should start with line clear");
         assert!(s.contains("[ua:d2]"), "should have depth prefix");
-        assert!(s.contains("(4/50)"), "should show iteration");
+        assert!(s.contains("(4)"), "should show iteration");
         assert!(s.contains("grep -rn TODO src/"), "should have command");
         assert!(
             !s.ends_with('\n'),
@@ -571,17 +549,6 @@ mod tests {
         assert!(s.ends_with('\n'), "done should persist");
     }
 
-    #[test]
-    fn tty_max_iterations_yellow() {
-        let mut out = make_output(true, 0, "test");
-        out.emit_max_iterations();
-        let s = output_str(&out);
-        assert!(s.contains("\x1b[33m"), "should be yellow");
-        assert!(s.contains("max iterations"), "should say max iterations");
-        assert!(s.contains("50"), "should show count");
-        assert!(s.ends_with('\n'), "max iterations should persist");
-    }
-
     // --- Non-TTY mode tests ---
 
     #[test]
@@ -601,7 +568,7 @@ mod tests {
         out.emit_thinking(2);
         let s = output_str(&out);
         assert!(!s.contains("\r\x1b[K"), "non-TTY should not use line clear");
-        assert!(s.contains("(3/50)"), "should show iteration");
+        assert!(s.contains("(3)"), "should show iteration");
         assert!(s.ends_with('\n'), "non-TTY should use newline");
     }
 
@@ -710,14 +677,14 @@ mod tests {
     // --- System prompt tests ---
 
     #[test]
-    fn batch_system_prompt_mentions_budget() {
+    fn batch_system_prompt_mentions_efficiency() {
         let prompt = build_batch_system_prompt(0, 3);
-        assert!(prompt.contains("50 tool calls"), "should mention budget");
         assert!(prompt.contains("Be efficient"), "should mention efficiency");
         assert!(
             prompt.contains("Combine commands"),
             "should mention combining"
         );
+        assert!(!prompt.contains("budget"), "should not mention a budget");
     }
 
     #[test]
