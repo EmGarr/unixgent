@@ -7,15 +7,18 @@ use futures::StreamExt;
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
 use ua_backend::AnthropicClient;
-use ua_protocol::{ConversationMessage, StreamEvent, ToolResultRecord, ToolUseRecord};
+use ua_protocol::{StreamEvent, ToolResultRecord, ToolUseRecord};
 
 use crate::audit::AuditLogger;
 use crate::config::Config;
 use crate::context::{
-    build_agent_request, build_shell_context, compact_conversation, scrub_injection_markers,
-    OutputHistory, COMPACTION_THRESHOLD, TOOL_RESULT_PREFIX,
+    build_agent_request, build_shell_context, scrub_injection_markers, OutputHistory,
+    TOOL_RESULT_PREFIX,
 };
 use crate::display::PlanDisplay;
+use crate::journal::{
+    build_conversation_from_journal, epoch_secs, generate_session_id, JournalEntry, SessionJournal,
+};
 use crate::judge::{self, JudgeVerdict};
 use crate::osc::{OscEvent, OscParser, TerminalState};
 use crate::policy::{analyze_pipe_chain, validate_arguments, ArgumentSafety, RiskLevel};
@@ -353,16 +356,29 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
     let mut parser = OscParser::new();
     let mut line_buf = String::new();
     let mut output_history = OutputHistory::new(config.context.max_terminal_lines);
-    let mut conversation: Vec<ConversationMessage> = Vec::new();
     let mut terminal_size = crossterm::terminal::size().unwrap_or((80, 24));
     let mut command_queue = CommandQueue::new();
     let mut state = AgentState::Idle;
     // Instruction text saved across the state transition (Idle → Streaming).
     let mut pending_instruction: Option<String> = None;
-    // Token count from the most recent API call (for compaction triggering).
-    let mut last_input_tokens: u32 = 0;
     // Child shell PID for CWD resolution.
     let child_pid = session.child_pid();
+    // User command text captured on Enter, awaiting exit code from 133;D.
+    let mut pending_user_command: Option<String> = None;
+
+    // Initialize session journal
+    let session_id = generate_session_id();
+    let journal_path = config
+        .journal
+        .resolve_sessions_dir()
+        .join(format!("{session_id}.jsonl"));
+    let mut journal = match SessionJournal::new(journal_path) {
+        Ok(j) => Some(j),
+        Err(e) => {
+            eprintln!("[ua] warning: failed to open journal: {e}");
+            None
+        }
+    };
 
     // Initialize audit logger
     let mut audit = if config.security.audit_enabled {
@@ -481,6 +497,14 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                                 handled_instruction = true;
                                                 pending_instruction = Some(instruction.to_string());
 
+                                                // Write instruction to journal
+                                                if let Some(ref mut j) = journal {
+                                                    j.append(&JournalEntry::Instruction {
+                                                        ts: epoch_secs(),
+                                                        text: instruction.to_string(),
+                                                    });
+                                                }
+
                                                 // Clear shell readline (removes the # text)
                                                 let _ = session.write_all(b"\x15");
 
@@ -488,9 +512,8 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                                 state = start_streaming(
                                                     rt_handle,
                                                     config,
-                                                    instruction,
+                                                    &journal,
                                                     &output_history,
-                                                    &conversation,
                                                     terminal_size,
                                                     0,
                                                     &tx_for_streaming,
@@ -498,6 +521,19 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                                     child_pid,
                                                 );
                                             }
+                                        } else if !trimmed.is_empty() {
+                                            // Capture user shell command (non-# input).
+                                            // Flush any previous pending command with unknown exit.
+                                            if let Some(old_cmd) = pending_user_command.take() {
+                                                if let Some(ref mut j) = journal {
+                                                    j.append(&JournalEntry::ShellCommand {
+                                                        ts: epoch_secs(),
+                                                        command: old_cmd,
+                                                        exit_code: None,
+                                                    });
+                                                }
+                                            }
+                                            pending_user_command = Some(trimmed.to_string());
                                         }
                                         line_buf.clear();
                                     }
@@ -793,11 +829,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                 }
                             }
                         }
-                        StreamEvent::Usage { input_tokens, .. } => {
-                            if *input_tokens > 0 {
-                                last_input_tokens = *input_tokens;
-                            }
-                        }
+                        StreamEvent::Usage { .. } => {}
                         StreamEvent::Error(_) => {
                             if display.streaming_text.is_empty() {
                                 let _ = write!(stderr, "\r\x1b[K");
@@ -823,53 +855,6 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
 
                     match display.status {
                         crate::display::DisplayStatus::Error(ref msg) => {
-                            // Detect context overflow and attempt compaction
-                            let is_overflow = msg.contains("prompt is too long")
-                                || msg.contains("too many tokens")
-                                || msg.contains("context_length_exceeded");
-                            if is_overflow && conversation.len() > 4 {
-                                let _ = writeln!(
-                                    stderr,
-                                    "\r\x1b[2m[ua] context overflow, compacting...\x1b[0m\r"
-                                );
-                                let api_key = config.backend.anthropic.resolve_api_key().ok();
-                                if let Some(api_key) = api_key {
-                                    let client = AnthropicClient::with_model(
-                                        &api_key,
-                                        &config.backend.anthropic.model,
-                                    );
-                                    let compact_result = rt_handle.block_on(compact_conversation(
-                                        &client,
-                                        &mut conversation,
-                                        4,
-                                    ));
-                                    match compact_result {
-                                        Ok(()) => {
-                                            let _ = writeln!(
-                                                stderr,
-                                                "\r\x1b[2m[ua] compacted, retrying...\x1b[0m\r"
-                                            );
-                                            state = start_streaming(
-                                                rt_handle,
-                                                config,
-                                                "",
-                                                &output_history,
-                                                &conversation,
-                                                terminal_size,
-                                                iteration,
-                                                &tx_for_streaming,
-                                                &mut stderr,
-                                                child_pid,
-                                            );
-                                            continue;
-                                        }
-                                        Err(e) => {
-                                            let _ =
-                                                writeln!(stderr, "\r\n[ua] compaction failed: {e}");
-                                        }
-                                    }
-                                }
-                            }
                             let _ = writeln!(stderr, "\r\n[ua] error: {msg}");
                             pending_instruction = None;
                         }
@@ -877,30 +862,21 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                             let response_text = display.streaming_text.clone();
                             let commands = tool_commands;
 
-                            // Push conversation history
-                            if let Some(instruction) = pending_instruction.take() {
-                                conversation.push(ConversationMessage::user(&instruction));
-                            }
+                            // Consume pending_instruction (already in journal)
+                            pending_instruction.take();
 
-                            // Push assistant message with tool_use records if present
-                            if !tool_uses.is_empty() {
-                                conversation.push(ConversationMessage::assistant_with_tool_use(
-                                    &response_text,
-                                    tool_uses.clone(),
-                                ));
-                            } else if !response_text.is_empty() {
-                                conversation.push(ConversationMessage::assistant(&response_text));
+                            // Write response to journal
+                            if let Some(ref mut j) = journal {
+                                j.append(&JournalEntry::Response {
+                                    ts: epoch_secs(),
+                                    text: response_text.clone(),
+                                    tool_uses: tool_uses.clone(),
+                                });
                             }
 
                             // Extract tool_use_ids for Approving/Executing states
                             let tool_use_ids: Vec<String> =
                                 tool_uses.iter().map(|t| t.id.clone()).collect();
-
-                            // Evict oldest turns if over limit
-                            let max = config.context.max_conversation_turns;
-                            if conversation.len() > max {
-                                conversation.drain(..conversation.len() - max);
-                            }
 
                             let action = classify_and_gate(
                                 commands,
@@ -927,8 +903,12 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                                 content: denial_msg.to_string(),
                                             })
                                             .collect();
-                                        conversation
-                                            .push(ConversationMessage::tool_result(tool_results));
+                                        if let Some(ref mut j) = journal {
+                                            j.append(&JournalEntry::Blocked {
+                                                ts: epoch_secs(),
+                                                results: tool_results,
+                                            });
+                                        }
                                     }
                                     let _ = writeln!(stderr, "\r[ua] command blocked by policy\r");
                                     state = AgentState::Idle;
@@ -1057,6 +1037,21 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                         line_buf.clear();
                     }
 
+                    // Capture user command exit code on 133;D (idle, non-agent).
+                    if let OscEvent::Osc133D { exit_code } = evt {
+                        if matches!(state, AgentState::Idle) {
+                            if let Some(cmd) = pending_user_command.take() {
+                                if let Some(ref mut j) = journal {
+                                    j.append(&JournalEntry::ShellCommand {
+                                        ts: epoch_secs(),
+                                        command: cmd,
+                                        exit_code: *exit_code,
+                                    });
+                                }
+                            }
+                        }
+                    }
+
                     // OSC 133 sequencing: dispatch next command on 133;B
                     match command_queue.handle_osc_event(evt) {
                         QueueEvent::Dispatch(cmd) => {
@@ -1088,20 +1083,19 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                     let observation =
                                         format!("{}{}\n", TOOL_RESULT_PREFIX, scrubbed);
 
-                                    // Push as tool_result if we have tool_use_ids,
-                                    // otherwise fall back to plain user message.
-                                    if !tool_use_ids.is_empty() {
-                                        let tool_results: Vec<ToolResultRecord> = tool_use_ids
-                                            .iter()
-                                            .map(|id| ToolResultRecord {
-                                                tool_use_id: id.clone(),
-                                                content: observation.clone(),
-                                            })
-                                            .collect();
-                                        conversation
-                                            .push(ConversationMessage::tool_result(tool_results));
-                                    } else {
-                                        conversation.push(ConversationMessage::user(&observation));
+                                    // Write tool result to journal
+                                    let tool_results: Vec<ToolResultRecord> = tool_use_ids
+                                        .iter()
+                                        .map(|id| ToolResultRecord {
+                                            tool_use_id: id.clone(),
+                                            content: observation.clone(),
+                                        })
+                                        .collect();
+                                    if let Some(ref mut j) = journal {
+                                        j.append(&JournalEntry::ToolResult {
+                                            ts: epoch_secs(),
+                                            results: tool_results,
+                                        });
                                     }
 
                                     // Clear readline before next LLM call
@@ -1109,43 +1103,17 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
 
                                     let next_iteration = iteration + 1;
 
-                                    // Compact if context is getting large
-                                    if last_input_tokens > COMPACTION_THRESHOLD {
-                                        let _ = writeln!(
-                                            stderr,
-                                            "\r\x1b[2m[ua] compacting context...\x1b[0m\r"
-                                        );
-                                        let api_key =
-                                            config.backend.anthropic.resolve_api_key().ok();
-                                        if let Some(api_key) = api_key {
-                                            let client = AnthropicClient::with_model(
-                                                &api_key,
-                                                &config.backend.anthropic.model,
-                                            );
-                                            let compact_result = rt_handle.block_on(
-                                                compact_conversation(&client, &mut conversation, 4),
-                                            );
-                                            if let Err(e) = compact_result {
-                                                let _ = writeln!(
-                                                    stderr,
-                                                    "\r[ua] compaction failed: {e}"
-                                                );
-                                            }
-                                        }
-                                    }
-
                                     let _ = writeln!(
                                         stderr,
                                         "\r[ua] observing output (iteration {next_iteration})..."
                                     );
-                                    // Pass empty instruction — tool_result is
-                                    // already in conversation history.
+                                    // Journal has the tool_result — rebuild
+                                    // conversation fresh from journal.
                                     state = start_streaming(
                                         rt_handle,
                                         config,
-                                        "",
+                                        &journal,
                                         &output_history,
-                                        &conversation,
                                         terminal_size,
                                         next_iteration,
                                         &tx_for_streaming,
@@ -1196,13 +1164,14 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
 
 /// Spawn a tokio task to stream from the backend, forwarding events through the mpsc channel.
 /// Returns the initial AgentState::Streaming.
+///
+/// Rebuilds conversation context fresh from the journal each time.
 #[allow(clippy::too_many_arguments)]
 fn start_streaming(
     rt_handle: &Handle,
     config: &Config,
-    instruction: &str,
+    journal: &Option<SessionJournal>,
     history: &OutputHistory,
-    conversation: &[ConversationMessage],
     terminal_size: (u16, u16),
     iteration: usize,
     tx: &mpsc::Sender<Event>,
@@ -1218,15 +1187,17 @@ fn start_streaming(
         }
     };
 
-    // Build request
-    let request = build_agent_request(
-        instruction,
-        config,
-        history,
-        conversation.to_vec(),
-        terminal_size,
-        child_pid,
-    );
+    // Rebuild conversation from journal
+    let conversation = match journal {
+        Some(j) => {
+            let entries = j.read_all();
+            build_conversation_from_journal(&entries, config.journal.conversation_budget)
+        }
+        None => Vec::new(),
+    };
+
+    // Build request — instruction is empty; the journal carries it.
+    let request = build_agent_request("", config, history, conversation, terminal_size, child_pid);
 
     // Create client and stream
     let client = AnthropicClient::with_model(&api_key, &config.backend.anthropic.model);
@@ -1359,6 +1330,7 @@ fn start_judging(
 mod tests {
     use super::*;
     use crate::config::SecurityConfig;
+    use ua_protocol::ConversationMessage;
 
     // --- Tool use command extraction tests ---
 

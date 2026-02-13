@@ -5,7 +5,6 @@
 
 use std::collections::VecDeque;
 
-use ua_backend::AnthropicClient;
 use ua_protocol::{AgentRequest, ConversationMessage, ShellContext, TerminalHistory};
 
 use crate::config::{Config, ContextConfig};
@@ -333,73 +332,6 @@ pub fn build_agent_request(
         conversation,
         system_prompt_extra,
     }
-}
-
-/// Token threshold above which compaction is triggered.
-pub const COMPACTION_THRESHOLD: u32 = 100_000;
-
-/// Compact conversation history by summarizing old turns.
-///
-/// When the conversation grows too large (measured by input_tokens from the API),
-/// this function summarizes older turns into a single message while preserving
-/// recent turns verbatim.
-pub async fn compact_conversation(
-    client: &AnthropicClient,
-    conversation: &mut Vec<ConversationMessage>,
-    keep_recent: usize,
-) -> Result<(), String> {
-    if conversation.len() <= keep_recent {
-        return Ok(());
-    }
-
-    let split_at = conversation.len() - keep_recent;
-    let old_turns: Vec<ConversationMessage> = conversation.drain(..split_at).collect();
-
-    // Serialize old turns into text for summarization
-    let mut serialized = String::new();
-    for msg in &old_turns {
-        let role = match msg.role {
-            ua_protocol::Role::User => "User",
-            ua_protocol::Role::Assistant => "Assistant",
-        };
-        if !msg.content.is_empty() {
-            serialized.push_str(&format!("{role}: {}\n", msg.content));
-        }
-        for tu in &msg.tool_uses {
-            serialized.push_str(&format!(
-                "{role} [tool_use]: {} {}\n",
-                tu.name, tu.input_json
-            ));
-        }
-        for tr in &msg.tool_results {
-            // Truncate long tool results for the summary input
-            let content = if tr.content.len() > 500 {
-                format!("{}...[truncated]", &tr.content[..500])
-            } else {
-                tr.content.clone()
-            };
-            serialized.push_str(&format!("{role} [tool_result]: {content}\n"));
-        }
-    }
-
-    let system_prompt =
-        "Summarize this agent conversation concisely. Preserve: key decisions made, \
-        commands executed and their outcomes, current task state, the user's goals. \
-        Omit: raw command output, thinking/reasoning, redundant details. \
-        Output a compact summary paragraph.";
-
-    let summary = client
-        .send_non_streaming(system_prompt, &serialized)
-        .await
-        .map_err(|e| format!("compaction failed: {e}"))?;
-
-    // Insert summary as the first message in the conversation
-    conversation.insert(
-        0,
-        ConversationMessage::user(format!("Previous context summary: {summary}")),
-    );
-
-    Ok(())
 }
 
 #[cfg(test)]
