@@ -3,6 +3,7 @@ pub mod batch;
 pub mod config;
 pub mod context;
 pub mod display;
+pub mod journal;
 pub mod judge;
 pub mod osc;
 pub mod policy;
