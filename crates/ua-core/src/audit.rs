@@ -6,7 +6,8 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::journal::{epoch_secs, generate_session_id};
 
 /// Append-only JSONL audit logger.
 pub struct AuditLogger {
@@ -125,19 +126,6 @@ impl AuditLogger {
             }
         }
     }
-}
-
-fn epoch_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-fn generate_session_id() -> String {
-    let pid = std::process::id();
-    let ts = epoch_secs();
-    format!("s{:x}", pid ^ (ts as u32))
 }
 
 #[cfg(test)]
