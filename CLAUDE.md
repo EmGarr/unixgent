@@ -99,8 +99,9 @@ ua-core/src/
   repl.rs          REPL loop, # detection, command extraction, OSC 133 dispatch
   pty.rs           PTY session management
   osc.rs           OSC 133 parser + terminal state machine
-  config.rs        Config loading (shell, backend, context)
-  context.rs       OutputHistory ring buffer, ANSI stripping, context assembly, compaction
+  config.rs        Config loading (shell, backend, context, journal)
+  context.rs       OutputHistory ring buffer, ANSI stripping, context assembly
+  journal.rs       Append-only session journal (JSONL), context builder from journal
   display.rs       Response stream accumulator (PlanDisplay)
   process.rs       Process introspection: depth counting, child CWD resolution
   shell_scripts.rs Shell integration scripts (bash/zsh/fish)
