@@ -11,13 +11,16 @@ use std::time::Instant;
 
 use futures::StreamExt;
 use ua_backend::AnthropicClient;
-use ua_protocol::{ConversationMessage, StreamEvent, ToolResultRecord, ToolUseRecord};
+use ua_protocol::{StreamEvent, ToolResultRecord, ToolUseRecord};
 
 use crate::audit::AuditLogger;
 use crate::config::Config;
 use crate::context::{
     build_agent_request, build_delegation_prompt, scrub_injection_markers, OutputHistory,
     TOOL_RESULT_PREFIX,
+};
+use crate::journal::{
+    build_conversation_from_journal, epoch_secs, generate_session_id, JournalEntry, SessionJournal,
 };
 use crate::policy::{analyze_pipe_chain, RiskLevel};
 
@@ -261,20 +264,49 @@ pub async fn run_batch(config: &Config, instruction: &str, depth: u32) -> i32 {
     };
 
     let empty_history = OutputHistory::new(0);
-    let mut conversation: Vec<ConversationMessage> = Vec::new();
-    let mut current_instruction = instruction.to_string();
     let mut consecutive_denials: usize = 0;
+
+    // Initialize session journal
+    let session_id = generate_session_id();
+    let journal_path = config
+        .journal
+        .resolve_sessions_dir()
+        .join(format!("{session_id}.jsonl"));
+    let mut journal = match SessionJournal::new(journal_path) {
+        Ok(j) => Some(j),
+        Err(e) => {
+            output.emit_error(&format!("failed to open journal: {e}"));
+            None
+        }
+    };
+
+    // Write initial instruction to journal
+    if let Some(ref mut j) = journal {
+        j.append(&JournalEntry::Instruction {
+            ts: epoch_secs(),
+            text: instruction.to_string(),
+        });
+    }
 
     output.emit_start();
 
     let mut iteration: usize = 0;
     loop {
-        // Build request
+        // Rebuild conversation from journal
+        let conversation = match journal {
+            Some(ref j) => {
+                let entries = j.read_all();
+                build_conversation_from_journal(&entries, config.journal.conversation_budget)
+            }
+            None => Vec::new(),
+        };
+
+        // Build request — instruction is empty; journal carries it.
         let mut request = build_agent_request(
-            &current_instruction,
+            "",
             config,
             &empty_history,
-            conversation.clone(),
+            conversation,
             (80, 24),
             None, // No PTY child in batch mode
         );
@@ -317,18 +349,13 @@ pub async fn run_batch(config: &Config, instruction: &str, depth: u32) -> i32 {
             }
         }
 
-        // Push conversation history
-        if iteration == 0 {
-            conversation.push(ConversationMessage::user(&current_instruction));
-        }
-
-        if !tool_uses.is_empty() {
-            conversation.push(ConversationMessage::assistant_with_tool_use(
-                &text,
-                tool_uses.clone(),
-            ));
-        } else if !text.is_empty() {
-            conversation.push(ConversationMessage::assistant(&text));
+        // Write response to journal
+        if let Some(ref mut j) = journal {
+            j.append(&JournalEntry::Response {
+                ts: epoch_secs(),
+                text: text.clone(),
+                tool_uses: tool_uses.clone(),
+            });
         }
 
         // No tool calls = final answer
@@ -377,8 +404,12 @@ pub async fn run_batch(config: &Config, instruction: &str, depth: u32) -> i32 {
                     content: denial_msg.to_string(),
                 })
                 .collect();
-            conversation.push(ConversationMessage::tool_result(tool_results));
-            current_instruction = String::new();
+            if let Some(ref mut j) = journal {
+                j.append(&JournalEntry::Blocked {
+                    ts: epoch_secs(),
+                    results: tool_results,
+                });
+            }
             continue;
         }
 
@@ -443,13 +474,11 @@ pub async fn run_batch(config: &Config, instruction: &str, depth: u32) -> i32 {
             }
         }
 
-        conversation.push(ConversationMessage::tool_result(all_results));
-        current_instruction = String::new();
-
-        // Evict oldest turns
-        let max = config.context.max_conversation_turns;
-        if conversation.len() > max {
-            conversation.drain(..conversation.len() - max);
+        if let Some(ref mut j) = journal {
+            j.append(&JournalEntry::ToolResult {
+                ts: epoch_secs(),
+                results: all_results,
+            });
         }
 
         iteration += 1;
