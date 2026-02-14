@@ -273,6 +273,7 @@ Child agents, policy inheritance, trace propagation, musl build, packaging.
 | ~~Token-aware conversation compaction~~ | ~~2026-02-11~~ | ~~Replaced by session journal~~ |
 | Append-only session journal (Ralph Loop) | 2026-02-12 | All session events written to JSONL file (`~/.local/share/unixagent/sessions/`). Each LLM call rebuilds conversation from journal with token budget (default 60k, configurable via `[journal].conversation_budget`). User shell commands captured on 133;D with exit code. Replaces `Vec<ConversationMessage>` accumulation, `compact_conversation()`, and `COMPACTION_THRESHOLD`. Journal entries: ShellCommand, Instruction, Response, ToolResult, Blocked, Checkpoint. Strict user/assistant alternation via `merge_or_push_user()`. |
 | Unbounded batch loop + descendant counting | 2026-02-11 | Batch mode `MAX_ITERATIONS` removed — loop runs until LLM stops or API error. System prompt no longer mentions budget. `count_descendant_agents()` walks process tree to count child agent instances via `list_all_pids()` (macOS: `proc_listallpids`, Linux: `/proc` enumeration). Testable `_core` variant uses fake process tables. |
+| No `delegate` tool — shell pipes are RLM recursion | 2026-02-14 | RLM paper needed `call_llm()` because its env was a Python REPL. Our env is the shell — pipes + `unixagent` already compose. Model slices its own journal (`$UA_JOURNAL`) with `jq`/`head`/`grep` and pipes context to child agents. No new tool surface needed. Delegation prompt in system prompt exposes journal path so model can self-inspect. |
 
 ---
 
@@ -321,21 +322,54 @@ Key: the model decides **when and how** to partition context. Not hardcoded orch
 | Environment (Python REPL) | PTY shell | DONE — strictly more powerful |
 | Context as variable | Files on disk + journal | DONE |
 | Model inspects subsets | `head`, `grep`, `cat`, `awk` | DONE — model already does this |
-| Recursive child LM calls | `max_agent_depth` + batch mode | Scaffolded, not wired as tool |
+| Recursive child LM calls | `max_agent_depth` + batch mode + pipes | Scaffolded (subagent mode pending) |
 | `FINAL(answer)` tag | Response journal entry | DONE |
 | Per-instance context isolation | Separate journal per child | Natural fit with Ralph Loop |
+| Context partitioning | `jq`, `head`, `split` + pipe to `unixagent` | DONE — shell is the orchestrator |
 
-### What's Missing for Full RLM
+### Design Decision: No `delegate` Tool — Shell Pipes Are the Recursion Primitive
 
-1. **`delegate` tool**: A tool in the schema the model can invoke to spawn a child agent with a focused query + context reference. Not a shell command — a structured tool alongside `shell`.
+**Date**: 2026-02-14
 
-2. **Child lifecycle**: Each child gets its own journal, token budget, and depth counter. Runs batch-style, returns a final answer. Parent sees only the answer as a `ToolResult`.
+The RLM paper needed a `call_llm()` function as a tool because their environment was a Python REPL with no native process model. Our environment **is** the shell. The recursion primitive already exists: pipes.
 
-3. **Proactive context offloading**: Currently the journal trims context reactively (budget truncation). With delegation, the model proactively offloads — "this file is too big for me, delegate a child to search it."
+~~1. **`delegate` tool**: A tool in the schema the model can invoke to spawn a child agent with a focused query + context reference.~~
+
+**Rejected.** A `delegate` tool would be a worse version of `sh -c` with extra serialization overhead. The model already knows how to pipe, slice, and invoke subprocesses:
+
+```bash
+# Slice journal rows and delegate analysis
+jq -s '.[0:100]' "$UA_JOURNAL" | unixagent "summarize these entries"
+
+# Extract a specific field and delegate
+jq -r '.[500].user_input' data.json | unixagent "what value are we looking for"
+
+# Partition + map (parallel)
+split -l 1000 big_file.jsonl /tmp/chunk_
+for f in /tmp/chunk_*; do
+  unixagent "analyze $f" > "$f.result" 2>/dev/null &
+done
+wait
+cat /tmp/chunk_*.result | unixagent "synthesize these results"
+```
+
+No new tool surface. No new serialization format. The model uses `jq`, `head`, `awk`, `split`, and pipes — tools it already understands — to partition context and delegate to child agents.
+
+### What's Needed for Full RLM
+
+1. **Subagent mode works** (`unixagent "instruction"` via args/stdin). Planned in SUBAGENT_PLAN.md.
+
+2. **Model knows its own journal path** (`$UA_JOURNAL` env var or system prompt). The journal is the model's memory on disk — it must be able to `jq`/`grep`/`head` its own history and pipe slices to children. Exposed via delegation prompt in system prompt.
+
+3. **Depth control** (`UA_DEPTH` + `max_agent_depth`). Already designed.
+
+That's it. Items 2 and 3 from the old plan ("child lifecycle" and "proactive context offloading") are already solved by the journal architecture and Unix pipes respectively. Each child process gets its own journal. The model proactively offloads by piping context slices to `unixagent` — no special API needed.
 
 ### Key Insight
 
 The journal makes recursive agents clean. Each instance writes its own JSONL file. No shared mutable state. Parent reads child's final answer. Depth verified via process tree (`process.rs`). The whole recursion tree is debuggable by reading journal files.
+
+The model's journal path in the system prompt is the bridge: the model can treat its own journal as a queryable context store, slice it with standard Unix tools, and pipe subsets to child agents. This is exactly the RLM "context as variable" concept, but the variable is a file and the REPL is a shell.
 
 ### Limitations Noted in Paper
 
@@ -346,7 +380,8 @@ The journal makes recursive agents clean. Each instance writes its own JSONL fil
 
 ### Open Questions for UnixAgent
 
-- Should `delegate` pass context by file path or inline? File path is more Unix, avoids copying.
-- Should children share the parent's PTY or get their own? Own PTY = full isolation but heavier.
+- ~~Should `delegate` pass context by file path or inline?~~ Answered: file path via pipes. No `delegate` tool.
+- ~~Should children share the parent's PTY or get their own?~~ Answered: no PTY for children (`std::process::Command`). See SUBAGENT_PLAN.md.
 - How to surface child progress to the user? Batch UX already handles this for subagents.
 - Can checkpoints in the journal serve as RLM "summarization" strategy automatically?
+- Should `$UA_JOURNAL` be set for all commands or only in the system prompt? Env var is simpler but leaks path to every subprocess.

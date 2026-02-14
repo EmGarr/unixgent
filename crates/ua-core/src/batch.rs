@@ -218,7 +218,7 @@ fn build_batch_system_prompt(depth: u32, max_depth: u32) -> String {
          5. Use as many iterations as required to complete the task thoroughly.",
     );
 
-    if let Some(delegation) = build_delegation_prompt(depth, max_depth) {
+    if let Some(delegation) = build_delegation_prompt(depth, max_depth, None) {
         prompt.push_str("\n\n");
         prompt.push_str(&delegation);
     }
@@ -302,6 +302,9 @@ pub async fn run_batch(config: &Config, instruction: &str, depth: u32) -> i32 {
         };
 
         // Build request — instruction is empty; journal carries it.
+        let batch_journal_path = journal
+            .as_ref()
+            .map(|j| j.path().to_string_lossy().to_string());
         let mut request = build_agent_request(
             "",
             config,
@@ -309,6 +312,7 @@ pub async fn run_batch(config: &Config, instruction: &str, depth: u32) -> i32 {
             conversation,
             (80, 24),
             None, // No PTY child in batch mode
+            batch_journal_path.as_deref(),
         );
         request.system_prompt_extra = Some(system_extra.clone());
 

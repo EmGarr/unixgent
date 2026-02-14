@@ -358,7 +358,10 @@ mod tests {
             output: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
-        assert!(!json.contains("output"), "None output should be skipped in serialization");
+        assert!(
+            !json.contains("output"),
+            "None output should be skipped in serialization"
+        );
     }
 
     #[test]

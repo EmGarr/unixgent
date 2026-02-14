@@ -287,14 +287,39 @@ pub fn scrub_injection_markers(output: &str) -> String {
 /// Build the delegation instructions for the system prompt.
 ///
 /// When `depth + 1 < max_depth`, the LLM is told it can spawn subagents.
+/// `journal_path` is exposed so the model can inspect/slice its own history.
 /// Returns `None` if delegation is not available (at depth limit).
-pub fn build_delegation_prompt(depth: u32, max_depth: u32) -> Option<String> {
+pub fn build_delegation_prompt(
+    depth: u32,
+    max_depth: u32,
+    journal_path: Option<&str>,
+) -> Option<String> {
     if depth + 1 >= max_depth {
         return None;
     }
 
     let exe_path =
         std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("unixagent"));
+
+    let journal_section = match journal_path {
+        Some(path) => format!(
+            "\n\
+             Your session journal (append-only JSONL) is at:\n\
+             \x20 {path}\n\
+             \n\
+             You can inspect your own history with standard tools:\n\
+             \x20 jq -s '.[-10:]' {path}              # last 10 entries\n\
+             \x20 jq -s '[.[] | select(.type==\"instruction\")]' {path}  # all instructions\n\
+             \x20 grep '\"shell_command\"' {path} | tail -5   # recent commands\n\
+             \n\
+             To delegate context slices to a subagent:\n\
+             \x20 jq -s '.[0:100]' {path} | {exe} \"summarize these entries\"\n\
+             \x20 jq -r '.[500].output' {path} | {exe} \"what value are we looking for\"\n",
+            path = path,
+            exe = exe_path.display(),
+        ),
+        None => String::new(),
+    };
 
     Some(format!(
         "You can delegate subtasks to subagents by running:\n\
@@ -306,6 +331,7 @@ pub fn build_delegation_prompt(depth: u32, max_depth: u32) -> Option<String> {
          - Parallel independent tasks (launch multiple in background with &, then wait)\n\
          - Focused research or analysis that would clutter the main conversation\n\
          - Subtasks that need their own multi-step tool use loops\n\
+         - Analyzing large context: slice data with jq/head/awk, pipe to subagent\n\
          \n\
          Subagent patterns:\n\
          \n\
@@ -324,10 +350,12 @@ pub fn build_delegation_prompt(depth: u32, max_depth: u32) -> Option<String> {
          Subagents share the working directory, filesystem, and audit log. \
          They enforce the same security policy (deny list). \
          They exit 0 on success, 1 on error. \
-         Nesting depth is limited to {max_depth} levels (currently at depth {depth}).",
+         Nesting depth is limited to {max_depth} levels (currently at depth {depth}).\
+         {journal_section}",
         exe = exe_path.display(),
         max_depth = max_depth,
         depth = depth,
+        journal_section = journal_section,
     ))
 }
 
@@ -338,12 +366,14 @@ pub fn build_agent_request(
     conversation: Vec<ConversationMessage>,
     terminal_size: (u16, u16),
     child_pid: Option<u32>,
+    journal_path: Option<&str>,
 ) -> AgentRequest {
     let context = build_shell_context(config, terminal_size, child_pid);
     let terminal_history = TerminalHistory::from_lines(history.lines());
 
     // REPL is always depth 0 — add delegation instructions if allowed
-    let system_prompt_extra = build_delegation_prompt(0, config.security.max_agent_depth);
+    let system_prompt_extra =
+        build_delegation_prompt(0, config.security.max_agent_depth, journal_path);
 
     AgentRequest {
         instruction: instruction.to_string(),
@@ -643,6 +673,7 @@ mod tests {
             &history,
             vec![],
             (80, 24),
+            None,
             None,
         );
 
