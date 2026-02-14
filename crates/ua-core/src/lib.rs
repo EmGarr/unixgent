@@ -1,7 +1,13 @@
+pub mod audit;
+pub mod batch;
 pub mod config;
 pub mod context;
 pub mod display;
+pub mod journal;
+pub mod judge;
 pub mod osc;
+pub mod policy;
+pub mod process;
 pub mod pty;
 pub mod repl;
 pub mod shell_scripts;

@@ -1488,8 +1488,11 @@ version = "0.1.0"
 dependencies = [
  "crossterm",
  "futures",
+ "libc",
  "portable-pty",
  "serde",
+ "serde_json",
+ "signal-hook",
  "tempfile",
  "tokio",
  "toml",

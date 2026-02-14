@@ -9,6 +9,13 @@ pub enum StreamEvent {
     /// A chunk of response text.
     TextDelta(String),
 
+    /// The model is calling a tool. Contains the tool call ID and accumulated input JSON.
+    ToolUse {
+        id: String,
+        name: String,
+        input_json: String,
+    },
+
     /// Token usage information.
     Usage {
         input_tokens: u32,

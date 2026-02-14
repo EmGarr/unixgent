@@ -9,6 +9,8 @@ pub struct Config {
     pub shell: ShellConfig,
     pub backend: BackendConfig,
     pub context: ContextConfig,
+    pub security: SecurityConfig,
+    pub journal: JournalConfig,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -94,6 +96,8 @@ impl AnthropicConfig {
 pub struct ContextConfig {
     /// Maximum number of terminal output lines to include in context.
     pub max_terminal_lines: usize,
+    /// Maximum number of conversation turns to keep before evicting oldest.
+    pub max_conversation_turns: usize,
     /// Environment variables to include in context.
     pub include_env: Vec<String>,
 }
@@ -102,6 +106,7 @@ impl Default for ContextConfig {
     fn default() -> Self {
         Self {
             max_terminal_lines: 200,
+            max_conversation_turns: 20,
             include_env: vec![
                 "PATH".to_string(),
                 "HOME".to_string(),
@@ -111,6 +116,93 @@ impl Default for ContextConfig {
                 "LANG".to_string(),
             ],
         }
+    }
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SecurityConfig {
+    /// Auto-approve read-only commands without prompting.
+    pub auto_approve_read_only: bool,
+    /// Require typing "yes" (not just 'y') for privileged commands.
+    pub require_yes_for_privileged: bool,
+    /// Enable audit logging.
+    pub audit_enabled: bool,
+    /// Custom audit log path. Defaults to ~/.local/share/unixagent/audit.jsonl.
+    pub audit_log_path: Option<String>,
+    /// Enable LLM-based security judge for non-read-only commands.
+    /// Adds latency (1-3s) and doubles API costs for evaluated batches.
+    pub judge_enabled: bool,
+    /// Maximum nesting depth for batch-mode agent delegation.
+    /// Verified via process tree inspection (tamper-proof).
+    pub max_agent_depth: u32,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            auto_approve_read_only: true,
+            require_yes_for_privileged: true,
+            audit_enabled: true,
+            audit_log_path: None,
+            judge_enabled: false,
+            max_agent_depth: 3,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct JournalConfig {
+    /// Enable session journaling.
+    pub enabled: bool,
+    /// Custom sessions directory. Defaults to ~/.local/share/unixagent/sessions/.
+    pub sessions_dir: Option<String>,
+    /// Token budget for conversation context rebuilt from journal.
+    pub conversation_budget: usize,
+}
+
+impl Default for JournalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sessions_dir: None,
+            conversation_budget: 60_000,
+        }
+    }
+}
+
+impl JournalConfig {
+    /// Resolve the sessions directory, using the configured path or the XDG default.
+    pub fn resolve_sessions_dir(&self) -> PathBuf {
+        if let Some(ref custom) = self.sessions_dir {
+            return PathBuf::from(custom);
+        }
+
+        let base = std::env::var("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                PathBuf::from(home).join(".local").join("share")
+            });
+        base.join("unixagent").join("sessions")
+    }
+}
+
+impl SecurityConfig {
+    /// Resolve the audit log path, using the configured path or the XDG default.
+    pub fn resolve_audit_path(&self) -> PathBuf {
+        if let Some(ref custom) = self.audit_log_path {
+            return PathBuf::from(custom);
+        }
+
+        let base = std::env::var("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                PathBuf::from(home).join(".local").join("share")
+            });
+        base.join("unixagent").join("audit.jsonl")
     }
 }
 
@@ -240,6 +332,118 @@ include_env = ["PATH", "HOME"]
 
         let key = cfg.resolve_api_key().unwrap();
         assert_eq!(key, "test_key_123");
+    }
+
+    #[test]
+    fn security_config_defaults() {
+        let cfg = SecurityConfig::default();
+        assert!(cfg.auto_approve_read_only);
+        assert!(cfg.require_yes_for_privileged);
+        assert!(cfg.audit_enabled);
+        assert!(cfg.audit_log_path.is_none());
+        assert!(!cfg.judge_enabled);
+    }
+
+    #[test]
+    fn parse_security_config() {
+        let toml_str = r#"
+[security]
+auto_approve_read_only = false
+require_yes_for_privileged = false
+audit_enabled = false
+audit_log_path = "/tmp/audit.jsonl"
+judge_enabled = true
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(!cfg.security.auto_approve_read_only);
+        assert!(!cfg.security.require_yes_for_privileged);
+        assert!(!cfg.security.audit_enabled);
+        assert_eq!(
+            cfg.security.audit_log_path.as_deref(),
+            Some("/tmp/audit.jsonl")
+        );
+        assert!(cfg.security.judge_enabled);
+    }
+
+    #[test]
+    fn parse_security_config_judge_defaults_false() {
+        let toml_str = r#"
+[security]
+auto_approve_read_only = true
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(!cfg.security.judge_enabled);
+    }
+
+    #[test]
+    fn parse_toml_without_security_uses_defaults() {
+        let toml_str = r#"
+[shell]
+command = "/bin/bash"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.security.auto_approve_read_only);
+        assert!(cfg.security.audit_enabled);
+    }
+
+    #[test]
+    fn resolve_audit_path_custom() {
+        let cfg = SecurityConfig {
+            audit_log_path: Some("/custom/path/audit.jsonl".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.resolve_audit_path(),
+            PathBuf::from("/custom/path/audit.jsonl")
+        );
+    }
+
+    #[test]
+    fn resolve_audit_path_default() {
+        let cfg = SecurityConfig::default();
+        let path = cfg.resolve_audit_path();
+        assert!(path.to_string_lossy().ends_with("unixagent/audit.jsonl"));
+    }
+
+    #[test]
+    fn journal_config_defaults() {
+        let cfg = JournalConfig::default();
+        assert!(cfg.enabled);
+        assert!(cfg.sessions_dir.is_none());
+        assert_eq!(cfg.conversation_budget, 60_000);
+    }
+
+    #[test]
+    fn parse_journal_config() {
+        let toml_str = r#"
+[journal]
+enabled = false
+sessions_dir = "/tmp/sessions"
+conversation_budget = 30000
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(!cfg.journal.enabled);
+        assert_eq!(cfg.journal.sessions_dir.as_deref(), Some("/tmp/sessions"));
+        assert_eq!(cfg.journal.conversation_budget, 30000);
+    }
+
+    #[test]
+    fn resolve_sessions_dir_custom() {
+        let cfg = JournalConfig {
+            sessions_dir: Some("/custom/sessions".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.resolve_sessions_dir(),
+            PathBuf::from("/custom/sessions")
+        );
+    }
+
+    #[test]
+    fn resolve_sessions_dir_default() {
+        let cfg = JournalConfig::default();
+        let path = cfg.resolve_sessions_dir();
+        assert!(path.to_string_lossy().ends_with("unixagent/sessions"));
     }
 
     #[test]
