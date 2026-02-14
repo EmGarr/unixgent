@@ -20,6 +20,9 @@ pub struct OutputHistory {
     max_lines: usize,
     /// State for ANSI escape sequence parsing.
     escape_state: EscapeState,
+    /// If true, `\r` clears the current line (only final overwrite survives).
+    /// Used for `output_mode: "final"` to collapse progress bar output.
+    cr_resets: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +40,20 @@ impl OutputHistory {
             current_line: String::new(),
             max_lines,
             escape_state: EscapeState::Ground,
+            cr_resets: false,
+        }
+    }
+
+    /// Create an OutputHistory where `\r` clears the current line.
+    /// Only the final overwritten content survives — useful for collapsing
+    /// progress bar output (e.g., `\rProgress: 100%` keeps only `Progress: 100%`).
+    pub fn with_cr_reset(max_lines: usize) -> Self {
+        Self {
+            lines: VecDeque::with_capacity(max_lines),
+            current_line: String::new(),
+            max_lines,
+            escape_state: EscapeState::Ground,
+            cr_resets: true,
         }
     }
 
@@ -51,7 +68,10 @@ impl OutputHistory {
                     } else if byte == b'\n' {
                         self.push_line();
                     } else if byte == b'\r' {
-                        // Ignore carriage returns
+                        if self.cr_resets {
+                            self.current_line.clear();
+                        }
+                        // else: ignore carriage returns (default)
                     } else if (0x20..0x7f).contains(&byte) {
                         self.current_line.push(byte as char);
                     }
@@ -416,6 +436,33 @@ mod tests {
         let lines = history.lines();
         // Incomplete line should not be included
         assert_eq!(lines, vec!["complete line"]);
+    }
+
+    #[test]
+    fn output_history_cr_resets_current_line() {
+        let mut history = OutputHistory::with_cr_reset(100);
+        history.feed(b"a\rb\n");
+
+        let lines = history.lines();
+        assert_eq!(lines, vec!["b"]);
+    }
+
+    #[test]
+    fn output_history_cr_no_reset_default() {
+        let mut history = OutputHistory::new(100);
+        history.feed(b"a\rb\n");
+
+        let lines = history.lines();
+        assert_eq!(lines, vec!["ab"]);
+    }
+
+    #[test]
+    fn output_history_cr_reset_progress_bar() {
+        let mut history = OutputHistory::with_cr_reset(100);
+        history.feed(b"Progress: 50%\rProgress: 75%\rProgress: 100%\n");
+
+        let lines = history.lines();
+        assert_eq!(lines, vec!["Progress: 100%"]);
     }
 
     #[test]

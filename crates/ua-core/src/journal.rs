@@ -47,6 +47,8 @@ pub enum JournalEntry {
         ts: u64,
         command: String,
         exit_code: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
     },
     /// User typed `# instruction` for the LLM.
     #[serde(rename = "instruction")]
@@ -144,7 +146,15 @@ fn approx_tokens(s: &str) -> usize {
 /// Approximate token cost of a single journal entry.
 fn entry_tokens(entry: &JournalEntry) -> usize {
     match entry {
-        JournalEntry::ShellCommand { command, .. } => approx_tokens(command) + 10,
+        JournalEntry::ShellCommand {
+            command, output, ..
+        } => {
+            let base = approx_tokens(command) + 10;
+            match output {
+                Some(o) => base + approx_tokens(o),
+                None => base,
+            }
+        }
         JournalEntry::Instruction { text, .. } => approx_tokens(text),
         JournalEntry::Response {
             text, tool_uses, ..
@@ -207,13 +217,22 @@ pub fn convert_entries_to_messages(entries: &[JournalEntry]) -> Vec<Conversation
     for entry in entries {
         match entry {
             JournalEntry::ShellCommand {
-                command, exit_code, ..
+                command,
+                exit_code,
+                output,
+                ..
             } => {
                 let exit_str = match exit_code {
                     Some(code) => format!("exit {code}"),
                     None => "unknown exit".to_string(),
                 };
-                let text = format!("[ran: {command} -> {exit_str}]");
+                let mut text = format!("[ran: {command} -> {exit_str}]");
+                if let Some(out) = output {
+                    if !out.is_empty() {
+                        text.push('\n');
+                        text.push_str(out);
+                    }
+                }
                 merge_or_push_user(&mut messages, text, Vec::new());
             }
             JournalEntry::Instruction { text, .. } => {
@@ -293,10 +312,56 @@ mod tests {
             ts: 1000,
             command: "ls -la".to_string(),
             exit_code: Some(0),
+            output: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: JournalEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(entry, parsed);
+    }
+
+    #[test]
+    fn serde_roundtrip_shell_command_with_output() {
+        let entry = JournalEntry::ShellCommand {
+            ts: 1000,
+            command: "ls".to_string(),
+            exit_code: Some(0),
+            output: Some("file1.txt\nfile2.txt".to_string()),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"output\":"));
+        let parsed: JournalEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(entry, parsed);
+    }
+
+    #[test]
+    fn serde_shell_command_missing_output_defaults_none() {
+        // Simulates reading an old journal entry without the output field
+        let json = r#"{"type":"shell_command","ts":1000,"command":"ls","exit_code":0}"#;
+        let parsed: JournalEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed,
+            JournalEntry::ShellCommand {
+                ts: 1000,
+                command: "ls".to_string(),
+                exit_code: Some(0),
+                output: None,
+            }
+        );
+    }
+
+    #[test]
+    fn serde_shell_command_none_output_skipped() {
+        let entry = JournalEntry::ShellCommand {
+            ts: 1000,
+            command: "ls".to_string(),
+            exit_code: Some(0),
+            output: None,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(
+            !json.contains("output"),
+            "None output should be skipped in serialization"
+        );
     }
 
     #[test]
@@ -471,6 +536,7 @@ mod tests {
                 ts: 1,
                 command: "ls -la".to_string(),
                 exit_code: Some(0),
+                output: None,
             },
             JournalEntry::Instruction {
                 ts: 2,
@@ -492,11 +558,13 @@ mod tests {
                 ts: 1,
                 command: "cd /tmp".to_string(),
                 exit_code: Some(0),
+                output: None,
             },
             JournalEntry::ShellCommand {
                 ts: 2,
                 command: "ls".to_string(),
                 exit_code: Some(0),
+                output: None,
             },
             JournalEntry::Instruction {
                 ts: 3,
@@ -625,11 +693,47 @@ mod tests {
             ts: 1,
             command: "sleep 100 &".to_string(),
             exit_code: None,
+            output: None,
         }];
 
         let msgs = build_conversation_from_journal(&entries, 60000);
         assert_eq!(msgs.len(), 1);
         assert!(msgs[0].content.contains("unknown exit"));
+    }
+
+    #[test]
+    fn shell_command_output_in_conversation() {
+        let entries = vec![
+            JournalEntry::ShellCommand {
+                ts: 1,
+                command: "ls".to_string(),
+                exit_code: Some(0),
+                output: Some("file1.txt\nfile2.txt".to_string()),
+            },
+            JournalEntry::Instruction {
+                ts: 2,
+                text: "what files?".to_string(),
+            },
+        ];
+
+        let msgs = build_conversation_from_journal(&entries, 60000);
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].content.contains("[ran: ls -> exit 0]"));
+        assert!(msgs[0].content.contains("file1.txt\nfile2.txt"));
+    }
+
+    #[test]
+    fn shell_command_empty_output_not_appended() {
+        let entries = vec![JournalEntry::ShellCommand {
+            ts: 1,
+            command: "true".to_string(),
+            exit_code: Some(0),
+            output: Some(String::new()),
+        }];
+
+        let msgs = build_conversation_from_journal(&entries, 60000);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "[ran: true -> exit 0]");
     }
 
     #[test]
