@@ -6,6 +6,7 @@ use std::thread::{self, JoinHandle};
 use futures::StreamExt;
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
+use ua_backend::anthropic::build_system_prompt;
 use ua_backend::AnthropicClient;
 use ua_protocol::{StreamEvent, ToolResultRecord, ToolUseRecord};
 
@@ -49,6 +50,8 @@ enum AgentState {
         display: PlanDisplay,
         /// Whether we're currently in thinking mode (for display).
         is_thinking: bool,
+        /// Accumulated thinking text for journal.
+        thinking_text: String,
         /// Current agentic loop iteration (0-based).
         iteration: usize,
         /// Commands captured from tool_use events.
@@ -390,8 +393,11 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
         .journal
         .resolve_sessions_dir()
         .join(format!("{session_id}.jsonl"));
-    let mut journal = match SessionJournal::new(journal_path) {
-        Ok(j) => Some(j),
+    let mut journal = match SessionJournal::new(journal_path.clone()) {
+        Ok(j) => {
+            std::env::set_var("UNIXAGENT_JOURNAL", &journal_path);
+            Some(j)
+        }
         Err(e) => {
             eprintln!("[ua] warning: failed to open journal: {e}");
             None
@@ -530,7 +536,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                                 state = start_streaming(
                                                     rt_handle,
                                                     config,
-                                                    &journal,
+                                                    &mut journal,
                                                     &output_history,
                                                     terminal_size,
                                                     0,
@@ -823,6 +829,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                 if let AgentState::Streaming {
                     ref mut display,
                     ref mut is_thinking,
+                    ref mut thinking_text,
                     ref mut tool_commands,
                     ref mut tool_cr_resets,
                     ref mut tool_uses,
@@ -836,6 +843,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                 let _ = write!(stderr, "\r\x1b[K\x1b[2m");
                                 let _ = stderr.flush();
                             }
+                            thinking_text.push_str(text);
                             let raw_safe = text.replace('\n', "\r\n");
                             let _ = write!(stderr, "\x1b[2m{raw_safe}\x1b[0m");
                             let _ = stderr.flush();
@@ -889,6 +897,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
             Event::BackendDone => {
                 if let AgentState::Streaming {
                     display,
+                    thinking_text,
                     iteration,
                     tool_commands,
                     tool_cr_resets,
@@ -917,6 +926,11 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                             if let Some(ref mut j) = journal {
                                 j.append(&JournalEntry::Response {
                                     ts: epoch_secs(),
+                                    thinking: if thinking_text.is_empty() {
+                                        None
+                                    } else {
+                                        Some(thinking_text)
+                                    },
                                     text: response_text.clone(),
                                     tool_uses: tool_uses.clone(),
                                 });
@@ -1197,7 +1211,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                     state = start_streaming(
                                         rt_handle,
                                         config,
-                                        &journal,
+                                        &mut journal,
                                         &output_history,
                                         terminal_size,
                                         next_iteration,
@@ -1255,7 +1269,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
 fn start_streaming(
     rt_handle: &Handle,
     config: &Config,
-    journal: &Option<SessionJournal>,
+    journal: &mut Option<SessionJournal>,
     history: &OutputHistory,
     terminal_size: (u16, u16),
     iteration: usize,
@@ -1283,6 +1297,15 @@ fn start_streaming(
 
     // Build request — instruction is empty; the journal carries it.
     let request = build_agent_request("", config, history, conversation, terminal_size, child_pid);
+
+    // Log system prompt to journal for trajectory reconstruction
+    if let Some(ref mut j) = journal {
+        let sp = build_system_prompt(&request);
+        j.append(&JournalEntry::SystemPrompt {
+            ts: epoch_secs(),
+            text: sp,
+        });
+    }
 
     // Create client and stream
     let client = AnthropicClient::with_model(&api_key, &config.backend.anthropic.model);
@@ -1318,6 +1341,7 @@ fn start_streaming(
         cancel_tx: Some(cancel_tx),
         display: PlanDisplay::new(),
         is_thinking: false,
+        thinking_text: String::new(),
         iteration,
         tool_commands: Vec::new(),
         tool_cr_resets: Vec::new(),

@@ -208,7 +208,7 @@ fn build_shell_tool() -> ApiTool {
     }
 }
 
-fn build_system_prompt(request: &AgentRequest) -> String {
+pub fn build_system_prompt(request: &AgentRequest) -> String {
     let ctx = &request.context;
     let (cols, rows) = ctx.terminal_size;
 

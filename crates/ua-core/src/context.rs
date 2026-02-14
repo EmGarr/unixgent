@@ -318,11 +318,18 @@ pub fn build_delegation_prompt(depth: u32, max_depth: u32) -> Option<String> {
          \x20 wait\n\
          \x20 cat /tmp/coverage.txt /tmp/api.txt\n\
          \n\
-         \x20 # Piped:\n\
-         \x20 echo \"summarize this\" | {exe}\n\
+         Your session journal is at $UNIXAGENT_JOURNAL. You can share context \
+         with subagents by embedding journal data in the instruction:\n\
+         \n\
+         \x20 # Share full journal context:\n\
+         \x20 {exe} \"$(cat $UNIXAGENT_JOURNAL) Summarize what happened\"\n\
+         \n\
+         \x20 # Share selective context (filter with jq):\n\
+         \x20 {exe} \"$(jq -r 'select(.command)' $UNIXAGENT_JOURNAL) Which commands modified config?\"\n\
          \n\
          Subagents share the working directory, filesystem, and audit log. \
          They enforce the same security policy (deny list). \
+         Each subagent gets its own isolated journal. \
          They exit 0 on success, 1 on error. \
          Nesting depth is limited to {max_depth} levels (currently at depth {depth}).",
         exe = exe_path.display(),
@@ -648,5 +655,40 @@ mod tests {
 
         assert_eq!(request.instruction, "what files are here");
         assert_eq!(request.terminal_history.lines, vec!["$ ls", "file.txt"]);
+    }
+
+    // --- Delegation prompt tests ---
+
+    #[test]
+    fn delegation_prompt_none_at_depth_limit() {
+        assert!(build_delegation_prompt(2, 3).is_none());
+        assert!(build_delegation_prompt(3, 3).is_none());
+        assert!(build_delegation_prompt(5, 3).is_none());
+    }
+
+    #[test]
+    fn delegation_prompt_some_when_under_limit() {
+        let prompt = build_delegation_prompt(0, 3);
+        assert!(prompt.is_some());
+        let prompt = prompt.unwrap();
+        assert!(prompt.contains("delegate subtasks"));
+        assert!(prompt.contains("depth 0"));
+    }
+
+    #[test]
+    fn delegation_prompt_contains_journal_patterns() {
+        let prompt = build_delegation_prompt(0, 3).unwrap();
+        assert!(
+            prompt.contains("$UNIXAGENT_JOURNAL"),
+            "Prompt should reference $UNIXAGENT_JOURNAL"
+        );
+        assert!(
+            prompt.contains("jq"),
+            "Prompt should show jq filtering pattern"
+        );
+        assert!(
+            prompt.contains("isolated journal"),
+            "Prompt should mention child journal isolation"
+        );
     }
 }

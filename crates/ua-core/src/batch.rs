@@ -10,6 +10,7 @@ use std::process::Command;
 use std::time::Instant;
 
 use futures::StreamExt;
+use ua_backend::anthropic::build_system_prompt;
 use ua_backend::AnthropicClient;
 use ua_protocol::{StreamEvent, ToolResultRecord, ToolUseRecord};
 
@@ -272,8 +273,11 @@ pub async fn run_batch(config: &Config, instruction: &str, depth: u32) -> i32 {
         .journal
         .resolve_sessions_dir()
         .join(format!("{session_id}.jsonl"));
-    let mut journal = match SessionJournal::new(journal_path) {
-        Ok(j) => Some(j),
+    let mut journal = match SessionJournal::new(journal_path.clone()) {
+        Ok(j) => {
+            std::env::set_var("UNIXAGENT_JOURNAL", &journal_path);
+            Some(j)
+        }
         Err(e) => {
             output.emit_error(&format!("failed to open journal: {e}"));
             None
@@ -312,11 +316,21 @@ pub async fn run_batch(config: &Config, instruction: &str, depth: u32) -> i32 {
         );
         request.system_prompt_extra = Some(system_extra.clone());
 
+        // Log system prompt to journal for trajectory reconstruction
+        if let Some(ref mut j) = journal {
+            let sp = build_system_prompt(&request);
+            j.append(&JournalEntry::SystemPrompt {
+                ts: epoch_secs(),
+                text: sp,
+            });
+        }
+
         // Stream response
         let stream = client.send(&request);
         let mut stream = std::pin::pin!(stream);
 
         let mut text = String::new();
+        let mut thinking_text = String::new();
         let mut tool_uses: Vec<ToolUseRecord> = Vec::new();
         let mut tool_commands: Vec<String> = Vec::new();
 
@@ -325,6 +339,7 @@ pub async fn run_batch(config: &Config, instruction: &str, depth: u32) -> i32 {
         while let Some(event) = stream.next().await {
             match event {
                 StreamEvent::TextDelta(t) => text.push_str(&t),
+                StreamEvent::ThinkingDelta(t) => thinking_text.push_str(&t),
                 StreamEvent::ToolUse {
                     id,
                     name,
@@ -353,6 +368,11 @@ pub async fn run_batch(config: &Config, instruction: &str, depth: u32) -> i32 {
         if let Some(ref mut j) = journal {
             j.append(&JournalEntry::Response {
                 ts: epoch_secs(),
+                thinking: if thinking_text.is_empty() {
+                    None
+                } else {
+                    Some(thinking_text)
+                },
                 text: text.clone(),
                 tool_uses: tool_uses.clone(),
             });

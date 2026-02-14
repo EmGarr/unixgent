@@ -53,10 +53,12 @@ pub enum JournalEntry {
     /// User typed `# instruction` for the LLM.
     #[serde(rename = "instruction")]
     Instruction { ts: u64, text: String },
-    /// LLM response (text + optional tool_use blocks).
+    /// LLM response (thinking + text + optional tool_use blocks).
     #[serde(rename = "response")]
     Response {
         ts: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thinking: Option<String>,
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tool_uses: Vec<ToolUseRecord>,
@@ -76,6 +78,10 @@ pub enum JournalEntry {
     /// Summary checkpoint for very long sessions.
     #[serde(rename = "checkpoint")]
     Checkpoint { ts: u64, summary: String },
+    /// System prompt snapshot — logged before each API call.
+    /// Acts as a delimiter for trajectory reconstruction.
+    #[serde(rename = "system_prompt")]
+    SystemPrompt { ts: u64, text: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -157,9 +163,15 @@ fn entry_tokens(entry: &JournalEntry) -> usize {
         }
         JournalEntry::Instruction { text, .. } => approx_tokens(text),
         JournalEntry::Response {
-            text, tool_uses, ..
+            thinking,
+            text,
+            tool_uses,
+            ..
         } => {
             let mut t = approx_tokens(text);
+            if let Some(th) = thinking {
+                t += approx_tokens(th);
+            }
             for tu in tool_uses {
                 t += approx_tokens(&tu.name) + approx_tokens(&tu.input_json);
             }
@@ -169,6 +181,7 @@ fn entry_tokens(entry: &JournalEntry) -> usize {
             results.iter().map(|r| approx_tokens(&r.content)).sum()
         }
         JournalEntry::Checkpoint { summary, .. } => approx_tokens(summary),
+        JournalEntry::SystemPrompt { .. } => 0, // Not included in conversation messages
     }
 }
 
@@ -258,6 +271,10 @@ pub fn convert_entries_to_messages(entries: &[JournalEntry]) -> Vec<Conversation
             JournalEntry::Checkpoint { summary, .. } => {
                 let text = format!("Previous context summary: {summary}");
                 merge_or_push_user(&mut messages, text, Vec::new());
+            }
+            JournalEntry::SystemPrompt { .. } => {
+                // System prompt snapshots are for trajectory reconstruction only;
+                // they don't contribute to the conversation messages.
             }
         }
     }
@@ -379,6 +396,7 @@ mod tests {
     fn serde_roundtrip_response_with_tool_uses() {
         let entry = JournalEntry::Response {
             ts: 1000,
+            thinking: None,
             text: "Let me check.".to_string(),
             tool_uses: vec![ToolUseRecord {
                 id: "toolu_1".to_string(),
@@ -395,6 +413,7 @@ mod tests {
     fn serde_roundtrip_response_without_tool_uses() {
         let entry = JournalEntry::Response {
             ts: 1000,
+            thinking: None,
             text: "The answer is 42.".to_string(),
             tool_uses: vec![],
         };
@@ -446,6 +465,74 @@ mod tests {
         assert_eq!(entry, parsed);
     }
 
+    #[test]
+    fn serde_roundtrip_system_prompt() {
+        let entry = JournalEntry::SystemPrompt {
+            ts: 1000,
+            text: "You are a Unix shell agent.\nWorking directory: /tmp".to_string(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: JournalEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(entry, parsed);
+    }
+
+    #[test]
+    fn serde_roundtrip_response_with_thinking() {
+        let entry = JournalEntry::Response {
+            ts: 1000,
+            thinking: Some("I should run ls to check.".to_string()),
+            text: "Let me check.".to_string(),
+            tool_uses: vec![],
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"thinking\":"));
+        let parsed: JournalEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(entry, parsed);
+    }
+
+    #[test]
+    fn serde_response_missing_thinking_defaults_none() {
+        // Simulates reading an old journal entry without the thinking field
+        let json = r#"{"type":"response","ts":1000,"text":"hello","tool_uses":[]}"#;
+        let parsed: JournalEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed,
+            JournalEntry::Response {
+                ts: 1000,
+                thinking: None,
+                text: "hello".to_string(),
+                tool_uses: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn system_prompt_skipped_in_conversation() {
+        let entries = vec![
+            JournalEntry::Instruction {
+                ts: 1,
+                text: "hello".to_string(),
+            },
+            JournalEntry::SystemPrompt {
+                ts: 1,
+                text: "You are a Unix shell agent.".to_string(),
+            },
+            JournalEntry::Response {
+                ts: 2,
+                thinking: Some("thinking...".to_string()),
+                text: "Hi!".to_string(),
+                tool_uses: vec![],
+            },
+        ];
+
+        let msgs = build_conversation_from_journal(&entries, 60000);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, ua_protocol::Role::User);
+        assert_eq!(msgs[0].content, "hello");
+        assert_eq!(msgs[1].role, ua_protocol::Role::Assistant);
+        assert_eq!(msgs[1].content, "Hi!");
+    }
+
     // --- SessionJournal tests ---
 
     #[test]
@@ -460,6 +547,7 @@ mod tests {
         });
         journal.append(&JournalEntry::Response {
             ts: 1001,
+            thinking: None,
             text: "Hi there!".to_string(),
             tool_uses: vec![],
         });
@@ -503,6 +591,7 @@ mod tests {
             },
             JournalEntry::Response {
                 ts: 2,
+                thinking: None,
                 text: "Let me check.".to_string(),
                 tool_uses: vec![ToolUseRecord {
                     id: "toolu_1".to_string(),
@@ -588,6 +677,7 @@ mod tests {
             },
             JournalEntry::Response {
                 ts: 2,
+                thinking: None,
                 text: "old response".to_string(),
                 tool_uses: vec![],
             },
@@ -620,6 +710,7 @@ mod tests {
             },
             JournalEntry::Response {
                 ts: 2,
+                thinking: None,
                 text: big_text,
                 tool_uses: vec![],
             },
@@ -629,6 +720,7 @@ mod tests {
             },
             JournalEntry::Response {
                 ts: 4,
+                thinking: None,
                 text: "recent response".to_string(),
                 tool_uses: vec![],
             },
@@ -650,6 +742,7 @@ mod tests {
             },
             JournalEntry::Response {
                 ts: 2,
+                thinking: None,
                 text: "OK".to_string(),
                 tool_uses: vec![ToolUseRecord {
                     id: "toolu_1".to_string(),
@@ -676,6 +769,7 @@ mod tests {
     fn assistant_first_gets_synthetic_user() {
         let entries = vec![JournalEntry::Response {
             ts: 2,
+            thinking: None,
             text: "Continuing...".to_string(),
             tool_uses: vec![],
         }];
@@ -759,6 +853,7 @@ mod tests {
             },
             JournalEntry::Response {
                 ts: 2,
+                thinking: None,
                 text: "step 1".to_string(),
                 tool_uses: vec![ToolUseRecord {
                     id: "t1".to_string(),
@@ -775,6 +870,7 @@ mod tests {
             },
             JournalEntry::Response {
                 ts: 4,
+                thinking: None,
                 text: "step 2".to_string(),
                 tool_uses: vec![ToolUseRecord {
                     id: "t2".to_string(),
@@ -799,5 +895,184 @@ mod tests {
         assert_eq!(msgs[2].role, ua_protocol::Role::User);
         assert_eq!(msgs[3].role, ua_protocol::Role::Assistant);
         assert_eq!(msgs[4].role, ua_protocol::Role::User);
+    }
+
+    // --- Token cost tests ---
+
+    #[test]
+    fn entry_tokens_shell_command_with_output() {
+        let without_output = JournalEntry::ShellCommand {
+            ts: 1,
+            command: "ls".to_string(),
+            exit_code: Some(0),
+            output: None,
+        };
+        let with_output = JournalEntry::ShellCommand {
+            ts: 1,
+            command: "ls".to_string(),
+            exit_code: Some(0),
+            output: Some("file1.txt\nfile2.txt\nfile3.txt".to_string()),
+        };
+        assert!(entry_tokens(&with_output) > entry_tokens(&without_output));
+    }
+
+    #[test]
+    fn entry_tokens_response_with_thinking() {
+        let without_thinking = JournalEntry::Response {
+            ts: 1,
+            thinking: None,
+            text: "hello".to_string(),
+            tool_uses: vec![],
+        };
+        let with_thinking = JournalEntry::Response {
+            ts: 1,
+            thinking: Some("I need to analyze this carefully...".to_string()),
+            text: "hello".to_string(),
+            tool_uses: vec![],
+        };
+        assert!(entry_tokens(&with_thinking) > entry_tokens(&without_thinking));
+    }
+
+    #[test]
+    fn entry_tokens_system_prompt_is_zero() {
+        let sp = JournalEntry::SystemPrompt {
+            ts: 1,
+            text: "You are a Unix shell agent. Very long system prompt here...".to_string(),
+        };
+        assert_eq!(entry_tokens(&sp), 0);
+    }
+
+    // --- Thinking serialization tests ---
+
+    #[test]
+    fn serde_response_none_thinking_skipped() {
+        let entry = JournalEntry::Response {
+            ts: 1000,
+            thinking: None,
+            text: "hello".to_string(),
+            tool_uses: vec![],
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(
+            !json.contains("thinking"),
+            "None thinking should be skipped in serialization"
+        );
+    }
+
+    // --- SystemPrompt budget tests ---
+
+    #[test]
+    fn system_prompt_does_not_consume_budget() {
+        // SystemPrompt has zero token cost, so it shouldn't affect budget truncation
+        let entries = vec![
+            JournalEntry::Instruction {
+                ts: 1,
+                text: "x".repeat(400), // ~100 tokens
+            },
+            JournalEntry::SystemPrompt {
+                ts: 1,
+                text: "x".repeat(100000), // huge, but zero cost
+            },
+            JournalEntry::Response {
+                ts: 2,
+                thinking: None,
+                text: "y".repeat(400), // ~100 tokens
+                tool_uses: vec![],
+            },
+            JournalEntry::Instruction {
+                ts: 3,
+                text: "recent".to_string(),
+            },
+        ];
+
+        // Budget of 250 tokens — should include all entries since SystemPrompt is free
+        let msgs = build_conversation_from_journal(&entries, 250);
+        let all_text: String = msgs.iter().map(|m| m.content.clone()).collect();
+        assert!(all_text.contains("recent"));
+        // Should also include the first instruction since SystemPrompt doesn't eat budget
+        assert!(all_text.contains(&"x".repeat(400)));
+    }
+
+    // --- Trajectory reconstruction ---
+
+    #[test]
+    fn trajectory_split_by_system_prompt() {
+        let entries = vec![
+            JournalEntry::Instruction {
+                ts: 1,
+                text: "what files?".to_string(),
+            },
+            JournalEntry::SystemPrompt {
+                ts: 1,
+                text: "SP1: Working directory: /tmp".to_string(),
+            },
+            JournalEntry::Response {
+                ts: 2,
+                thinking: Some("I should run ls.".to_string()),
+                text: "Let me check.".to_string(),
+                tool_uses: vec![ToolUseRecord {
+                    id: "t1".to_string(),
+                    name: "shell".to_string(),
+                    input_json: r#"{"command":"ls"}"#.to_string(),
+                }],
+            },
+            JournalEntry::ToolResult {
+                ts: 3,
+                results: vec![ToolResultRecord {
+                    tool_use_id: "t1".to_string(),
+                    content: "foo.txt".to_string(),
+                }],
+            },
+            JournalEntry::SystemPrompt {
+                ts: 3,
+                text: "SP2: Working directory: /tmp\nRecent: $ ls\nfoo.txt".to_string(),
+            },
+            JournalEntry::Response {
+                ts: 4,
+                thinking: Some("I see foo.txt.".to_string()),
+                text: "You have foo.txt.".to_string(),
+                tool_uses: vec![],
+            },
+        ];
+
+        // Split by SystemPrompt to find trajectory boundaries
+        let sp_indices: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e, JournalEntry::SystemPrompt { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(sp_indices, vec![1, 4]);
+
+        // Trajectory 1: entries[0..1] = messages, entries[1] = SP, entries[2..4] = output
+        let msgs1 = convert_entries_to_messages(&entries[..sp_indices[0]]);
+        assert_eq!(msgs1.len(), 1);
+        assert!(msgs1[0].content.contains("what files?"));
+
+        // Trajectory 2: entries[0..4] = messages, entries[4] = SP, entries[5] = output
+        let msgs2 = convert_entries_to_messages(&entries[..sp_indices[1]]);
+        assert_eq!(msgs2.len(), 3); // user, assistant(tool_use), user(tool_result)
+
+        // Verify system prompt text is extractable
+        if let JournalEntry::SystemPrompt { text, .. } = &entries[sp_indices[0]] {
+            assert!(text.contains("SP1"));
+        } else {
+            panic!("Expected SystemPrompt");
+        }
+        if let JournalEntry::SystemPrompt { text, .. } = &entries[sp_indices[1]] {
+            assert!(text.contains("SP2"));
+        } else {
+            panic!("Expected SystemPrompt");
+        }
+
+        // Verify response after each SP has thinking
+        if let JournalEntry::Response { thinking, text, .. } = &entries[sp_indices[0] + 1] {
+            assert_eq!(thinking.as_deref(), Some("I should run ls."));
+            assert_eq!(text, "Let me check.");
+        }
+        if let JournalEntry::Response { thinking, text, .. } = &entries[sp_indices[1] + 1] {
+            assert_eq!(thinking.as_deref(), Some("I see foo.txt."));
+            assert_eq!(text, "You have foo.txt.");
+        }
     }
 }

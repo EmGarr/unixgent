@@ -213,11 +213,26 @@ Input synthesis, window management, clipboard, accessibility-targeted actions.
 
 ---
 
-## Phase 9: Agent Spawning + Telemetry + Static Binary — TODO
+## Phase 9: Agent Spawning + Telemetry + Static Binary — WIP
 
-Child agents, policy inheritance, trace propagation, musl build, packaging.
+Child agent spawning via Unix-native RLM (shell + batch mode + journal piping).
+Policy inheritance, trace propagation, musl build, packaging.
 
-**Exit criteria**: Parent spawns child over SSH, trace links them. Static binary ships.
+| Sub-task | Status | Files |
+|----------|--------|-------|
+| Batch mode (non-interactive execution) | DONE | `ua-core/src/batch.rs` |
+| Delegation prompt (subagent patterns) | DONE | `ua-core/src/context.rs` |
+| `$UNIXAGENT_JOURNAL` env var | DONE | `ua-core/src/repl.rs`, `ua-core/src/batch.rs` |
+| Process depth counting (`max_agent_depth`) | DONE | `ua-core/src/process.rs` |
+| Descendant agent counting | DONE | `ua-core/src/process.rs` |
+| Journal-piped context sharing | DONE | via shell + `jq` + command substitution |
+| Per-child journal isolation | DONE | each process creates own session journal |
+| Child sandboxing (filesystem/network) | TODO | deferred to Phase 4.5 |
+| Trace propagation | TODO | |
+| Static binary (musl) | TODO | |
+
+**Exit criteria**: Parent spawns child agents via shell, shares selective
+context via journal piping, children run in isolated journals. Static binary ships.
 
 ---
 
@@ -273,6 +288,7 @@ Child agents, policy inheritance, trace propagation, musl build, packaging.
 | ~~Token-aware conversation compaction~~ | ~~2026-02-11~~ | ~~Replaced by session journal~~ |
 | Append-only session journal (Ralph Loop) | 2026-02-12 | All session events written to JSONL file (`~/.local/share/unixagent/sessions/`). Each LLM call rebuilds conversation from journal with token budget (default 60k, configurable via `[journal].conversation_budget`). User shell commands captured on 133;D with exit code. Replaces `Vec<ConversationMessage>` accumulation, `compact_conversation()`, and `COMPACTION_THRESHOLD`. Journal entries: ShellCommand, Instruction, Response, ToolResult, Blocked, Checkpoint. Strict user/assistant alternation via `merge_or_push_user()`. |
 | Unbounded batch loop + descendant counting | 2026-02-11 | Batch mode `MAX_ITERATIONS` removed — loop runs until LLM stops or API error. System prompt no longer mentions budget. `count_descendant_agents()` walks process tree to count child agent instances via `list_all_pids()` (macOS: `proc_listallpids`, Linux: `/proc` enumeration). Testable `_core` variant uses fake process tables. |
+| Unix-native RLM (no delegate tool) | 2026-02-14 | No structured `delegate` tool needed. Model spawns child agents via existing shell tool + batch mode. `$UNIXAGENT_JOURNAL` env var exposes journal path. Model uses `jq` + command substitution to pipe selective context into child instructions. Each child creates its own isolated journal. Depth enforced via process tree. All RLM strategies (peek, grep, partition+map) fall out of Unix primitives the model already knows. |
 | Journal fidelity: user command output capture + output_mode | 2026-02-14 | `ShellCommand` journal entry gains `output: Option<String>` field (serde-default for backward compat). REPL captures terminal output between OSC 133;C and 133;D via `user_cmd_capture` buffer, mirroring how agent command output is captured. `convert_entries_to_messages()` appends output to `[ran: ...]` stub. Shell tool gains `output_mode` enum (`"full"` / `"final"`) — `"final"` mode uses `OutputHistory::with_cr_reset()` where `\r` clears `current_line`, collapsing progress bar output to only the final overwritten state. |
 
 ---
@@ -322,21 +338,68 @@ Key: the model decides **when and how** to partition context. Not hardcoded orch
 | Environment (Python REPL) | PTY shell | DONE — strictly more powerful |
 | Context as variable | Files on disk + journal | DONE |
 | Model inspects subsets | `head`, `grep`, `cat`, `awk` | DONE — model already does this |
-| Recursive child LM calls | `max_agent_depth` + batch mode | Scaffolded, not wired as tool |
+| Recursive child LM calls | Shell + batch mode + `$UNIXAGENT_JOURNAL` | DONE — no special tool, Unix-native |
 | `FINAL(answer)` tag | Response journal entry | DONE |
-| Per-instance context isolation | Separate journal per child | Natural fit with Ralph Loop |
+| Per-instance context isolation | Separate journal per child | DONE — each process creates own session |
 
-### What's Missing for Full RLM
+### Implementation: Unix-Native RLM (DONE)
 
-1. **`delegate` tool**: A tool in the schema the model can invoke to spawn a child agent with a focused query + context reference. Not a shell command — a structured tool alongside `shell`.
+No `delegate` tool needed. The existing shell tool + batch mode + journal compose naturally:
 
-2. **Child lifecycle**: Each child gets its own journal, token budget, and depth counter. Runs batch-style, returns a final answer. Parent sees only the answer as a `ToolResult`.
+- `$UNIXAGENT_JOURNAL` env var exposes the current session's journal path
+- Model uses command substitution to embed selective context in child instructions
+- `jq` handles context partitioning (the "peek/grep/partition" strategies from the paper)
+- Each child creates its own isolated journal automatically
+- Depth limiting via `max_agent_depth` + process tree counting
 
-3. **Proactive context offloading**: Currently the journal trims context reactively (budget truncation). With delegation, the model proactively offloads — "this file is too big for me, delegate a child to search it."
+```
+# Full context sharing:
+unixagent "$(cat $UNIXAGENT_JOURNAL) Summarize what happened"
+
+# Selective context (filter with jq):
+unixagent "$(jq -r 'select(.command)' $UNIXAGENT_JOURNAL) Which commands modified config?"
+
+# Parallel with context:
+unixagent "$(head -5 $UNIXAGENT_JOURNAL) Analyze early commands" > /tmp/a.txt 2>/dev/null &
+unixagent "$(tail -5 $UNIXAGENT_JOURNAL) Analyze recent commands" > /tmp/b.txt 2>/dev/null &
+wait
+```
 
 ### Key Insight
 
 The journal makes recursive agents clean. Each instance writes its own JSONL file. No shared mutable state. Parent reads child's final answer. Depth verified via process tree (`process.rs`). The whole recursion tree is debuggable by reading journal files.
+
+### Trajectory Reconstruction (for rejection sampling)
+
+The journal must capture everything needed to reconstruct the exact `(input, output)` pair for every API call. Two additions make this possible:
+
+1. **`SystemPrompt` entry** — logged before each API call. Contains the full rendered system prompt (CWD, env vars, terminal history, delegation instructions). Acts as a delimiter between API calls.
+
+2. **`thinking` field on `Response`** — captures extended thinking output alongside text and tool_uses.
+
+The journal becomes a flat stream where `system_prompt` entries delimit API calls:
+
+```jsonl
+{"type":"shell_command","ts":1,"command":"cd /tmp","exit_code":0}
+{"type":"instruction","ts":2,"text":"what files are here?"}
+{"type":"system_prompt","ts":2,"text":"You are a Unix shell agent...\nWorking directory: /tmp\n..."}
+{"type":"response","ts":3,"thinking":"I should run ls.","text":"Let me check.","tool_uses":[...]}
+{"type":"tool_result","ts":4,"results":[{"tool_use_id":"toolu_1","content":"foo.txt\nbar.log"}]}
+{"type":"system_prompt","ts":4,"text":"You are a Unix shell agent...\nRecent terminal output:\n$ ls\nfoo.txt\n..."}
+{"type":"response","ts":5,"thinking":"Two files.","text":"You have foo.txt and bar.log."}
+```
+
+**To reconstruct API call N:**
+1. Find the Nth `system_prompt` entry at position P → that's the system prompt input
+2. Messages = `convert_entries_to_messages(entries[..P])` with budget truncation → exact messages array
+3. Output = the `response` entry after P → thinking + text + tool_uses
+
+Split by `system_prompt` → each segment is one complete API call. No indices, no cross-references. Full `(state, action, reward)` tuples for rejection sampling.
+
+**Files to touch:**
+- `journal.rs` — add `SystemPrompt` variant, add `thinking: Option<String>` to `Response`, skip `SystemPrompt` in `convert_entries_to_messages`
+- `repl.rs` — log `SystemPrompt` before each `start_streaming()`, accumulate thinking during streaming, include in `Response` entry
+- `batch.rs` — same for batch mode
 
 ### Limitations Noted in Paper
 
@@ -347,7 +410,7 @@ The journal makes recursive agents clean. Each instance writes its own JSONL fil
 
 ### Open Questions for UnixAgent
 
-- Should `delegate` pass context by file path or inline? File path is more Unix, avoids copying.
 - Should children share the parent's PTY or get their own? Own PTY = full isolation but heavier.
 - How to surface child progress to the user? Batch UX already handles this for subagents.
 - Can checkpoints in the journal serve as RLM "summarization" strategy automatically?
+- Sandboxing: how to restrict child filesystem/network access (deferred).
