@@ -196,6 +196,11 @@ fn build_shell_tool() -> ApiTool {
                 "command": {
                     "type": "string",
                     "description": "Shell command to execute. Chain multiple commands with && if needed."
+                },
+                "output_mode": {
+                    "type": "string",
+                    "enum": ["full", "final"],
+                    "description": "How to capture output. 'full' (default): all output including dynamic content like progress bars. 'final': only the final state of each line (collapses \\r-overwritten content)."
                 }
             },
             "required": ["command"]
@@ -779,13 +784,14 @@ mod tests {
     fn build_shell_tool_structure() {
         let tool = build_shell_tool();
         assert_eq!(tool.name, "shell");
-        assert!(tool.input_schema.get("properties").is_some());
-        assert!(tool
-            .input_schema
-            .get("properties")
-            .unwrap()
-            .get("command")
-            .is_some());
+        let props = tool.input_schema.get("properties").unwrap();
+        assert!(props.get("command").is_some());
+        assert!(props.get("output_mode").is_some());
+
+        let output_mode = props.get("output_mode").unwrap();
+        let enum_values = output_mode.get("enum").unwrap().as_array().unwrap();
+        let modes: Vec<&str> = enum_values.iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(modes, vec!["full", "final"]);
     }
 
     #[test]

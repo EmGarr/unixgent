@@ -273,3 +273,80 @@ Child agents, policy inheritance, trace propagation, musl build, packaging.
 | ~~Token-aware conversation compaction~~ | ~~2026-02-11~~ | ~~Replaced by session journal~~ |
 | Append-only session journal (Ralph Loop) | 2026-02-12 | All session events written to JSONL file (`~/.local/share/unixagent/sessions/`). Each LLM call rebuilds conversation from journal with token budget (default 60k, configurable via `[journal].conversation_budget`). User shell commands captured on 133;D with exit code. Replaces `Vec<ConversationMessage>` accumulation, `compact_conversation()`, and `COMPACTION_THRESHOLD`. Journal entries: ShellCommand, Instruction, Response, ToolResult, Blocked, Checkpoint. Strict user/assistant alternation via `merge_or_push_user()`. |
 | Unbounded batch loop + descendant counting | 2026-02-11 | Batch mode `MAX_ITERATIONS` removed — loop runs until LLM stops or API error. System prompt no longer mentions budget. `count_descendant_agents()` walks process tree to count child agent instances via `list_all_pids()` (macOS: `proc_listallpids`, Linux: `/proc` enumeration). Testable `_core` variant uses fake process tables. |
+
+---
+
+## Research Notes: Recursive Language Models (RLMs)
+
+**Source**: [alexzhang13.github.io/blog/2025/rlm](https://alexzhang13.github.io/blog/2025/rlm/)
+**Date noted**: 2026-02-12
+**Relevance**: Phase 9 (Agent Spawning) — this is the theoretical foundation for how child agents should work.
+
+### Core Thesis
+
+No single LM call should handle the full context. RLMs are "a thin wrapper around a LM that can spawn (recursive) LM calls for intermediate computation." The API stays the same from the caller's perspective — the recursion is internal.
+
+### How It Works
+
+1. Root model receives query + a reference to context (not the full context itself)
+2. Model has an environment (Python REPL in the paper) where context is stored as a variable
+3. Model can inspect subsets (`peek`, `grep`), transform data, or spawn child LM calls
+4. Child calls receive a focused context slice and a sub-query
+5. Child results flow back into the parent's environment
+6. Parent synthesizes a final answer from child results
+
+Key: the model decides **when and how** to partition context. Not hardcoded orchestration.
+
+### Emergent Strategies (observed, not programmed)
+
+| Strategy | Description | Unix equivalent |
+|----------|-------------|-----------------|
+| Peeking | Sample initial context to understand structure | `head -n 50 file` |
+| Grepping | Regex/keyword narrowing | `grep -n pattern file` |
+| Partition+Map | Chunk context, parallel recursive calls | `split` + child agents |
+| Summarization | Extract condensed info from subsets | `awk` / child agent with summary query |
+| Programmatic | Handle tasks through code execution | Shell commands directly |
+
+### Results
+
+- RLM(GPT-5-mini) outperformed GPT-5 by 34+ points (~114%) on 132K-token contexts
+- RLM(GPT-5) achieved 100% accuracy on 1,000 documents (~10M+ tokens) where baseline collapsed
+- Cost parity with standard calls at moderate scale
+- Avoids "context rot" — no single call processes huge context
+
+### Mapping to UnixAgent
+
+| RLM concept | UnixAgent equivalent | Status |
+|---|---|---|
+| Environment (Python REPL) | PTY shell | DONE — strictly more powerful |
+| Context as variable | Files on disk + journal | DONE |
+| Model inspects subsets | `head`, `grep`, `cat`, `awk` | DONE — model already does this |
+| Recursive child LM calls | `max_agent_depth` + batch mode | Scaffolded, not wired as tool |
+| `FINAL(answer)` tag | Response journal entry | DONE |
+| Per-instance context isolation | Separate journal per child | Natural fit with Ralph Loop |
+
+### What's Missing for Full RLM
+
+1. **`delegate` tool**: A tool in the schema the model can invoke to spawn a child agent with a focused query + context reference. Not a shell command — a structured tool alongside `shell`.
+
+2. **Child lifecycle**: Each child gets its own journal, token budget, and depth counter. Runs batch-style, returns a final answer. Parent sees only the answer as a `ToolResult`.
+
+3. **Proactive context offloading**: Currently the journal trims context reactively (budget truncation). With delegation, the model proactively offloads — "this file is too big for me, delegate a child to search it."
+
+### Key Insight
+
+The journal makes recursive agents clean. Each instance writes its own JSONL file. No shared mutable state. Parent reads child's final answer. Depth verified via process tree (`process.rs`). The whole recursion tree is debuggable by reading journal files.
+
+### Limitations Noted in Paper
+
+- Non-async blocking between recursion levels
+- No prefix caching optimization
+- Uncontrolled runtime/cost without iteration bounds (we already have `max_agent_depth`)
+- Paper only tested depth=1 (single level of recursion)
+
+### Open Questions for UnixAgent
+
+- Should `delegate` pass context by file path or inline? File path is more Unix, avoids copying.
+- Should children share the parent's PTY or get their own? Own PTY = full isolation but heavier.
+- How to surface child progress to the user? Batch UX already handles this for subagents.
+- Can checkpoints in the journal serve as RLM "summarization" strategy automatically?
