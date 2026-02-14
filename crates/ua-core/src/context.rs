@@ -5,9 +5,11 @@
 
 use std::collections::VecDeque;
 
+use ua_backend::AnthropicClient;
 use ua_protocol::{AgentRequest, ConversationMessage, ShellContext, TerminalHistory};
 
 use crate::config::{Config, ContextConfig};
+use crate::process::cwd_of_pid;
 
 /// Ring buffer for terminal output history.
 pub struct OutputHistory {
@@ -119,10 +121,20 @@ impl OutputHistory {
 }
 
 /// Build a ShellContext from the current environment.
-pub fn build_shell_context(config: &Config, terminal_size: (u16, u16)) -> ShellContext {
-    let cwd = std::env::current_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| ".".to_string());
+///
+/// If `child_pid` is provided, resolves the CWD from the child process
+/// (the PTY shell) instead of the parent process. This ensures the system
+/// prompt shows the correct directory after the user runs `cd`.
+pub fn build_shell_context(
+    config: &Config,
+    terminal_size: (u16, u16),
+    child_pid: Option<u32>,
+) -> ShellContext {
+    let cwd = child_pid.and_then(cwd_of_pid).unwrap_or_else(|| {
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string())
+    });
 
     let shell = config.shell_command();
 
@@ -306,8 +318,9 @@ pub fn build_agent_request(
     history: &OutputHistory,
     conversation: Vec<ConversationMessage>,
     terminal_size: (u16, u16),
+    child_pid: Option<u32>,
 ) -> AgentRequest {
-    let context = build_shell_context(config, terminal_size);
+    let context = build_shell_context(config, terminal_size, child_pid);
     let terminal_history = TerminalHistory::from_lines(history.lines());
 
     // REPL is always depth 0 — add delegation instructions if allowed
@@ -320,6 +333,73 @@ pub fn build_agent_request(
         conversation,
         system_prompt_extra,
     }
+}
+
+/// Token threshold above which compaction is triggered.
+pub const COMPACTION_THRESHOLD: u32 = 100_000;
+
+/// Compact conversation history by summarizing old turns.
+///
+/// When the conversation grows too large (measured by input_tokens from the API),
+/// this function summarizes older turns into a single message while preserving
+/// recent turns verbatim.
+pub async fn compact_conversation(
+    client: &AnthropicClient,
+    conversation: &mut Vec<ConversationMessage>,
+    keep_recent: usize,
+) -> Result<(), String> {
+    if conversation.len() <= keep_recent {
+        return Ok(());
+    }
+
+    let split_at = conversation.len() - keep_recent;
+    let old_turns: Vec<ConversationMessage> = conversation.drain(..split_at).collect();
+
+    // Serialize old turns into text for summarization
+    let mut serialized = String::new();
+    for msg in &old_turns {
+        let role = match msg.role {
+            ua_protocol::Role::User => "User",
+            ua_protocol::Role::Assistant => "Assistant",
+        };
+        if !msg.content.is_empty() {
+            serialized.push_str(&format!("{role}: {}\n", msg.content));
+        }
+        for tu in &msg.tool_uses {
+            serialized.push_str(&format!(
+                "{role} [tool_use]: {} {}\n",
+                tu.name, tu.input_json
+            ));
+        }
+        for tr in &msg.tool_results {
+            // Truncate long tool results for the summary input
+            let content = if tr.content.len() > 500 {
+                format!("{}...[truncated]", &tr.content[..500])
+            } else {
+                tr.content.clone()
+            };
+            serialized.push_str(&format!("{role} [tool_result]: {content}\n"));
+        }
+    }
+
+    let system_prompt =
+        "Summarize this agent conversation concisely. Preserve: key decisions made, \
+        commands executed and their outcomes, current task state, the user's goals. \
+        Omit: raw command output, thinking/reasoning, redundant details. \
+        Output a compact summary paragraph.";
+
+    let summary = client
+        .send_non_streaming(system_prompt, &serialized)
+        .await
+        .map_err(|e| format!("compaction failed: {e}"))?;
+
+    // Insert summary as the first message in the conversation
+    conversation.insert(
+        0,
+        ConversationMessage::user(format!("Previous context summary: {summary}")),
+    );
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -475,7 +555,7 @@ mod tests {
     #[test]
     fn build_shell_context_basic() {
         let config = Config::default();
-        let ctx = build_shell_context(&config, (80, 24));
+        let ctx = build_shell_context(&config, (80, 24), None);
 
         assert!(!ctx.cwd.is_empty());
         assert!(!ctx.shell.is_empty());
@@ -578,8 +658,14 @@ mod tests {
         let mut history = OutputHistory::new(100);
         history.feed(b"$ ls\nfile.txt\n");
 
-        let request =
-            build_agent_request("what files are here", &config, &history, vec![], (80, 24));
+        let request = build_agent_request(
+            "what files are here",
+            &config,
+            &history,
+            vec![],
+            (80, 24),
+            None,
+        );
 
         assert_eq!(request.instruction, "what files are here");
         assert_eq!(request.terminal_history.lines, vec!["$ ls", "file.txt"]);

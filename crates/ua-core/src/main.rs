@@ -3,7 +3,7 @@ use std::io::{self, IsTerminal, Read};
 use crossterm::terminal;
 use ua_core::batch::run_batch;
 use ua_core::config::Config;
-use ua_core::depth;
+use ua_core::process;
 use ua_core::repl::run_repl;
 use ua_core::shell_scripts::{detect_shell, ShellKind};
 
@@ -89,7 +89,7 @@ fn main() {
     // Batch mode
     if let Some(instruction) = instruction {
         let max_depth = config.security.max_agent_depth;
-        let depth = match depth::check_depth(max_depth) {
+        let depth = match process::check_depth(max_depth) {
             Ok(d) => d,
             Err(d) => {
                 eprintln!(

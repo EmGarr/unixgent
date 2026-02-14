@@ -12,8 +12,8 @@ use ua_protocol::{ConversationMessage, StreamEvent, ToolResultRecord, ToolUseRec
 use crate::audit::AuditLogger;
 use crate::config::Config;
 use crate::context::{
-    build_agent_request, build_shell_context, scrub_injection_markers, OutputHistory,
-    TOOL_RESULT_PREFIX,
+    build_agent_request, build_shell_context, compact_conversation, scrub_injection_markers,
+    OutputHistory, COMPACTION_THRESHOLD, TOOL_RESULT_PREFIX,
 };
 use crate::display::PlanDisplay;
 use crate::judge::{self, JudgeVerdict};
@@ -210,9 +210,6 @@ impl CommandQueue {
     }
 }
 
-/// Maximum number of agentic loop iterations before stopping.
-const MAX_AGENT_ITERATIONS: usize = 10;
-
 /// What to do after classifying proposed commands.
 #[derive(Debug)]
 enum CommandAction {
@@ -362,6 +359,10 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
     let mut state = AgentState::Idle;
     // Instruction text saved across the state transition (Idle → Streaming).
     let mut pending_instruction: Option<String> = None;
+    // Token count from the most recent API call (for compaction triggering).
+    let mut last_input_tokens: u32 = 0;
+    // Child shell PID for CWD resolution.
+    let child_pid = session.child_pid();
 
     // Initialize audit logger
     let mut audit = if config.security.audit_enabled {
@@ -494,6 +495,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                                     0,
                                                     &tx_for_streaming,
                                                     &mut stderr,
+                                                    child_pid,
                                                 );
                                             }
                                         }
@@ -791,6 +793,11 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                 }
                             }
                         }
+                        StreamEvent::Usage { input_tokens, .. } => {
+                            if *input_tokens > 0 {
+                                last_input_tokens = *input_tokens;
+                            }
+                        }
                         StreamEvent::Error(_) => {
                             if display.streaming_text.is_empty() {
                                 let _ = write!(stderr, "\r\x1b[K");
@@ -816,6 +823,53 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
 
                     match display.status {
                         crate::display::DisplayStatus::Error(ref msg) => {
+                            // Detect context overflow and attempt compaction
+                            let is_overflow = msg.contains("prompt is too long")
+                                || msg.contains("too many tokens")
+                                || msg.contains("context_length_exceeded");
+                            if is_overflow && conversation.len() > 4 {
+                                let _ = writeln!(
+                                    stderr,
+                                    "\r\x1b[2m[ua] context overflow, compacting...\x1b[0m\r"
+                                );
+                                let api_key = config.backend.anthropic.resolve_api_key().ok();
+                                if let Some(api_key) = api_key {
+                                    let client = AnthropicClient::with_model(
+                                        &api_key,
+                                        &config.backend.anthropic.model,
+                                    );
+                                    let compact_result = rt_handle.block_on(compact_conversation(
+                                        &client,
+                                        &mut conversation,
+                                        4,
+                                    ));
+                                    match compact_result {
+                                        Ok(()) => {
+                                            let _ = writeln!(
+                                                stderr,
+                                                "\r\x1b[2m[ua] compacted, retrying...\x1b[0m\r"
+                                            );
+                                            state = start_streaming(
+                                                rt_handle,
+                                                config,
+                                                "",
+                                                &output_history,
+                                                &conversation,
+                                                terminal_size,
+                                                iteration,
+                                                &tx_for_streaming,
+                                                &mut stderr,
+                                                child_pid,
+                                            );
+                                            continue;
+                                        }
+                                        Err(e) => {
+                                            let _ =
+                                                writeln!(stderr, "\r\n[ua] compaction failed: {e}");
+                                        }
+                                    }
+                                }
+                            }
                             let _ = writeln!(stderr, "\r\n[ua] error: {msg}");
                             pending_instruction = None;
                         }
@@ -913,7 +967,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                         config,
                                         &commands,
                                         pending_instruction.as_deref().unwrap_or(""),
-                                        &build_shell_context(config, terminal_size).cwd,
+                                        &build_shell_context(config, terminal_size, child_pid).cwd,
                                         iteration,
                                         tool_use_ids,
                                         risk_levels,
@@ -1014,7 +1068,11 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                             }
                         }
                         QueueEvent::AllDone => {
-                            // Commands finished executing
+                            // Commands finished executing — clear line buffer
+                            // so stale content (e.g. background job notifications)
+                            // doesn't block # detection.
+                            line_buf.clear();
+
                             if let AgentState::Executing {
                                 iteration,
                                 capture,
@@ -1023,7 +1081,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                             } = std::mem::replace(&mut state, AgentState::Idle)
                             {
                                 let captured_lines = capture.lines();
-                                if !captured_lines.is_empty() && iteration < MAX_AGENT_ITERATIONS {
+                                if !captured_lines.is_empty() {
                                     // Build observation with scrubbing
                                     let raw_output = captured_lines.join("\n");
                                     let scrubbed = scrub_injection_markers(&raw_output);
@@ -1050,32 +1108,52 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                     let _ = session.write_all(b"\x15");
 
                                     let next_iteration = iteration + 1;
-                                    if next_iteration >= MAX_AGENT_ITERATIONS {
+
+                                    // Compact if context is getting large
+                                    if last_input_tokens > COMPACTION_THRESHOLD {
                                         let _ = writeln!(
                                             stderr,
-                                            "\r[ua] max iterations ({MAX_AGENT_ITERATIONS}) reached"
+                                            "\r\x1b[2m[ua] compacting context...\x1b[0m\r"
                                         );
-                                    } else {
-                                        let _ = writeln!(
-                                            stderr,
-                                            "\r[ua] observing output ({next_iteration}/{MAX_AGENT_ITERATIONS})..."
-                                        );
-                                        // Pass empty instruction — tool_result is
-                                        // already in conversation history.
-                                        state = start_streaming(
-                                            rt_handle,
-                                            config,
-                                            "",
-                                            &output_history,
-                                            &conversation,
-                                            terminal_size,
-                                            next_iteration,
-                                            &tx_for_streaming,
-                                            &mut stderr,
-                                        );
+                                        let api_key =
+                                            config.backend.anthropic.resolve_api_key().ok();
+                                        if let Some(api_key) = api_key {
+                                            let client = AnthropicClient::with_model(
+                                                &api_key,
+                                                &config.backend.anthropic.model,
+                                            );
+                                            let compact_result = rt_handle.block_on(
+                                                compact_conversation(&client, &mut conversation, 4),
+                                            );
+                                            if let Err(e) = compact_result {
+                                                let _ = writeln!(
+                                                    stderr,
+                                                    "\r[ua] compaction failed: {e}"
+                                                );
+                                            }
+                                        }
                                     }
+
+                                    let _ = writeln!(
+                                        stderr,
+                                        "\r[ua] observing output (iteration {next_iteration})..."
+                                    );
+                                    // Pass empty instruction — tool_result is
+                                    // already in conversation history.
+                                    state = start_streaming(
+                                        rt_handle,
+                                        config,
+                                        "",
+                                        &output_history,
+                                        &conversation,
+                                        terminal_size,
+                                        next_iteration,
+                                        &tx_for_streaming,
+                                        &mut stderr,
+                                        child_pid,
+                                    );
                                 }
-                                // else: no output or max iterations — stay Idle
+                                // else: no output — stay Idle
                             }
                         }
                         QueueEvent::Failed(code) => {
@@ -1083,6 +1161,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                 stderr,
                                 "\r[ua] command failed (exit code {code}), stopping"
                             );
+                            line_buf.clear();
                             state = AgentState::Idle;
                         }
                         QueueEvent::None => {}
@@ -1128,6 +1207,7 @@ fn start_streaming(
     iteration: usize,
     tx: &mpsc::Sender<Event>,
     stderr: &mut io::Stderr,
+    child_pid: Option<u32>,
 ) -> AgentState {
     // Resolve API key
     let api_key = match config.backend.anthropic.resolve_api_key() {
@@ -1145,6 +1225,7 @@ fn start_streaming(
         history,
         conversation.to_vec(),
         terminal_size,
+        child_pid,
     );
 
     // Create client and stream
