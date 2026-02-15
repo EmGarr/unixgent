@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod audit;
 pub mod batch;
 pub mod config;
@@ -11,3 +12,4 @@ pub mod process;
 pub mod pty;
 pub mod repl;
 pub mod shell_scripts;
+pub mod style;

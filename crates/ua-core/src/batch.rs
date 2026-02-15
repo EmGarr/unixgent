@@ -20,10 +20,9 @@ use crate::context::{
     build_agent_request, build_delegation_prompt, scrub_injection_markers, OutputHistory,
     TOOL_RESULT_PREFIX,
 };
-use crate::journal::{
-    build_conversation_from_journal, epoch_secs, generate_session_id, JournalEntry, SessionJournal,
-};
+use crate::journal::{build_conversation_from_journal, epoch_secs, JournalEntry, SessionJournal};
 use crate::policy::{analyze_pipe_chain, RiskLevel};
+use crate::style::{format_tokens, Style};
 
 const MAX_OUTPUT_BYTES: usize = 100_000;
 const MAX_CONSECUTIVE_DENIALS: usize = 3;
@@ -40,10 +39,11 @@ pub struct BatchOutput<W: Write> {
     task_summary: String,
     step_count: usize,
     term_width: u16,
+    style: Style,
 }
 
 impl<W: Write> BatchOutput<W> {
-    pub fn new(writer: W, is_tty: bool, depth: u32, instruction: &str) -> Self {
+    pub fn new(writer: W, is_tty: bool, depth: u32, instruction: &str, style: Style) -> Self {
         let term_width = if is_tty {
             crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80)
         } else {
@@ -65,6 +65,7 @@ impl<W: Write> BatchOutput<W> {
             task_summary,
             step_count: 0,
             term_width,
+            style,
         }
     }
 
@@ -73,10 +74,16 @@ impl<W: Write> BatchOutput<W> {
         format!("[ua:d{}]", self.depth)
     }
 
-    /// Prefix with dim cyan color for TTY mode.
+    /// Prefix with dim cyan color (respects NO_COLOR).
     fn colored_prefix(&self) -> String {
         if self.is_tty {
-            format!("\x1b[2m\x1b[36m{}\x1b[0m", self.prefix())
+            format!(
+                "{}{}{}{}",
+                self.style.dim_start(),
+                self.style.cyan_start(),
+                self.prefix(),
+                self.style.reset()
+            )
         } else {
             self.prefix()
         }
@@ -101,8 +108,10 @@ impl<W: Write> BatchOutput<W> {
         if self.is_tty {
             let _ = writeln!(
                 self.writer,
-                "{} \x1b[36m---\x1b[0m \"{}\"",
+                "{} {}---{} \"{}\"",
                 self.colored_prefix(),
+                self.style.cyan_start(),
+                self.style.reset(),
                 self.task_summary
             );
         } else {
@@ -121,9 +130,11 @@ impl<W: Write> BatchOutput<W> {
         if self.is_tty {
             let _ = write!(
                 self.writer,
-                "\r\x1b[K{} \x1b[2m({}) thinking...\x1b[0m",
+                "\r\x1b[K{} {}({}) thinking...{}",
                 self.colored_prefix(),
+                self.style.dim_start(),
                 iteration + 1,
+                self.style.reset(),
             );
         } else {
             let _ = writeln!(
@@ -143,10 +154,12 @@ impl<W: Write> BatchOutput<W> {
         if self.is_tty {
             let _ = write!(
                 self.writer,
-                "\r\x1b[K{} \x1b[2m({}) {}\x1b[0m",
+                "\r\x1b[K{} {}({}) {}{}",
                 self.colored_prefix(),
+                self.style.dim_start(),
                 iteration + 1,
                 display_cmd,
+                self.style.reset(),
             );
             let _ = self.writer.flush();
         } else {
@@ -160,9 +173,11 @@ impl<W: Write> BatchOutput<W> {
         if self.is_tty {
             let _ = writeln!(
                 self.writer,
-                "\r\x1b[K{} \x1b[31mDENIED: {}\x1b[0m",
+                "\r\x1b[K{} {}DENIED: {}{}",
                 self.colored_prefix(),
+                self.style.red_start(),
                 display_cmd,
+                self.style.reset(),
             );
         } else {
             let _ = writeln!(self.writer, "{} DENIED: {}", self.prefix(), display_cmd,);
@@ -174,33 +189,46 @@ impl<W: Write> BatchOutput<W> {
         if self.is_tty {
             let _ = writeln!(
                 self.writer,
-                "\r\x1b[K{} \x1b[31merror: {}\x1b[0m",
+                "\r\x1b[K{} {}error: {}{}",
                 self.colored_prefix(),
+                self.style.red_start(),
                 msg,
+                self.style.reset(),
             );
         } else {
             let _ = writeln!(self.writer, "{} error: {}", self.prefix(), msg,);
         }
     }
 
-    /// Emit the done boundary line (persists).
-    pub fn emit_done(&mut self) {
+    /// Emit the done boundary line (persists), including token totals.
+    pub fn emit_done(&mut self, input_tokens: u32, output_tokens: u32) {
         let elapsed = self.start_time.elapsed().as_secs();
+        let tok_in = format_tokens(input_tokens);
+        let tok_out = format_tokens(output_tokens);
         if self.is_tty {
             let _ = writeln!(
                 self.writer,
-                "\r\x1b[K{} \x1b[36m---\x1b[0m \x1b[2mdone ({elapsed}s, {} steps)\x1b[0m",
+                "\r\x1b[K{} {}---{} {}done  {tok_in}↑ {tok_out}↓  {} steps  {elapsed}s{}",
                 self.colored_prefix(),
+                self.style.cyan_start(),
+                self.style.reset(),
+                self.style.dim_start(),
                 self.step_count,
+                self.style.reset(),
             );
         } else {
             let _ = writeln!(
                 self.writer,
-                "{} --- done ({elapsed}s, {} steps)",
+                "{} --- done  {tok_in}↑ {tok_out}↓  {} steps  {elapsed}s",
                 self.prefix(),
                 self.step_count,
             );
         }
+    }
+
+    /// Elapsed seconds since batch start.
+    pub fn elapsed_secs(&self) -> f64 {
+        self.start_time.elapsed().as_secs_f64()
     }
 }
 
@@ -233,7 +261,8 @@ fn build_batch_system_prompt(depth: u32, max_depth: u32) -> String {
 /// and prints the final text answer to stdout. Returns the exit code.
 pub async fn run_batch(config: &Config, instruction: &str, depth: u32) -> i32 {
     let is_tty = std::io::stderr().is_terminal();
-    let mut output = BatchOutput::new(std::io::stderr(), is_tty, depth, instruction);
+    let style = Style::new();
+    let mut output = BatchOutput::new(std::io::stderr(), is_tty, depth, instruction, style);
 
     let system_extra = build_batch_system_prompt(depth, config.security.max_agent_depth);
 
@@ -267,12 +296,12 @@ pub async fn run_batch(config: &Config, instruction: &str, depth: u32) -> i32 {
     let empty_history = OutputHistory::new(0);
     let mut consecutive_denials: usize = 0;
 
-    // Initialize session journal
-    let session_id = generate_session_id();
+    // Initialize session journal (PID-based naming for subagent discovery)
+    let pid = std::process::id();
     let journal_path = config
         .journal
         .resolve_sessions_dir()
-        .join(format!("{session_id}.jsonl"));
+        .join(format!("agent-{pid}.jsonl"));
     let mut journal = match SessionJournal::new(journal_path.clone()) {
         Ok(j) => {
             std::env::set_var("UNIXAGENT_JOURNAL", &journal_path);
@@ -293,6 +322,30 @@ pub async fn run_batch(config: &Config, instruction: &str, depth: u32) -> i32 {
     }
 
     output.emit_start();
+
+    let mut total_input_tokens: u32 = 0;
+    let mut total_output_tokens: u32 = 0;
+    let mut total_commands: u32 = 0;
+    let mut total_denied: u32 = 0;
+
+    /// Helper macro to write Summary to journal before returning.
+    macro_rules! write_summary {
+        ($journal:expr, $output:expr, $exit_code:expr, $instruction:expr,
+         $in_tok:expr, $out_tok:expr, $cmds:expr, $denied:expr) => {
+            if let Some(ref mut j) = $journal {
+                j.append(&JournalEntry::Summary {
+                    ts: epoch_secs(),
+                    input_tokens: $in_tok,
+                    output_tokens: $out_tok,
+                    commands_run: $cmds,
+                    commands_denied: $denied,
+                    exit_code: $exit_code,
+                    elapsed_secs: $output.elapsed_secs(),
+                    task: $instruction.chars().take(60).collect(),
+                });
+            }
+        };
+    }
 
     let mut iteration: usize = 0;
     loop {
@@ -358,9 +411,26 @@ pub async fn run_batch(config: &Config, instruction: &str, depth: u32) -> i32 {
                 }
                 StreamEvent::Error(e) => {
                     output.emit_error(&e);
+                    write_summary!(
+                        journal,
+                        output,
+                        1,
+                        instruction,
+                        total_input_tokens,
+                        total_output_tokens,
+                        total_commands,
+                        total_denied
+                    );
                     return 1;
                 }
-                _ => {}
+                StreamEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                } => {
+                    total_input_tokens += input_tokens;
+                    total_output_tokens += output_tokens;
+                }
+                StreamEvent::Done => {}
             }
         }
 
@@ -380,7 +450,17 @@ pub async fn run_batch(config: &Config, instruction: &str, depth: u32) -> i32 {
 
         // No tool calls = final answer
         if tool_commands.is_empty() {
-            output.emit_done();
+            output.emit_done(total_input_tokens, total_output_tokens);
+            write_summary!(
+                journal,
+                output,
+                0,
+                instruction,
+                total_input_tokens,
+                total_output_tokens,
+                total_commands,
+                total_denied
+            );
             print!("{text}");
             return 0;
         }
@@ -402,6 +482,7 @@ pub async fn run_batch(config: &Config, instruction: &str, depth: u32) -> i32 {
                 output.emit_denied(&tool_commands[i]);
                 audit.log_blocked(&tool_commands[i], risk.as_str(), "denied by policy");
                 any_denied = true;
+                total_denied += 1;
             }
         }
 
@@ -414,6 +495,16 @@ pub async fn run_batch(config: &Config, instruction: &str, depth: u32) -> i32 {
                     "{MAX_CONSECUTIVE_DENIALS} consecutive denials, aborting"
                 );
                 output.emit_error(&msg);
+                write_summary!(
+                    journal,
+                    output,
+                    1,
+                    instruction,
+                    total_input_tokens,
+                    total_output_tokens,
+                    total_commands,
+                    total_denied
+                );
                 return 1;
             }
             let denial_msg = "Command blocked by security policy. Suggest a safer alternative.";
@@ -437,6 +528,7 @@ pub async fn run_batch(config: &Config, instruction: &str, depth: u32) -> i32 {
         audit.log_approved(iteration, "batch", "non-interactive auto-approve");
 
         // Execute each command
+        total_commands += tool_commands.len() as u32;
         let mut all_results: Vec<ToolResultRecord> = Vec::new();
         for (i, cmd) in tool_commands.iter().enumerate() {
             output.emit_command(cmd, iteration);
@@ -513,7 +605,14 @@ mod tests {
     use super::*;
 
     fn make_output(is_tty: bool, depth: u32, instruction: &str) -> BatchOutput<Vec<u8>> {
-        BatchOutput::new(Vec::new(), is_tty, depth, instruction)
+        // TTY tests use enabled style to verify ANSI codes;
+        // non-TTY tests use disabled style to verify no ANSI.
+        let style = if is_tty {
+            Style::force_enabled()
+        } else {
+            Style::disabled()
+        };
+        BatchOutput::new(Vec::new(), is_tty, depth, instruction, style)
     }
 
     fn output_str(output: &BatchOutput<Vec<u8>>) -> String {
@@ -589,12 +688,13 @@ mod tests {
     fn tty_done_has_boundary_and_elapsed() {
         let mut out = make_output(true, 1, "test");
         out.step_count = 3;
-        out.emit_done();
+        out.emit_done(1200, 500);
         let s = output_str(&out);
         assert!(s.contains("---"), "should have boundary");
         assert!(s.contains("done"), "should say done");
         assert!(s.contains("3 steps"), "should show step count");
-        assert!(s.contains("s,"), "should show elapsed time");
+        assert!(s.contains("1.2k↑"), "should show input tokens");
+        assert!(s.contains("500↓"), "should show output tokens");
         assert!(s.ends_with('\n'), "done should persist");
     }
 
@@ -653,10 +753,12 @@ mod tests {
     fn non_tty_done_no_ansi() {
         let mut out = make_output(false, 0, "test");
         out.step_count = 5;
-        out.emit_done();
+        out.emit_done(800, 300);
         let s = output_str(&out);
         assert!(s.contains("--- done"), "should have boundary");
         assert!(s.contains("5 steps"), "should show step count");
+        assert!(s.contains("800↑"), "should show input tokens");
+        assert!(s.contains("300↓"), "should show output tokens");
         assert!(!s.contains("\x1b["), "non-TTY should not have ANSI codes");
     }
 

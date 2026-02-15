@@ -16,6 +16,8 @@ pub struct PlanDisplay {
     pub thinking_text: String,
     pub streaming_text: String,
     pub status: DisplayStatus,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
 }
 
 impl Default for PlanDisplay {
@@ -30,6 +32,8 @@ impl PlanDisplay {
             thinking_text: String::new(),
             streaming_text: String::new(),
             status: DisplayStatus::Idle,
+            input_tokens: 0,
+            output_tokens: 0,
         }
     }
 
@@ -45,7 +49,13 @@ impl PlanDisplay {
                 self.streaming_text.push_str(text);
             }
             StreamEvent::ToolUse { .. } => {}
-            StreamEvent::Usage { .. } => {}
+            StreamEvent::Usage {
+                input_tokens,
+                output_tokens,
+            } => {
+                self.input_tokens += input_tokens;
+                self.output_tokens += output_tokens;
+            }
             StreamEvent::Done => {}
             StreamEvent::Error(msg) => {
                 self.status = DisplayStatus::Error(msg.clone());
@@ -58,6 +68,8 @@ impl PlanDisplay {
         self.thinking_text.clear();
         self.streaming_text.clear();
         self.status = DisplayStatus::Idle;
+        self.input_tokens = 0;
+        self.output_tokens = 0;
     }
 }
 
@@ -134,5 +146,42 @@ mod tests {
         assert_eq!(display.status, DisplayStatus::Idle);
         assert!(display.thinking_text.is_empty());
         assert!(display.streaming_text.is_empty());
+    }
+
+    #[test]
+    fn handle_usage_accumulates() {
+        let mut display = PlanDisplay::new();
+        display.handle_event(&StreamEvent::Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+        });
+        display.handle_event(&StreamEvent::Usage {
+            input_tokens: 200,
+            output_tokens: 75,
+        });
+        assert_eq!(display.input_tokens, 300);
+        assert_eq!(display.output_tokens, 125);
+    }
+
+    #[test]
+    fn reset_clears_tokens() {
+        let mut display = PlanDisplay::new();
+        display.handle_event(&StreamEvent::Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+        });
+        display.reset();
+        assert_eq!(display.input_tokens, 0);
+        assert_eq!(display.output_tokens, 0);
+    }
+
+    #[test]
+    fn usage_does_not_change_status() {
+        let mut display = PlanDisplay::new();
+        display.handle_event(&StreamEvent::Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+        });
+        assert_eq!(display.status, DisplayStatus::Idle);
     }
 }

@@ -1,7 +1,8 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use futures::StreamExt;
 use tokio::runtime::Handle;
@@ -10,6 +11,7 @@ use ua_backend::anthropic::build_system_prompt;
 use ua_backend::AnthropicClient;
 use ua_protocol::{StreamEvent, ToolResultRecord, ToolUseRecord};
 
+use crate::agents;
 use crate::audit::AuditLogger;
 use crate::config::Config;
 use crate::context::{
@@ -24,6 +26,10 @@ use crate::judge::{self, JudgeVerdict};
 use crate::osc::{OscEvent, OscParser, TerminalState};
 use crate::policy::{analyze_pipe_chain, validate_arguments, ArgumentSafety, RiskLevel};
 use crate::pty::PtySession;
+use crate::style::{format_tokens, Style};
+
+/// Braille spinner frames.
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 enum Event {
     Stdin(Vec<u8>),
@@ -36,6 +42,10 @@ enum Event {
     BackendDone,
     /// Result from the LLM security judge.
     JudgeResult(JudgeVerdict),
+    /// Spinner animation tick.
+    SpinnerTick,
+    /// Periodic poll for child agent processes.
+    ChildPoll,
 }
 
 /// Agent state machine — drives the main event loop.
@@ -60,6 +70,12 @@ enum AgentState {
         tool_cr_resets: Vec<bool>,
         /// Full tool_use records for conversation history.
         tool_uses: Vec<ToolUseRecord>,
+        /// When streaming started (for elapsed time in footer).
+        stream_start: Instant,
+        /// Current spinner frame index.
+        spinner_frame: usize,
+        /// Whether we've already shown the first thinking line.
+        thinking_first_line_shown: bool,
     },
     /// Waiting for the LLM security judge to evaluate commands.
     Judging {
@@ -264,6 +280,7 @@ enum CommandAction {
 /// This is the pure decision logic extracted from the BackendDone handler.
 /// It performs risk classification, deny checks, argument warnings, and
 /// decides whether to auto-approve, send to the judge, or go to approval UI.
+#[allow(clippy::too_many_arguments)]
 fn classify_and_gate(
     commands: Vec<String>,
     tool_use_ids: Vec<String>,
@@ -271,6 +288,7 @@ fn classify_and_gate(
     use_cr_reset: bool,
     config: &Config,
     audit: &mut AuditLogger,
+    style: &Style,
     stderr: &mut impl Write,
 ) -> CommandAction {
     if commands.is_empty() {
@@ -290,8 +308,10 @@ fn classify_and_gate(
         if *risk == RiskLevel::Denied {
             let _ = writeln!(
                 stderr,
-                "\r  \x1b[31m[DENIED]\x1b[0m {}",
-                commands[i].replace('\n', "\r\n")
+                "\r  ❯ {}  {}▐ DENIED{}",
+                commands[i].replace('\n', "\r\n"),
+                style.red_start(),
+                style.reset(),
             );
             audit.log_blocked(&commands[i], risk.as_str(), "denied by policy");
             blocked = true;
@@ -305,7 +325,13 @@ fn classify_and_gate(
     // Check for dangerous arguments
     for cmd in &commands {
         if let ArgumentSafety::Dangerous(reason) = validate_arguments(cmd) {
-            let _ = writeln!(stderr, "\r  \x1b[33m[WARNING]\x1b[0m {reason}");
+            let _ = writeln!(
+                stderr,
+                "\r  {}⚠ {}{}",
+                style.yellow_start(),
+                reason,
+                style.reset()
+            );
         }
     }
 
@@ -315,7 +341,15 @@ fn classify_and_gate(
 
     if all_read_only && config.security.auto_approve_read_only {
         audit.log_approved(iteration, "auto", "all commands read-only");
-        let _ = writeln!(stderr, "\r[ua] auto-approved (read-only)\r");
+        for cmd in &commands {
+            let safe = cmd.replace('\n', "\r\n");
+            let _ = writeln!(
+                stderr,
+                "\r  ❯ {safe}  {}▐ safe{}",
+                style.dim_start(),
+                style.reset(),
+            );
+        }
         CommandAction::AutoApprove {
             commands,
             tool_use_ids,
@@ -350,6 +384,7 @@ fn handle_judge_verdict(
     verdict: &JudgeVerdict,
     iteration: usize,
     audit: &mut AuditLogger,
+    style: &Style,
     stderr: &mut impl Write,
 ) {
     match verdict {
@@ -357,14 +392,29 @@ fn handle_judge_verdict(
             audit.log_judge_result(iteration, true, "safe");
         }
         JudgeVerdict::Unsafe { reasoning } => {
-            let _ = writeln!(
-                stderr,
-                "\r\x1b[K\x1b[33m[JUDGE WARNING]\x1b[0m {reasoning}\r"
-            );
+            let mut lines = reasoning.lines();
+            if let Some(first) = lines.next() {
+                let _ = writeln!(
+                    stderr,
+                    "\r\x1b[K{}⚠ {}{}",
+                    style.yellow_start(),
+                    first,
+                    style.reset()
+                );
+            }
+            for line in lines {
+                let _ = writeln!(stderr, "\r  {}{}{}", style.dim_start(), line, style.reset());
+            }
             audit.log_judge_result(iteration, false, reasoning);
         }
         JudgeVerdict::Error(e) => {
-            let _ = writeln!(stderr, "\r\x1b[K\x1b[2m[ua] judge error: {e}\x1b[0m\r");
+            let _ = writeln!(
+                stderr,
+                "\r\x1b[K{}judge: {}{}",
+                style.dim_start(),
+                e,
+                style.reset()
+            );
         }
     }
 }
@@ -420,6 +470,18 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
     } else {
         AuditLogger::noop()
     };
+
+    let style = Style::new();
+
+    // Accumulated stats across iterations within a single agent turn.
+    let mut total_input_tokens: u32 = 0;
+    let mut total_output_tokens: u32 = 0;
+    let mut total_commands: u32 = 0;
+    let mut turn_start: Option<Instant> = None;
+
+    // Child agent tracking.
+    let mut known_children: HashSet<u32> = HashSet::new();
+    let sessions_dir = config.journal.resolve_sessions_dir();
 
     let (tx, rx) = mpsc::channel::<Event>();
 
@@ -491,6 +553,15 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
         });
     }
 
+    // Child agent poll thread (3s interval)
+    let tx_child = tx.clone();
+    thread::spawn(move || loop {
+        thread::sleep(std::time::Duration::from_secs(3));
+        if tx_child.send(Event::ChildPoll).is_err() {
+            break;
+        }
+    });
+
     drop(tx);
 
     let mut stdout = io::stdout().lock();
@@ -543,6 +614,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                                     &tx_for_streaming,
                                                     &mut stderr,
                                                     child_pid,
+                                                    &style,
                                                 );
                                             }
                                         } else if !trimmed.is_empty() {
@@ -676,6 +748,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                                 );
                                                 let _ = writeln!(stderr, "\r\n[ua] executing...\r");
 
+                                                total_commands += commands.len() as u32;
                                                 command_queue.enqueue(commands);
                                                 if let Some(cmd) = command_queue.pop_immediate() {
                                                     let cmd = format!("{cmd}\n");
@@ -714,6 +787,10 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                                 stderr,
                                                 "\r\n[ua] skipped (type 'yes' to approve)\r"
                                             );
+                                            total_input_tokens = 0;
+                                            total_output_tokens = 0;
+                                            total_commands = 0;
+                                            turn_start = None;
                                             state = AgentState::Idle;
                                         }
                                         break;
@@ -735,6 +812,10 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                             );
                                         }
                                         let _ = writeln!(stderr, "\r\n[ua] cancelled\r");
+                                        total_input_tokens = 0;
+                                        total_output_tokens = 0;
+                                        total_commands = 0;
+                                        turn_start = None;
                                         state = AgentState::Idle;
                                         break;
                                     }
@@ -766,6 +847,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                             );
                                             let _ = writeln!(stderr, "\r\n[ua] executing...\r");
 
+                                            total_commands += commands.len() as u32;
                                             command_queue.enqueue(commands);
                                             if let Some(cmd) = command_queue.pop_immediate() {
                                                 let cmd = format!("{cmd}\n");
@@ -800,8 +882,16 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                             );
                                         }
                                         let _ = writeln!(stderr, "\r\n[ua] skipped\r");
+                                        total_input_tokens = 0;
+                                        total_output_tokens = 0;
+                                        total_commands = 0;
+                                        turn_start = None;
                                         state = AgentState::Idle;
                                         break;
+                                    }
+                                    b'e' | b'E' => {
+                                        let _ =
+                                            writeln!(stderr, "\r\n  (edit not yet implemented)\r");
                                     }
                                     _ => {
                                         // Ignore other keys
@@ -816,6 +906,10 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                             let _ = session.write_all(&[0x03]);
                             command_queue.clear();
                             let _ = writeln!(stderr, "\r\n[ua] cancelled\r");
+                            total_input_tokens = 0;
+                            total_output_tokens = 0;
+                            total_commands = 0;
+                            turn_start = None;
                             state = AgentState::Idle;
                             pending_instruction = None;
                         } else {
@@ -833,25 +927,50 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                     ref mut tool_commands,
                     ref mut tool_cr_resets,
                     ref mut tool_uses,
+                    ref mut thinking_first_line_shown,
                     ..
                 } = state
                 {
                     match &stream_event {
                         StreamEvent::ThinkingDelta(text) => {
-                            if !*is_thinking {
-                                *is_thinking = true;
-                                let _ = write!(stderr, "\r\x1b[K\x1b[2m");
-                                let _ = stderr.flush();
-                            }
+                            *is_thinking = true;
                             thinking_text.push_str(text);
-                            let raw_safe = text.replace('\n', "\r\n");
-                            let _ = write!(stderr, "\x1b[2m{raw_safe}\x1b[0m");
-                            let _ = stderr.flush();
+                            // Show only the first line of thinking as a dim comment
+                            if !*thinking_first_line_shown {
+                                if let Some(nl_pos) = thinking_text.find('\n') {
+                                    let first_line: String =
+                                        thinking_text[..nl_pos].chars().take(70).collect();
+                                    let _ = write!(
+                                        stderr,
+                                        "\r\x1b[K{}# {}{}\r\n",
+                                        style.dim_start(),
+                                        first_line,
+                                        style.reset()
+                                    );
+                                    let _ = stderr.flush();
+                                    *thinking_first_line_shown = true;
+                                }
+                            }
                         }
                         StreamEvent::TextDelta(text) => {
                             if *is_thinking {
                                 *is_thinking = false;
-                                let _ = write!(stderr, "\x1b[0m\r\n");
+                                if !*thinking_first_line_shown {
+                                    // Thinking ended without newline — show what we have
+                                    let first_line: String =
+                                        thinking_text.chars().take(70).collect();
+                                    if !first_line.is_empty() {
+                                        let _ = write!(
+                                            stderr,
+                                            "\r\x1b[K{}# {}{}\r\n",
+                                            style.dim_start(),
+                                            first_line,
+                                            style.reset()
+                                        );
+                                    } else {
+                                        let _ = write!(stderr, "\r\x1b[K");
+                                    }
+                                }
                             } else if display.streaming_text.is_empty() {
                                 let _ = write!(stderr, "\r\x1b[K");
                             }
@@ -902,9 +1021,17 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                     tool_commands,
                     tool_cr_resets,
                     tool_uses,
+                    stream_start,
                     ..
                 } = std::mem::replace(&mut state, AgentState::Idle)
                 {
+                    // Accumulate token counts
+                    total_input_tokens += display.input_tokens;
+                    total_output_tokens += display.output_tokens;
+                    if turn_start.is_none() {
+                        turn_start = Some(stream_start);
+                    }
+
                     // Trailing newline
                     let _ = writeln!(stderr, "\r");
 
@@ -947,11 +1074,29 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                 use_cr_reset,
                                 config,
                                 &mut audit,
+                                &style,
                                 &mut stderr,
                             );
 
                             match action {
                                 CommandAction::NoCommands => {
+                                    // Emit footer stats for this agent turn
+                                    if let Some(start) = turn_start.take() {
+                                        let elapsed = start.elapsed().as_secs();
+                                        let _ = writeln!(
+                                            stderr,
+                                            "\r{}{}↑ {}↓  {} cmds  {}s{}",
+                                            style.dim_start(),
+                                            format_tokens(total_input_tokens),
+                                            format_tokens(total_output_tokens),
+                                            total_commands,
+                                            elapsed,
+                                            style.reset(),
+                                        );
+                                    }
+                                    total_input_tokens = 0;
+                                    total_output_tokens = 0;
+                                    total_commands = 0;
                                     state = AgentState::Idle;
                                 }
                                 CommandAction::Blocked { tool_use_ids: ids } => {
@@ -974,6 +1119,10 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                         }
                                     }
                                     let _ = writeln!(stderr, "\r[ua] command blocked by policy\r");
+                                    total_input_tokens = 0;
+                                    total_output_tokens = 0;
+                                    total_commands = 0;
+                                    turn_start = None;
                                     state = AgentState::Idle;
                                     continue;
                                 }
@@ -983,6 +1132,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                     iteration,
                                     use_cr_reset,
                                 } => {
+                                    total_commands += commands.len() as u32;
                                     command_queue.enqueue(commands);
                                     if let Some(cmd) = command_queue.pop_immediate() {
                                         let cmd = format!("{cmd}\n");
@@ -1025,6 +1175,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                         use_cr_reset,
                                         &tx_for_streaming,
                                         &mut stderr,
+                                        &style,
                                     );
                                 }
                                 CommandAction::Approve {
@@ -1040,6 +1191,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                         &risk_levels,
                                         has_privileged,
                                         config,
+                                        &style,
                                         &mut stderr,
                                     );
                                     state = AgentState::Approving {
@@ -1067,10 +1219,17 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                     ..
                 } = std::mem::replace(&mut state, AgentState::Idle)
                 {
-                    handle_judge_verdict(&verdict, iteration, &mut audit, &mut stderr);
+                    handle_judge_verdict(&verdict, iteration, &mut audit, &style, &mut stderr);
 
                     // Proceed to approval UI regardless of verdict
-                    show_approval_ui(&commands, &risk_levels, has_privileged, config, &mut stderr);
+                    show_approval_ui(
+                        &commands,
+                        &risk_levels,
+                        has_privileged,
+                        config,
+                        &style,
+                        &mut stderr,
+                    );
                     state = AgentState::Approving {
                         commands,
                         iteration,
@@ -1218,6 +1377,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                         &tx_for_streaming,
                                         &mut stderr,
                                         child_pid,
+                                        &style,
                                     );
                                 }
                                 // else: no output — stay Idle
@@ -1252,6 +1412,61 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                     }
                 }
             }
+            Event::SpinnerTick => {
+                if let AgentState::Streaming {
+                    ref display,
+                    ref mut spinner_frame,
+                    is_thinking,
+                    thinking_first_line_shown,
+                    ..
+                } = state
+                {
+                    // Only spin if no content has arrived yet
+                    if display.streaming_text.is_empty()
+                        && !is_thinking
+                        && !thinking_first_line_shown
+                    {
+                        *spinner_frame = (*spinner_frame + 1) % SPINNER_FRAMES.len();
+                        let _ = write!(
+                            stderr,
+                            "\r\x1b[K{}{} thinking...{}",
+                            style.cyan_start(),
+                            SPINNER_FRAMES[*spinner_frame],
+                            style.reset()
+                        );
+                        let _ = stderr.flush();
+                    }
+                }
+                // SpinnerTick outside Streaming is silently ignored
+            }
+            Event::ChildPoll => {
+                let current_pids: HashSet<u32> =
+                    crate::process::list_descendant_agent_pids(std::process::id())
+                        .into_iter()
+                        .collect();
+
+                // New children: appeared since last poll
+                for &pid in current_pids.difference(&known_children) {
+                    let journal_path = sessions_dir.join(format!("agent-{pid}.jsonl"));
+                    let task = agents::read_child_task(&journal_path, 40)
+                        .unwrap_or_else(|| "agent".to_string());
+                    let line = agents::format_child_started(pid, &task, &style);
+                    let _ = writeln!(stderr, "\r{line}");
+                }
+
+                // Disappeared children: were known, now gone
+                for &pid in known_children.difference(&current_pids) {
+                    let journal_path = sessions_dir.join(format!("agent-{pid}.jsonl"));
+                    let task = agents::read_child_task(&journal_path, 40)
+                        .unwrap_or_else(|| "agent".to_string());
+                    if let Some(summary) = agents::read_child_summary(&journal_path) {
+                        let line = agents::format_child_done(pid, &task, &summary, &style);
+                        let _ = writeln!(stderr, "\r{line}");
+                    }
+                }
+
+                known_children = current_pids;
+            }
         }
     }
 
@@ -1276,6 +1491,7 @@ fn start_streaming(
     tx: &mpsc::Sender<Event>,
     stderr: &mut io::Stderr,
     child_pid: Option<u32>,
+    style: &Style,
 ) -> AgentState {
     // Resolve API key
     let api_key = match config.backend.anthropic.resolve_api_key() {
@@ -1311,9 +1527,24 @@ fn start_streaming(
     let client = AnthropicClient::with_model(&api_key, &config.backend.anthropic.model);
     let stream = client.send(&request);
 
-    // Show immediate feedback
-    let _ = write!(stderr, "\r\n[ua] thinking...");
+    // Show initial spinner frame
+    let _ = write!(
+        stderr,
+        "\r\n{}{} thinking...{}",
+        style.cyan_start(),
+        SPINNER_FRAMES[0],
+        style.reset()
+    );
     let _ = stderr.flush();
+
+    // Spawn spinner timer thread (sends SpinnerTick every 80ms)
+    let tx_spinner = tx.clone();
+    thread::spawn(move || loop {
+        thread::sleep(std::time::Duration::from_millis(80));
+        if tx_spinner.send(Event::SpinnerTick).is_err() {
+            break;
+        }
+    });
 
     // Cancellation channel
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
@@ -1346,6 +1577,18 @@ fn start_streaming(
         tool_commands: Vec::new(),
         tool_cr_resets: Vec::new(),
         tool_uses: Vec::new(),
+        stream_start: Instant::now(),
+        spinner_frame: 0,
+        thinking_first_line_shown: false,
+    }
+}
+
+/// Format risk label with color.
+fn risk_color<'a>(risk: &RiskLevel, style: &'a Style) -> &'a str {
+    match risk {
+        RiskLevel::ReadOnly | RiskLevel::BuildTest => style.green_start(),
+        RiskLevel::Write | RiskLevel::Network => style.yellow_start(),
+        RiskLevel::Destructive | RiskLevel::Privileged | RiskLevel::Denied => style.red_start(),
     }
 }
 
@@ -1355,19 +1598,21 @@ fn show_approval_ui(
     risk_levels: &[RiskLevel],
     has_privileged: bool,
     config: &Config,
+    style: &Style,
     stderr: &mut impl Write,
 ) {
-    let _ = writeln!(stderr, "\r[ua] proposed:");
     for (i, cmd) in commands.iter().enumerate() {
         let safe = cmd.replace('\n', "\r\n");
-        let label = risk_levels[i].label();
-        let _ = writeln!(stderr, "\r  {}. \x1b[33m[{label}]\x1b[0m {safe}", i + 1);
+        let risk = &risk_levels[i];
+        let color = risk_color(risk, style);
+        let label = risk.label();
+        let _ = writeln!(stderr, "\r  ❯ {safe}  {color}▐ {label}{}", style.reset());
     }
 
     if has_privileged && config.security.require_yes_for_privileged {
         let _ = write!(stderr, "\rType 'yes' to approve: ");
     } else {
-        let _ = write!(stderr, "\r[y] run  [n] skip  [q] quit ");
+        let _ = write!(stderr, "\r[y] run  [n] skip  [e] edit ");
     }
     let _ = stderr.flush();
 }
@@ -1388,6 +1633,7 @@ fn start_judging(
     use_cr_reset: bool,
     tx: &mpsc::Sender<Event>,
     stderr: &mut io::Stderr,
+    style: &Style,
 ) -> AgentState {
     // Resolve API key
     let api_key = match config.backend.anthropic.resolve_api_key() {
@@ -1395,7 +1641,14 @@ fn start_judging(
         Err(e) => {
             let _ = writeln!(stderr, "\r[ua] judge error: {e}");
             // Fall through to approval UI without judge
-            show_approval_ui(commands, &risk_levels, has_privileged, config, stderr);
+            show_approval_ui(
+                commands,
+                &risk_levels,
+                has_privileged,
+                config,
+                style,
+                stderr,
+            );
             return AgentState::Approving {
                 commands: commands.to_vec(),
                 iteration,
@@ -1999,6 +2252,7 @@ mod tests {
             false,
             &config,
             &mut audit,
+            &Style::disabled(),
             &mut stderr,
         );
 
@@ -2039,6 +2293,7 @@ mod tests {
             false,
             &config,
             &mut audit,
+            &Style::disabled(),
             &mut stderr,
         );
 
@@ -2074,6 +2329,7 @@ mod tests {
             false,
             &config,
             &mut audit,
+            &Style::disabled(),
             &mut stderr,
         );
 
@@ -2099,6 +2355,7 @@ mod tests {
             false,
             &config,
             &mut audit,
+            &Style::disabled(),
             &mut stderr,
         );
 
@@ -2111,7 +2368,7 @@ mod tests {
 
         // Verify stderr shows DENIED
         let output = String::from_utf8_lossy(&stderr);
-        assert!(output.contains("[DENIED]"));
+        assert!(output.contains("DENIED"));
     }
 
     #[test]
@@ -2120,7 +2377,16 @@ mod tests {
         let config = gate_config(true, true);
         let mut stderr = Vec::new();
 
-        let action = classify_and_gate(vec![], vec![], 0, false, &config, &mut audit, &mut stderr);
+        let action = classify_and_gate(
+            vec![],
+            vec![],
+            0,
+            false,
+            &config,
+            &mut audit,
+            &Style::disabled(),
+            &mut stderr,
+        );
 
         assert!(matches!(action, CommandAction::NoCommands));
     }
@@ -2140,6 +2406,7 @@ mod tests {
             false,
             &config,
             &mut audit,
+            &Style::disabled(),
             &mut stderr,
         );
 
@@ -2158,7 +2425,13 @@ mod tests {
         let mut audit = AuditLogger::new(&path).unwrap();
         let mut stderr = Vec::new();
 
-        handle_judge_verdict(&JudgeVerdict::Safe, 0, &mut audit, &mut stderr);
+        handle_judge_verdict(
+            &JudgeVerdict::Safe,
+            0,
+            &mut audit,
+            &Style::disabled(),
+            &mut stderr,
+        );
 
         // Audit should have judge_result with safe: true
         let lines = read_audit_lines(&path);
@@ -2168,7 +2441,7 @@ mod tests {
 
         // Stderr should NOT have a warning
         let output = String::from_utf8_lossy(&stderr);
-        assert!(!output.contains("[JUDGE WARNING]"));
+        assert!(!output.contains("\u{26a0}"));
     }
 
     #[test]
@@ -2181,7 +2454,7 @@ mod tests {
         let verdict = JudgeVerdict::Unsafe {
             reasoning: "Downloads and executes remote script".to_string(),
         };
-        handle_judge_verdict(&verdict, 2, &mut audit, &mut stderr);
+        handle_judge_verdict(&verdict, 2, &mut audit, &Style::disabled(), &mut stderr);
 
         // Audit should have judge_result with safe: false
         let lines = read_audit_lines(&path);
@@ -2195,7 +2468,7 @@ mod tests {
 
         // Stderr should have the warning
         let output = String::from_utf8_lossy(&stderr);
-        assert!(output.contains("[JUDGE WARNING]"));
+        assert!(output.contains("\u{26a0}"));
         assert!(output.contains("Downloads and executes remote script"));
     }
 
@@ -2207,7 +2480,7 @@ mod tests {
         let mut stderr = Vec::new();
 
         let verdict = JudgeVerdict::Error("connection timeout".to_string());
-        handle_judge_verdict(&verdict, 0, &mut audit, &mut stderr);
+        handle_judge_verdict(&verdict, 0, &mut audit, &Style::disabled(), &mut stderr);
 
         // No audit entry for errors
         let lines = read_audit_lines(&path);
@@ -2215,10 +2488,10 @@ mod tests {
 
         // Stderr should have dimmed error note
         let output = String::from_utf8_lossy(&stderr);
-        assert!(output.contains("judge error"));
+        assert!(output.contains("judge:"));
         assert!(output.contains("connection timeout"));
-        // Verify dimmed ANSI formatting
-        assert!(output.contains("\x1b[2m"));
+        // With Style::disabled(), no ANSI codes are emitted
+        assert!(!output.contains("\x1b[2m"));
     }
 
     // --- Group C: Full pipeline tests ---
@@ -2243,12 +2516,19 @@ mod tests {
             false,
             &config,
             &mut audit,
+            &Style::disabled(),
             &mut stderr,
         );
         assert!(matches!(action, CommandAction::Judge { .. }));
 
         // Step 3: handle_judge_verdict(Safe)
-        handle_judge_verdict(&JudgeVerdict::Safe, 0, &mut audit, &mut stderr);
+        handle_judge_verdict(
+            &JudgeVerdict::Safe,
+            0,
+            &mut audit,
+            &Style::disabled(),
+            &mut stderr,
+        );
 
         // Step 4: Verify audit trail has both entries
         let lines = read_audit_lines(&path);
@@ -2277,6 +2557,7 @@ mod tests {
             false,
             &config,
             &mut audit,
+            &Style::disabled(),
             &mut stderr,
         );
         assert!(
@@ -2288,11 +2569,11 @@ mod tests {
         let verdict = JudgeVerdict::Unsafe {
             reasoning: "Deletes build directory".to_string(),
         };
-        handle_judge_verdict(&verdict, 0, &mut audit, &mut stderr);
+        handle_judge_verdict(&verdict, 0, &mut audit, &Style::disabled(), &mut stderr);
 
         // Step 3: Verify warning was printed
         let output = String::from_utf8_lossy(&stderr);
-        assert!(output.contains("[JUDGE WARNING]"));
+        assert!(output.contains("\u{26a0}"));
         assert!(output.contains("Deletes build directory"));
 
         // Step 4: Verify audit trail has both entries

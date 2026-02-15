@@ -81,18 +81,18 @@ pub fn cwd_of_pid(pid: u32) -> Option<String> {
     platform::cwd_of(pid)
 }
 
-/// Count how many descendant processes of `ancestor_pid` are running the same
-/// binary as `my_exe`.
+/// Collect PIDs of descendant processes of `ancestor_pid` that are running
+/// the same binary as `my_exe`.
 ///
 /// This is the testable core — tests provide a fake `info_fn`, production
 /// provides the real OS-level one.
-fn count_descendant_agents_core(
+fn collect_descendant_agents_core(
     my_exe: &Path,
     ancestor_pid: u32,
     all_pids: &[u32],
     info_fn: &dyn Fn(u32) -> Option<(u32, PathBuf)>,
-) -> u32 {
-    let mut count = 0;
+) -> Vec<u32> {
+    let mut result = Vec::new();
     for &pid in all_pids {
         if pid == ancestor_pid {
             continue;
@@ -111,7 +111,7 @@ fn count_descendant_agents_core(
         seen.insert(pid);
         while current > 1 && seen.insert(current) {
             if current == ancestor_pid {
-                count += 1;
+                result.push(pid);
                 break;
             }
             match info_fn(current) {
@@ -120,19 +120,26 @@ fn count_descendant_agents_core(
             }
         }
     }
-    count
+    result
 }
 
 /// Count how many descendant agent processes are running under `ancestor_pid`.
 ///
 /// Returns 0 if we can't determine our exe or enumerate processes.
 pub fn count_descendant_agents(ancestor_pid: u32) -> u32 {
+    list_descendant_agent_pids(ancestor_pid).len() as u32
+}
+
+/// List PIDs of descendant agent processes running under `ancestor_pid`.
+///
+/// Returns an empty vec if we can't determine our exe or enumerate processes.
+pub fn list_descendant_agent_pids(ancestor_pid: u32) -> Vec<u32> {
     let my_exe = match std::env::current_exe().and_then(|p| p.canonicalize()) {
         Ok(p) => p,
-        Err(_) => return 0,
+        Err(_) => return Vec::new(),
     };
     let all_pids = platform::list_all_pids();
-    count_descendant_agents_core(&my_exe, ancestor_pid, &all_pids, &platform::process_info)
+    collect_descendant_agents_core(&my_exe, ancestor_pid, &all_pids, &platform::process_info)
 }
 
 // --- Platform-specific process info ---
@@ -514,20 +521,20 @@ mod tests {
         assert!(cwd.is_none());
     }
 
-    // --- Descendant counting tests ---
+    // --- Descendant collection tests ---
 
     #[test]
     fn descendants_none() {
-        // No other processes → count 0
+        // No other processes → empty
         let table: HashMap<u32, (u32, PathBuf)> =
             [(100, (1, PathBuf::from("/usr/bin/unixagent")))].into();
-        let count = count_descendant_agents_core(
+        let pids = collect_descendant_agents_core(
             Path::new("/usr/bin/unixagent"),
             100,
             &[100],
             &fake_info(&table),
         );
-        assert_eq!(count, 0);
+        assert!(pids.is_empty());
     }
 
     #[test]
@@ -540,8 +547,8 @@ mod tests {
             (102, (101, ua.clone())),
         ]
         .into();
-        let count = count_descendant_agents_core(&ua, 100, &[100, 101, 102], &fake_info(&table));
-        assert_eq!(count, 1);
+        let pids = collect_descendant_agents_core(&ua, 100, &[100, 101, 102], &fake_info(&table));
+        assert_eq!(pids, vec![102]);
     }
 
     #[test]
@@ -556,9 +563,15 @@ mod tests {
             (104, (103, ua.clone())),
         ]
         .into();
-        let count =
-            count_descendant_agents_core(&ua, 100, &[100, 101, 102, 103, 104], &fake_info(&table));
-        assert_eq!(count, 2);
+        let pids = collect_descendant_agents_core(
+            &ua,
+            100,
+            &[100, 101, 102, 103, 104],
+            &fake_info(&table),
+        );
+        assert_eq!(pids.len(), 2);
+        assert!(pids.contains(&102));
+        assert!(pids.contains(&104));
     }
 
     #[test]
@@ -571,8 +584,8 @@ mod tests {
             (102, (101, PathBuf::from("/usr/bin/python"))),
         ]
         .into();
-        let count = count_descendant_agents_core(&ua, 100, &[100, 101, 102], &fake_info(&table));
-        assert_eq!(count, 0);
+        let pids = collect_descendant_agents_core(&ua, 100, &[100, 101, 102], &fake_info(&table));
+        assert!(pids.is_empty());
     }
 
     #[test]
@@ -581,8 +594,8 @@ mod tests {
         let ua = PathBuf::from("/usr/bin/unixagent");
         let table: HashMap<u32, (u32, PathBuf)> =
             [(100, (1, ua.clone())), (200, (1, ua.clone()))].into();
-        let count = count_descendant_agents_core(&ua, 100, &[100, 200], &fake_info(&table));
-        assert_eq!(count, 0);
+        let pids = collect_descendant_agents_core(&ua, 100, &[100, 200], &fake_info(&table));
+        assert!(pids.is_empty());
     }
 
     #[test]
@@ -590,16 +603,16 @@ mod tests {
         // ancestor(100) itself should never be counted
         let ua = PathBuf::from("/usr/bin/unixagent");
         let table: HashMap<u32, (u32, PathBuf)> = [(100, (1, ua.clone()))].into();
-        let count = count_descendant_agents_core(&ua, 100, &[100], &fake_info(&table));
-        assert_eq!(count, 0);
+        let pids = collect_descendant_agents_core(&ua, 100, &[100], &fake_info(&table));
+        assert!(pids.is_empty());
     }
 
     #[test]
     fn descendants_empty_pid_list() {
         let ua = PathBuf::from("/usr/bin/unixagent");
         let table: HashMap<u32, (u32, PathBuf)> = HashMap::new();
-        let count = count_descendant_agents_core(&ua, 100, &[], &fake_info(&table));
-        assert_eq!(count, 0);
+        let pids = collect_descendant_agents_core(&ua, 100, &[], &fake_info(&table));
+        assert!(pids.is_empty());
     }
 
     #[test]
@@ -611,8 +624,8 @@ mod tests {
             (101, (999, PathBuf::from("/bin/sh"))),
         ]
         .into();
-        let count = count_descendant_agents_core(&ua, 100, &[101, 102], &fake_info(&table));
-        assert_eq!(count, 0);
+        let pids = collect_descendant_agents_core(&ua, 100, &[101, 102], &fake_info(&table));
+        assert!(pids.is_empty());
     }
 
     #[test]
@@ -630,14 +643,16 @@ mod tests {
             (106, (105, ua.clone())),
         ]
         .into();
-        let count = count_descendant_agents_core(
+        let pids = collect_descendant_agents_core(
             &ua,
             100,
             &[100, 101, 102, 103, 104, 105, 106],
             &fake_info(&table),
         );
         // 102 and 106 are descendant agents
-        assert_eq!(count, 2);
+        assert_eq!(pids.len(), 2);
+        assert!(pids.contains(&102));
+        assert!(pids.contains(&106));
     }
 
     #[test]

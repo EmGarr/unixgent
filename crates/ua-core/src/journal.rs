@@ -82,6 +82,18 @@ pub enum JournalEntry {
     /// Acts as a delimiter for trajectory reconstruction.
     #[serde(rename = "system_prompt")]
     SystemPrompt { ts: u64, text: String },
+    /// End-of-session summary with aggregate statistics.
+    #[serde(rename = "summary")]
+    Summary {
+        ts: u64,
+        input_tokens: u32,
+        output_tokens: u32,
+        commands_run: u32,
+        commands_denied: u32,
+        exit_code: i32,
+        elapsed_secs: f64,
+        task: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -182,6 +194,7 @@ fn entry_tokens(entry: &JournalEntry) -> usize {
         }
         JournalEntry::Checkpoint { summary, .. } => approx_tokens(summary),
         JournalEntry::SystemPrompt { .. } => 0, // Not included in conversation messages
+        JournalEntry::Summary { .. } => 0,      // Metadata, not conversation
     }
 }
 
@@ -272,9 +285,9 @@ pub fn convert_entries_to_messages(entries: &[JournalEntry]) -> Vec<Conversation
                 let text = format!("Previous context summary: {summary}");
                 merge_or_push_user(&mut messages, text, Vec::new());
             }
-            JournalEntry::SystemPrompt { .. } => {
+            JournalEntry::SystemPrompt { .. } | JournalEntry::Summary { .. } => {
                 // System prompt snapshots are for trajectory reconstruction only;
-                // they don't contribute to the conversation messages.
+                // Summary entries are metadata — neither contributes to conversation.
             }
         }
     }
@@ -1074,5 +1087,72 @@ mod tests {
             assert_eq!(thinking.as_deref(), Some("I see foo.txt."));
             assert_eq!(text, "You have foo.txt.");
         }
+    }
+
+    // --- Summary entry tests ---
+
+    #[test]
+    fn serde_roundtrip_summary() {
+        let entry = JournalEntry::Summary {
+            ts: 1000,
+            input_tokens: 5000,
+            output_tokens: 2000,
+            commands_run: 3,
+            commands_denied: 1,
+            exit_code: 0,
+            elapsed_secs: 12.5,
+            task: "find all TODO comments".to_string(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: JournalEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(entry, parsed);
+    }
+
+    #[test]
+    fn entry_tokens_summary_is_zero() {
+        let entry = JournalEntry::Summary {
+            ts: 1000,
+            input_tokens: 50000,
+            output_tokens: 20000,
+            commands_run: 10,
+            commands_denied: 0,
+            exit_code: 0,
+            elapsed_secs: 30.0,
+            task: "very long task description".to_string(),
+        };
+        assert_eq!(entry_tokens(&entry), 0);
+    }
+
+    #[test]
+    fn summary_skipped_in_conversation() {
+        let entries = vec![
+            JournalEntry::Instruction {
+                ts: 1,
+                text: "hello".to_string(),
+            },
+            JournalEntry::Response {
+                ts: 2,
+                thinking: None,
+                text: "Hi!".to_string(),
+                tool_uses: vec![],
+            },
+            JournalEntry::Summary {
+                ts: 3,
+                input_tokens: 100,
+                output_tokens: 50,
+                commands_run: 1,
+                commands_denied: 0,
+                exit_code: 0,
+                elapsed_secs: 5.0,
+                task: "hello".to_string(),
+            },
+        ];
+
+        let msgs = build_conversation_from_journal(&entries, 60000);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, ua_protocol::Role::User);
+        assert_eq!(msgs[0].content, "hello");
+        assert_eq!(msgs[1].role, ua_protocol::Role::Assistant);
+        assert_eq!(msgs[1].content, "Hi!");
     }
 }
