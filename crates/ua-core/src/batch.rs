@@ -17,7 +17,7 @@ use ua_protocol::{StreamEvent, ToolResultRecord, ToolUseRecord};
 use crate::audit::AuditLogger;
 use crate::config::Config;
 use crate::context::{
-    build_agent_request, build_delegation_prompt, scrub_injection_markers, OutputHistory,
+    build_agent_capabilities_prompt, build_agent_request, scrub_injection_markers, OutputHistory,
     TOOL_RESULT_PREFIX,
 };
 use crate::journal::{build_conversation_from_journal, epoch_secs, JournalEntry, SessionJournal};
@@ -247,10 +247,8 @@ fn build_batch_system_prompt(depth: u32, max_depth: u32) -> String {
          5. Use as many iterations as required to complete the task thoroughly.",
     );
 
-    if let Some(delegation) = build_delegation_prompt(depth, max_depth) {
-        prompt.push_str("\n\n");
-        prompt.push_str(&delegation);
-    }
+    prompt.push_str("\n\n");
+    prompt.push_str(&build_agent_capabilities_prompt(depth, max_depth));
 
     prompt
 }
@@ -836,6 +834,19 @@ mod tests {
             "should mention combining"
         );
         assert!(!prompt.contains("budget"), "should not mention a budget");
+    }
+
+    #[test]
+    fn batch_system_prompt_always_includes_journal_docs() {
+        let prompt = build_batch_system_prompt(2, 3);
+        assert!(
+            prompt.contains("SESSION JOURNAL"),
+            "should include journal docs even at depth limit"
+        );
+        assert!(
+            prompt.contains("LONG-RUNNING MEMORY"),
+            "should include LRM even at depth limit"
+        );
     }
 
     #[test]

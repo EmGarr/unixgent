@@ -16,6 +16,25 @@ const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
 const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
 
+#[derive(Debug, Clone, Serialize)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    cache_type: &'static str,
+}
+
+const EPHEMERAL: CacheControl = CacheControl {
+    cache_type: "ephemeral",
+};
+
+#[derive(Debug, Serialize)]
+struct SystemBlock {
+    #[serde(rename = "type")]
+    block_type: &'static str,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
+}
+
 #[derive(Debug, Error)]
 pub enum AnthropicError {
     #[error("HTTP error: {0}")]
@@ -79,21 +98,7 @@ impl AnthropicClient {
             }],
         };
 
-        let response = self
-            .http
-            .post(API_URL)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", API_VERSION)
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AnthropicError::Api(format!("{status}: {body}")));
-        }
+        let response = post_with_retry(&self.http, &self.api_key, &body).await?;
 
         let resp: NonStreamingResponse = response.json().await?;
         resp.content
@@ -151,14 +156,14 @@ async fn send_request(
     model: &str,
     request: &AgentRequest,
 ) -> Result<reqwest::Response, AnthropicError> {
-    let system_prompt = build_system_prompt(request);
+    let system = build_system_blocks(request);
     let messages = build_messages(request);
 
     let body = ApiRequest {
         model: model.to_string(),
         max_tokens: 16000,
         stream: true,
-        system: system_prompt,
+        system,
         messages,
         tools: vec![build_shell_tool()],
         thinking: ApiThinking {
@@ -167,22 +172,62 @@ async fn send_request(
         },
     };
 
-    let response = http
-        .post(API_URL)
-        .header("x-api-key", api_key)
-        .header("anthropic-version", API_VERSION)
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await?;
+    post_with_retry(http, api_key, &body).await
+}
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(AnthropicError::Api(format!("{status}: {body}")));
+fn parse_retry_after(response: &reqwest::Response) -> Option<Duration> {
+    response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(Duration::from_secs_f64)
+}
+
+async fn post_with_retry(
+    http: &Client,
+    api_key: &str,
+    body: &impl Serialize,
+) -> Result<reqwest::Response, AnthropicError> {
+    let max_retries = 5;
+    let mut attempt = 0;
+
+    loop {
+        let response = http
+            .post(API_URL)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", API_VERSION)
+            .header("content-type", "application/json")
+            .json(body)
+            .send()
+            .await?;
+
+        if response.status() == 429 && attempt < max_retries {
+            let delay =
+                parse_retry_after(&response).unwrap_or_else(|| Duration::from_secs(1 << attempt));
+            eprintln!("[ua] rate limited, retrying in {}s", delay.as_secs());
+            tokio::time::sleep(delay).await;
+            attempt += 1;
+            continue;
+        }
+
+        if response.status() == 529 && attempt < max_retries {
+            let delay =
+                parse_retry_after(&response).unwrap_or_else(|| Duration::from_secs(1 << attempt));
+            eprintln!("[ua] API overloaded, retrying in {}s", delay.as_secs());
+            tokio::time::sleep(delay).await;
+            attempt += 1;
+            continue;
+        }
+
+        return if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            Err(AnthropicError::Api(format!("{status}: {body}")))
+        } else {
+            Ok(response)
+        };
     }
-
-    Ok(response)
 }
 
 fn build_shell_tool() -> ApiTool {
@@ -205,7 +250,16 @@ fn build_shell_tool() -> ApiTool {
             },
             "required": ["command"]
         }),
+        cache_control: Some(EPHEMERAL),
     }
+}
+
+fn build_system_blocks(request: &AgentRequest) -> Vec<SystemBlock> {
+    vec![SystemBlock {
+        block_type: "text",
+        text: build_system_prompt(request),
+        cache_control: Some(EPHEMERAL),
+    }]
 }
 
 pub fn build_system_prompt(request: &AgentRequest) -> String {
@@ -240,7 +294,18 @@ Terminal: {}x{}",
         "\n\nUse the shell tool to execute commands. \
          Each command runs and you will see the output. \
          You may then run more commands or provide your final answer. \
-         When you are done, respond with text only (no tool calls).",
+         When you are done, respond with text only (no tool calls).\
+         \n\n\
+         Observe before acting: review the terminal output and working directory above \
+         to understand the current state before running commands.\
+         \n\n\
+         Your conversation context is rebuilt from a session journal with a token budget. \
+         Very old entries may no longer be visible to you. If you need to preserve \
+         important information across many turns, write it to a file.\
+         \n\n\
+         Act, don't describe. Think in your thinking block, act in your response. \
+         For simple tasks, execute commands directly. For complex multi-step tasks, \
+         decompose and delegate to subagents (see DELEGATION below if available).",
     );
 
     if let Some(ref extra) = request.system_prompt_extra {
@@ -267,6 +332,7 @@ fn build_messages(request: &AgentRequest) -> Vec<ApiMessage> {
             if !msg.content.is_empty() {
                 blocks.push(ApiContentBlock::Text {
                     text: msg.content.clone(),
+                    cache_control: None,
                 });
             }
             for tu in &msg.tool_uses {
@@ -290,6 +356,7 @@ fn build_messages(request: &AgentRequest) -> Vec<ApiMessage> {
                 .map(|tr| ApiContentBlock::ToolResult {
                     tool_use_id: tr.tool_use_id.clone(),
                     content: tr.content.clone(),
+                    cache_control: None,
                 })
                 .collect();
             messages.push(ApiMessage {
@@ -313,7 +380,40 @@ fn build_messages(request: &AgentRequest) -> Vec<ApiMessage> {
         });
     }
 
+    // Mark the last user message with cache_control for prompt caching.
+    // This caches the conversation prefix so turn N+1 gets a cache hit on turns 0..N.
+    if let Some(last_user) = messages.iter_mut().rfind(|m| m.role == "user") {
+        mark_cache_control(last_user);
+    }
+
     messages
+}
+
+/// Add `cache_control: ephemeral` to the last block of a user message.
+fn mark_cache_control(msg: &mut ApiMessage) {
+    match &mut msg.content {
+        ApiContent::Text(s) => {
+            msg.content = ApiContent::Blocks(vec![ApiContentBlock::Text {
+                text: std::mem::take(s),
+                cache_control: Some(EPHEMERAL),
+            }]);
+        }
+        ApiContent::Blocks(blocks) => {
+            if let Some(last) = blocks.last_mut() {
+                match last {
+                    ApiContentBlock::Text { cache_control, .. } => {
+                        *cache_control = Some(EPHEMERAL);
+                    }
+                    ApiContentBlock::ToolResult { cache_control, .. } => {
+                        *cache_control = Some(EPHEMERAL);
+                    }
+                    ApiContentBlock::ToolUse { .. } => {
+                        // User messages shouldn't have ToolUse blocks, but don't panic
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Tracks state across SSE events for tool_use accumulation.
@@ -460,7 +560,7 @@ struct ApiRequest {
     model: String,
     max_tokens: u32,
     stream: bool,
-    system: String,
+    system: Vec<SystemBlock>,
     messages: Vec<ApiMessage>,
     tools: Vec<ApiTool>,
     thinking: ApiThinking,
@@ -471,6 +571,8 @@ struct ApiTool {
     name: String,
     description: String,
     input_schema: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
 }
 
 #[derive(Debug, Serialize)]
@@ -490,7 +592,11 @@ struct ApiMessage {
 #[serde(tag = "type")]
 enum ApiContentBlock {
     #[serde(rename = "text")]
-    Text { text: String },
+    Text {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -501,6 +607,8 @@ enum ApiContentBlock {
     ToolResult {
         tool_use_id: String,
         content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
 }
 
@@ -986,6 +1094,7 @@ mod tests {
         let content = ApiContent::Blocks(vec![
             ApiContentBlock::Text {
                 text: "hi".to_string(),
+                cache_control: None,
             },
             ApiContentBlock::ToolUse {
                 id: "t1".to_string(),
@@ -997,7 +1106,203 @@ mod tests {
         let blocks = json.as_array().unwrap();
         assert_eq!(blocks[0]["type"], "text");
         assert_eq!(blocks[0]["text"], "hi");
+        // cache_control: None should not appear in JSON
+        assert!(blocks[0].get("cache_control").is_none());
         assert_eq!(blocks[1]["type"], "tool_use");
         assert_eq!(blocks[1]["id"], "t1");
+    }
+
+    #[test]
+    fn system_block_serialization() {
+        let block = SystemBlock {
+            block_type: "text",
+            text: "You are helpful.".to_string(),
+            cache_control: Some(EPHEMERAL),
+        };
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["type"], "text");
+        assert_eq!(json["text"], "You are helpful.");
+        assert_eq!(json["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn system_block_without_cache_control() {
+        let block = SystemBlock {
+            block_type: "text",
+            text: "plain".to_string(),
+            cache_control: None,
+        };
+        let json = serde_json::to_value(&block).unwrap();
+        assert!(json.get("cache_control").is_none());
+    }
+
+    #[test]
+    fn api_tool_with_cache_control_serialization() {
+        let tool = build_shell_tool();
+        let json = serde_json::to_value(&tool).unwrap();
+        assert_eq!(json["cache_control"]["type"], "ephemeral");
+        assert_eq!(json["name"], "shell");
+    }
+
+    #[test]
+    fn api_request_system_is_array() {
+        let body = ApiRequest {
+            model: "test".to_string(),
+            max_tokens: 1024,
+            stream: true,
+            system: vec![SystemBlock {
+                block_type: "text",
+                text: "system prompt".to_string(),
+                cache_control: Some(EPHEMERAL),
+            }],
+            messages: vec![],
+            tools: vec![],
+            thinking: ApiThinking {
+                thinking_type: "enabled".to_string(),
+                budget_tokens: 1000,
+            },
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        let system = json["system"].as_array().unwrap();
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0]["type"], "text");
+        assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn text_block_with_cache_control_serialization() {
+        let block = ApiContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: Some(EPHEMERAL),
+        };
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["type"], "text");
+        assert_eq!(json["text"], "hello");
+        assert_eq!(json["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn tool_result_with_cache_control_serialization() {
+        let block = ApiContentBlock::ToolResult {
+            tool_use_id: "t1".to_string(),
+            content: "output".to_string(),
+            cache_control: Some(EPHEMERAL),
+        };
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["type"], "tool_result");
+        assert_eq!(json["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn build_messages_marks_last_user_message_text() {
+        let request = AgentRequest {
+            instruction: "list files".to_string(),
+            context: ShellContext::default(),
+            terminal_history: TerminalHistory::new(),
+            conversation: vec![],
+            system_prompt_extra: None,
+        };
+
+        let messages = build_messages(&request);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+
+        // The last user message should be converted to Blocks with cache_control
+        let json = serde_json::to_value(&messages[0].content).unwrap();
+        let blocks = json.as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "list files");
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn build_messages_marks_last_user_tool_result() {
+        let request = AgentRequest {
+            instruction: "".to_string(),
+            context: ShellContext::default(),
+            terminal_history: TerminalHistory::new(),
+            conversation: vec![ConversationMessage::tool_result(vec![ToolResultRecord {
+                tool_use_id: "toolu_1".to_string(),
+                content: "output".to_string(),
+            }])],
+            system_prompt_extra: None,
+        };
+
+        let messages = build_messages(&request);
+        assert_eq!(messages.len(), 1);
+
+        let json = serde_json::to_value(&messages[0].content).unwrap();
+        let blocks = json.as_array().unwrap();
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn build_messages_marks_instruction_not_earlier_user() {
+        // When there's an instruction, it becomes the last user message
+        let request = AgentRequest {
+            instruction: "now do more".to_string(),
+            context: ShellContext::default(),
+            terminal_history: TerminalHistory::new(),
+            conversation: vec![
+                ConversationMessage::user("first"),
+                ConversationMessage::assistant("ok"),
+            ],
+            system_prompt_extra: None,
+        };
+
+        let messages = build_messages(&request);
+        assert_eq!(messages.len(), 3);
+
+        // First user message should NOT have cache_control
+        let first_json = serde_json::to_value(&messages[0].content).unwrap();
+        assert_eq!(first_json, "first"); // plain text, no blocks
+
+        // Last user message (instruction) SHOULD have cache_control
+        let last_json = serde_json::to_value(&messages[2].content).unwrap();
+        let blocks = last_json.as_array().unwrap();
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn parse_retry_after_valid() {
+        let resp = http::Response::builder()
+            .status(429)
+            .header("retry-after", "1.5")
+            .body("")
+            .unwrap();
+        let reqwest_resp = reqwest::Response::from(resp);
+        let duration = parse_retry_after(&reqwest_resp).unwrap();
+        assert_eq!(duration, Duration::from_secs_f64(1.5));
+    }
+
+    #[test]
+    fn parse_retry_after_integer() {
+        let resp = http::Response::builder()
+            .status(429)
+            .header("retry-after", "3")
+            .body("")
+            .unwrap();
+        let reqwest_resp = reqwest::Response::from(resp);
+        let duration = parse_retry_after(&reqwest_resp).unwrap();
+        assert_eq!(duration, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn parse_retry_after_missing() {
+        let resp = http::Response::builder().status(429).body("").unwrap();
+        let reqwest_resp = reqwest::Response::from(resp);
+        assert!(parse_retry_after(&reqwest_resp).is_none());
+    }
+
+    #[test]
+    fn parse_retry_after_invalid() {
+        let resp = http::Response::builder()
+            .status(429)
+            .header("retry-after", "not-a-number")
+            .body("")
+            .unwrap();
+        let reqwest_resp = reqwest::Response::from(resp);
+        assert!(parse_retry_after(&reqwest_resp).is_none());
     }
 }

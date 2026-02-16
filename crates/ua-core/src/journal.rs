@@ -38,6 +38,7 @@ pub fn generate_session_id() -> String {
 // ---------------------------------------------------------------------------
 
 /// A single entry in the session journal.
+// NOTE: If you add a variant, also update build_agent_capabilities_prompt() in context.rs
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum JournalEntry {

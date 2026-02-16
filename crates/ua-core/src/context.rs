@@ -283,59 +283,112 @@ pub fn scrub_injection_markers(output: &str) -> String {
     result
 }
 
-/// Build an AgentRequest from the current state.
-/// Build the delegation instructions for the system prompt.
+/// Build agent capabilities prompt (journal docs + LRM examples + optional delegation).
 ///
-/// When `depth + 1 < max_depth`, the LLM is told it can spawn subagents.
-/// Returns `None` if delegation is not available (at depth limit).
-pub fn build_delegation_prompt(depth: u32, max_depth: u32) -> Option<String> {
-    if depth + 1 >= max_depth {
-        return None;
+/// All agents get SESSION JOURNAL and LONG-RUNNING MEMORY sections.
+/// Only agents below the depth limit also get DELEGATION instructions.
+pub fn build_agent_capabilities_prompt(depth: u32, max_depth: u32) -> String {
+    let mut prompt = String::from(
+        "SESSION JOURNAL\n\
+         \n\
+         Your session journal is at $UNIXAGENT_JOURNAL (JSONL). Each line is a \
+         JSON object with a \"type\" field. Entry types:\n\
+         \n\
+         \x20 shell_command  { ts, command, exit_code, output }\n\
+         \x20 instruction    { ts, text }\n\
+         \x20 response       { ts, thinking, text, tool_uses }\n\
+         \x20 tool_result    { ts, results }\n\
+         \x20 blocked        { ts, results }\n\
+         \x20 checkpoint     { ts, summary }\n\
+         \x20 system_prompt  { ts, text }\n\
+         \x20 summary        { ts, input_tokens, output_tokens, commands_run, \
+         commands_denied, exit_code, elapsed_secs, task }\n\
+         \n\
+         LONG-RUNNING MEMORY\n\
+         \n\
+         Use jq on $UNIXAGENT_JOURNAL to recall prior context:\n\
+         \n\
+         \x20 # What commands have been run?\n\
+         \x20 jq -r 'select(.type==\"shell_command\") | .command' $UNIXAGENT_JOURNAL\n\
+         \n\
+         \x20 # What was the original instruction?\n\
+         \x20 jq -r 'select(.type==\"instruction\") | .text' $UNIXAGENT_JOURNAL\n\
+         \n\
+         \x20 # What decisions were made?\n\
+         \x20 jq -r 'select(.type==\"response\") | .text' $UNIXAGENT_JOURNAL\n\
+         \n\
+         \x20 # Which commands failed?\n\
+         \x20 jq -r 'select(.type==\"shell_command\" and .exit_code != 0)' $UNIXAGENT_JOURNAL\n\
+         \n\
+         \x20 # Session stats?\n\
+         \x20 jq -r 'select(.type==\"summary\")' $UNIXAGENT_JOURNAL\n\
+         \n\
+         Use these to resume work, recall decisions, or check what has been tried.",
+    );
+
+    if depth + 1 < max_depth {
+        let exe_path =
+            std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("unixagent"));
+
+        prompt.push_str(&format!(
+            "\n\n\
+             DELEGATION\n\
+             \n\
+             You can delegate subtasks to subagents by running:\n\
+             \n\
+             \x20 {exe} \"instruction\"\n\
+             \n\
+             Each subagent is a separate process that runs non-interactively, executes \
+             shell commands, and prints its final answer to stdout. Each subagent can \
+             handle ~200k tokens of context and runs its own multi-step tool use loop.\n\
+             \n\
+             DECOMPOSE FIRST: For any task with 3+ steps, your first action should be to \
+             decompose it into independent subtasks and delegate them. Be an orchestrator, \
+             not a sequential executor. Each subagent runs its own multi-step reasoning \
+             chain with a fresh context window — use this aggressively.\n\
+             \n\
+             Parallel delegation is your most powerful tool:\n\
+             \n\
+             \x20 {exe} \"subtask A\" > /tmp/a.txt 2>/dev/null &\n\
+             \x20 {exe} \"subtask B\" > /tmp/b.txt 2>/dev/null &\n\
+             \x20 {exe} \"subtask C\" > /tmp/c.txt 2>/dev/null &\n\
+             \x20 wait\n\
+             \x20 cat /tmp/a.txt /tmp/b.txt /tmp/c.txt\n\
+             \n\
+             When NOT to delegate:\n\
+             - Simple one-shot commands (just run them directly)\n\
+             - Tasks that require fewer than 3 steps total\n\
+             - Tasks that depend on your current conversation state and cannot be isolated\n\
+             \n\
+             Tips:\n\
+             - Give each subagent a specific, self-contained instruction\n\
+             - Include enough context in the instruction for the subagent to work independently\n\
+             - Prefer many small focused subagents over one large sequential execution\n\
+             - Collect and synthesize results from subagents rather than re-doing their work\n\
+             \n\
+             JOURNAL CONTEXT SHARING\n\
+             \n\
+             You can share selective journal context with subagents:\n\
+             \n\
+             \x20 # Share commands run so far:\n\
+             \x20 {exe} \"$(jq -r 'select(.type==\"shell_command\") | .command' $UNIXAGENT_JOURNAL) \
+             Which of these modified config files?\"\n\
+             \n\
+             \x20 # Share full journal context:\n\
+             \x20 {exe} \"$(cat $UNIXAGENT_JOURNAL) Continue this work: <specific task>\"\n\
+             \n\
+             Subagents share the working directory, filesystem, and audit log. \
+             They enforce the same security policy (deny list). \
+             Each subagent gets its own isolated journal. \
+             They exit 0 on success, 1 on error. \
+             Nesting depth is limited to {max_depth} levels (currently at depth {depth}).",
+            exe = exe_path.display(),
+            max_depth = max_depth,
+            depth = depth,
+        ));
     }
 
-    let exe_path =
-        std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("unixagent"));
-
-    Some(format!(
-        "You can delegate subtasks to subagents by running:\n\
-         \n\
-         \x20 {exe} \"instruction\"\n\
-         \n\
-         Each subagent is a separate process that runs non-interactively, executes \
-         shell commands, and prints its final answer to stdout. Use subagents for:\n\
-         - Parallel independent tasks (launch multiple in background with &, then wait)\n\
-         - Focused research or analysis that would clutter the main conversation\n\
-         - Subtasks that need their own multi-step tool use loops\n\
-         \n\
-         Subagent patterns:\n\
-         \n\
-         \x20 # Sequential:\n\
-         \x20 {exe} \"find all TODO comments in src/\"\n\
-         \n\
-         \x20 # Parallel (background + wait):\n\
-         \x20 {exe} \"analyze test coverage\" > /tmp/coverage.txt 2>/dev/null &\n\
-         \x20 {exe} \"list all public API functions\" > /tmp/api.txt 2>/dev/null &\n\
-         \x20 wait\n\
-         \x20 cat /tmp/coverage.txt /tmp/api.txt\n\
-         \n\
-         Your session journal is at $UNIXAGENT_JOURNAL. You can share context \
-         with subagents by embedding journal data in the instruction:\n\
-         \n\
-         \x20 # Share full journal context:\n\
-         \x20 {exe} \"$(cat $UNIXAGENT_JOURNAL) Summarize what happened\"\n\
-         \n\
-         \x20 # Share selective context (filter with jq):\n\
-         \x20 {exe} \"$(jq -r 'select(.command)' $UNIXAGENT_JOURNAL) Which commands modified config?\"\n\
-         \n\
-         Subagents share the working directory, filesystem, and audit log. \
-         They enforce the same security policy (deny list). \
-         Each subagent gets its own isolated journal. \
-         They exit 0 on success, 1 on error. \
-         Nesting depth is limited to {max_depth} levels (currently at depth {depth}).",
-        exe = exe_path.display(),
-        max_depth = max_depth,
-        depth = depth,
-    ))
+    prompt
 }
 
 pub fn build_agent_request(
@@ -349,8 +402,11 @@ pub fn build_agent_request(
     let context = build_shell_context(config, terminal_size, child_pid);
     let terminal_history = TerminalHistory::from_lines(history.lines());
 
-    // REPL is always depth 0 — add delegation instructions if allowed
-    let system_prompt_extra = build_delegation_prompt(0, config.security.max_agent_depth);
+    // REPL is always depth 0 — add agent capabilities (journal docs + delegation)
+    let system_prompt_extra = Some(build_agent_capabilities_prompt(
+        0,
+        config.security.max_agent_depth,
+    ));
 
     AgentRequest {
         instruction: instruction.to_string(),
@@ -657,38 +713,77 @@ mod tests {
         assert_eq!(request.terminal_history.lines, vec!["$ ls", "file.txt"]);
     }
 
-    // --- Delegation prompt tests ---
+    // --- Agent capabilities prompt tests ---
 
     #[test]
-    fn delegation_prompt_none_at_depth_limit() {
-        assert!(build_delegation_prompt(2, 3).is_none());
-        assert!(build_delegation_prompt(3, 3).is_none());
-        assert!(build_delegation_prompt(5, 3).is_none());
-    }
-
-    #[test]
-    fn delegation_prompt_some_when_under_limit() {
-        let prompt = build_delegation_prompt(0, 3);
-        assert!(prompt.is_some());
-        let prompt = prompt.unwrap();
-        assert!(prompt.contains("delegate subtasks"));
-        assert!(prompt.contains("depth 0"));
-    }
-
-    #[test]
-    fn delegation_prompt_contains_journal_patterns() {
-        let prompt = build_delegation_prompt(0, 3).unwrap();
+    fn agent_capabilities_prompt_always_has_journal_docs() {
+        // Even at depth limit, journal docs and LRM are present
+        let prompt = build_agent_capabilities_prompt(2, 3);
+        assert!(
+            prompt.contains("SESSION JOURNAL"),
+            "should always include journal docs"
+        );
+        assert!(
+            prompt.contains("LONG-RUNNING MEMORY"),
+            "should always include LRM section"
+        );
         assert!(
             prompt.contains("$UNIXAGENT_JOURNAL"),
-            "Prompt should reference $UNIXAGENT_JOURNAL"
+            "should reference journal env var"
+        );
+    }
+
+    #[test]
+    fn agent_capabilities_prompt_includes_delegation_under_limit() {
+        let prompt = build_agent_capabilities_prompt(0, 3);
+        assert!(
+            prompt.contains("DELEGATION"),
+            "should include delegation when under depth limit"
         );
         assert!(
-            prompt.contains("jq"),
-            "Prompt should show jq filtering pattern"
+            prompt.contains("delegate subtasks"),
+            "should explain delegation"
+        );
+        assert!(prompt.contains("depth 0"), "should show current depth");
+    }
+
+    #[test]
+    fn agent_capabilities_prompt_has_journal_structure() {
+        let prompt = build_agent_capabilities_prompt(0, 3);
+        // All entry types documented
+        for entry_type in &[
+            "shell_command",
+            "instruction",
+            "response",
+            "tool_result",
+            "blocked",
+            "checkpoint",
+            "system_prompt",
+            "summary",
+        ] {
+            assert!(
+                prompt.contains(entry_type),
+                "should document entry type: {entry_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_capabilities_prompt_journal_sharing_only_with_delegation() {
+        let with_delegation = build_agent_capabilities_prompt(0, 3);
+        assert!(
+            with_delegation.contains("JOURNAL CONTEXT SHARING"),
+            "sharing section should be present when delegation is allowed"
+        );
+
+        let without_delegation = build_agent_capabilities_prompt(2, 3);
+        assert!(
+            !without_delegation.contains("DELEGATION"),
+            "no delegation at depth limit"
         );
         assert!(
-            prompt.contains("isolated journal"),
-            "Prompt should mention child journal isolation"
+            !without_delegation.contains("JOURNAL CONTEXT SHARING"),
+            "sharing section should be absent at depth limit"
         );
     }
 }

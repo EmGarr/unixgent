@@ -1474,6 +1474,7 @@ dependencies = [
  "async-stream",
  "bytes",
  "futures",
+ "http",
  "reqwest",
  "serde",
  "serde_json",

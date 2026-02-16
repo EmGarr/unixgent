@@ -1,6 +1,6 @@
 # UnixAgent — Implementation Plan
 
-**Last updated**: 2026-02-14
+**Last updated**: 2026-02-16
 
 This document tracks the implementation status of every phase and sub-task.
 It is the single source of truth for "where are we at". See DESIGN.md for
@@ -161,23 +161,144 @@ Cannot read `~/.ssh`. Proxy enforces domain allowlist.
 
 ---
 
-## Phase 5: Agent Mode TUI + Interactive Approval — TODO
+## Phase 5: Display Redesign — Shell-Native Agent UI — DRAFT
 
-Full agent loop: context → backend → plan stream → agent mode TUI →
-interactive approval/steering → execute. Multi-turn conversation.
+**No TUI. No sidecar files. No cursor gymnastics. Just files and lines.**
 
-This is the big one — the TUI overlay described in DESIGN.md §2.4.
+Design direction: the agent disappears into the shell. Everything is stderr
+lines that flow forward (like `make` or `docker build`). The journal — already
+being written — is the status protocol. Process tree — already being walked —
+is the discovery mechanism. The missing piece is a seam between the two.
 
-| Sub-task | Status | Files |
-|----------|--------|-------|
-| Agent mode TUI overlay | TODO | `ua-core/src/display/` |
-| Plan approval controls ([a] Allow, [s] Step, [d] Deny, [e] Edit) | TODO | |
-| Step-through execution with inline output | TODO | |
-| Inline steering (`# new instruction` mid-plan) | TODO | |
-| Stream output mode (TTY vs NDJSON) | TODO | `ua-core/src/stream.rs` |
+See `/tmp/ua-design-demos/` for animated prototypes of every approach explored.
 
-**Exit criteria**: Complete interactive session works end-to-end. User can
-step through plans, edit commands, steer with inline `#` instructions.
+### Principles
+
+1. **Print lines, don't move cursors.** Scrollback stays clean. `| grep` works.
+   No `\033[NA` cursor-up rewriting. Every line printed is final.
+2. **The journal IS the status protocol.** No `.status` sidecar. Children already
+   write JSONL. Make the path predictable, add a `Summary` entry on exit. Done.
+3. **Process tree IS discovery.** `count_descendant_agents()` already walks PIDs.
+   PID-based journal path = parent can read any child's journal.
+4. **Stderr for UI, stdout for PTY.** Already the case. Don't break it.
+5. **8 colors + bold + dim.** No 256-color. No nerd fonts. Stock Terminal.app.
+
+### Design Decisions (converged)
+
+**Judge/safety display: "Inline" (demo-judge.sh approach 3)**
+
+```
+  ❯ docker image prune -a --force  ▐ privileged
+  ❯ docker builder prune --force   ▐ write
+
+  ⚠ -a removes all unused images, not just dangling
+    safer: docker image prune --force
+
+  [y] run  [n] skip  [e] edit
+```
+
+- Safe commands: `safe` suffix, auto-run, no gate
+- Write commands: `write` suffix, `[y/n/q]`
+- Privileged commands: `privileged` suffix, judge reasoning, type `yes`
+
+**Subagent display: streaming lines with summary fold**
+
+No in-place table. Lines flow forward. Each agent gets one status line on
+spawn and one summary line on exit. Active agents show elapsed via periodic
+one-line reprints (or just on events — child journal writes trigger parent).
+
+```
+  [48310] lint ···
+  [48311] test suite ···
+  [48312] security review ···
+  [48310] lint  done  3.1s  1.8k tok  2 cmds ✓✓
+  [48312] security review  done  6.2s  4.1k tok  6 cmds ✓✓✓✓⚠⚠
+  [48311/48342] └ ua-core  failed  1.6s  1.2k tok  2 cmds ✓✗
+  [48311/48360] └ retry: fix  done  0.4s  210 tok  1 cmd ✓
+  [48311] test suite  done  8.2s  3.8k tok  3+2 cmds ✓
+  ── 4 agents  2 depth  9.8k tok  13 cmds  8.4s ──
+```
+
+Folding rule is trivial: completed agents print one summary line.
+Failures print the failure path (parent/child chain). The `+N` suffix
+on parent's cmd count shows descendant work. Total line at the end.
+
+**Subagent status protocol: journal + predictable paths**
+
+Current batch journal: `s{pid^timestamp}.jsonl` — not findable from PID.
+
+Fix: batch mode journals use `agent-{pid}.jsonl`. Parent knows the PID
+(process tree), constructs the path, reads the tail. Zero new mechanisms.
+
+New journal entry on batch exit:
+```json
+{"type":"Summary","tokens_in":1800,"tokens_out":420,"cmds":2,"safe":2,"warn":0,"fail":0,"exit_code":0}
+```
+Parent reads just this one line (seek to end, scan back) to get the fold view.
+
+**General rendering:**
+- Commands look typed at a real prompt (`❯ cmd`)
+- Thinking: braille spinner (`⠋`) then dim `# one-liner`
+- Token stats: dim footer like `time` output (`2.4k↑ 1.1k↓  2 cmds  4.6s`)
+
+### Implementation Plan
+
+| # | Sub-task | Status | Files | Notes |
+|---|----------|--------|-------|-------|
+| 1 | Stop ignoring `StreamEvent::Usage` | TODO | `repl.rs`, `batch.rs`, `display.rs` | Three `{ .. } => {}` arms → accumulate in `PlanDisplay` |
+| 2 | Token counter in PlanDisplay | TODO | `display.rs` | `input_tokens: u32, output_tokens: u32`, summed per response |
+| 3 | Footer stats line | TODO | `repl.rs` | `{in}↑ {out}↓  {n} cmds  {t}s` — dim, after each interaction |
+| 4 | Inline risk tags on proposed commands | DONE | `renderer.rs`, `repl.rs` | `❯ cmd  ▐ risk` via `ReplRenderer::emit_command_risk()` |
+| 5 | Judge reasoning as inline warning | DONE | `renderer.rs`, `repl.rs` | `⚠ reason` via `emit_judge_warning()` + `emit_judge_note()` |
+| 6 | Rework approval UI | DONE | `renderer.rs`, `repl.rs` | `[y] run  [n] skip  [e] edit` via `emit_approval_prompt()` |
+| 7 | Thinking display as dim comment | DONE | `renderer.rs`, `repl.rs` | `# summary` via `emit_thinking_line()`. Full thinking in journal only. |
+| 8 | Braille spinner | DONE | `renderer.rs`, `repl.rs` | `⠋ thinking...` via `emit_spinner_tick()`. `SPINNER_FRAMES` in renderer. |
+| 9 | Terminal width detection in REPL | DONE | `renderer.rs` | `ReplRenderer::new()` queries `crossterm::terminal::size()` |
+| 10 | PID-based batch journal paths | TODO | `batch.rs`, `journal.rs` | `agent-{pid}.jsonl` for batch mode, keep `s{hex}` for REPL |
+| 11 | `Summary` journal entry on batch exit | TODO | `journal.rs`, `batch.rs` | Final JSONL line with totals, written in `run_batch()` cleanup |
+| 12 | Parent reads child journals | TODO | `repl.rs` or new | On child PID exit: construct path, read `Summary` line, print fold |
+| 13 | Subagent status lines | TODO | `repl.rs` | `[PID] task ···` on spawn, `[PID] task  done  stats` on exit |
+| 14 | `NO_COLOR` support | TODO | `repl.rs`, `batch.rs` | Respect `NO_COLOR` env var. Basic 8 colors only otherwise. |
+
+### Anticipated Issues
+
+**P0 — Must solve:**
+
+| Issue | Mitigation |
+|-------|------------|
+| Child journal path must be predictable | Batch uses `agent-{pid}.jsonl`. REPL keeps XOR path (interactive sessions don't need parent discovery). |
+| Parent must detect child exit | Process tree poll on timer (already exists for `count_descendant_agents`). On PID gone → read journal → print summary. |
+| Token timing — Usage arrives at stream end | Show `···` during stream, fill on Done. Users care post-hoc. |
+
+**P1 — Will hit:**
+
+| Issue | Mitigation |
+|-------|------------|
+| Terminal width for long lines | Truncate task names. Drop tokens column below 80 cols. |
+| Thinking floods display | First line only. `jq '.thinking' $UNIXAGENT_JOURNAL` for full. |
+| Multiple children exit simultaneously | Process serially through same stderr write path. Lines are atomic (single `write()` call). No races. |
+| `NO_COLOR` / non-TTY | Already have `is_tty` in batch. Extend to REPL. |
+
+**P2 — Future:**
+
+| Issue | Notes |
+|-------|-------|
+| 100+ agents → process tree walk expensive | Cache PIDs, diff on timer. Or switch to `$UNIXAGENT_PARENT_JOURNAL` env var for children to self-register. |
+| Deep nesting display | `+N deeper` suffix on parent summary. User reads child journal directly if curious. |
+| Structured task graphs (DAGs) | Current tree model sufficient for shell-spawned agents. DAGs need an orchestration layer — out of scope. |
+
+### Non-goals
+
+- **ratatui / alternate screen** — conflicts with PTY scrollback
+- **In-place multi-line table rewriting** — cursor movement corrupts with interleaved PTY output
+- **Sidecar status files** — journal already exists, don't duplicate
+- **Nerd fonts / 256-color** — stock Terminal.app must work
+- **Interactive fold/unfold** — lines flow forward. `grep` the scrollback.
+- **Markdown rendering** — model already formats for terminal
+
+**Exit criteria**: Commands look typed. Risk is visible at the prompt line.
+Token costs printed after every interaction. 50-agent tree produces ~50
+readable summary lines (not 50 live-updating table rows).
 
 ---
 
@@ -221,7 +342,7 @@ Policy inheritance, trace propagation, musl build, packaging.
 | Sub-task | Status | Files |
 |----------|--------|-------|
 | Batch mode (non-interactive execution) | DONE | `ua-core/src/batch.rs` |
-| Delegation prompt (subagent patterns) | DONE | `ua-core/src/context.rs` |
+| Agent capabilities prompt (journal docs + LRM + delegation) | DONE | `ua-core/src/context.rs` |
 | `$UNIXAGENT_JOURNAL` env var | DONE | `ua-core/src/repl.rs`, `ua-core/src/batch.rs` |
 | Process depth counting (`max_agent_depth`) | DONE | `ua-core/src/process.rs` |
 | Descendant agent counting | DONE | `ua-core/src/process.rs` |
@@ -253,7 +374,11 @@ context via journal piping, children run in isolated journals. Static binary shi
 | ~~CWD stale — shows parent process directory~~ | ~~High~~ | FIXED — `build_shell_context()` now queries child shell CWD via OS APIs (`proc_pidinfo` with `PROC_PIDVNODEPATHINFO` on macOS, `readlink /proc/{pid}/cwd` on Linux). Falls back to parent's `current_dir()` if unavailable. |
 | ~~Hard iteration cap + no compaction~~ | ~~High~~ | FIXED — Replaced reactive compaction with append-only session journal (Ralph Loop). `SessionJournal` writes JSONL entries for all events. Each LLM call rebuilds conversation from journal with token budget (default 60k). No in-memory accumulation, no compaction LLM call. |
 | ~~REPL stuck after subagent completion~~ | ~~Medium~~ | FIXED — `line_buf.clear()` in AllDone and Failed handlers prevents stale content from blocking `#` detection after command execution completes. |
+| Command echo duplication | Medium | Every command shows twice — once as our `❯ cmd ▐ risk` preview and once as the PTY echo at the real shell prompt. Fix requires PTY echo suppression (temporarily disabling ECHO, or filtering the echo from PtyOutput). |
 | Shell integration sourcing unverified | Medium | No check that `source` succeeded; `clear` hack; temp file leak on panic. See DESIGN.md §19.2.5 |
+| StreamEvent::Usage tokens discarded | Low | `Usage { .. } => {}` in repl.rs, batch.rs, and display.rs. Token counts parsed from API but never stored or displayed. Phase 5 will fix. |
+| No subagent status protocol | Medium | Parent discovers children via process tree (PID only). No access to child task name, token count, command count, or safety stats. Fix: PID-based journal paths (`agent-{pid}.jsonl`) + `Summary` entry on batch exit. Journal IS the protocol. |
+| REPL has no terminal width detection | Low | batch.rs uses `crossterm::terminal::size()` but REPL does not. Needed for Phase 5 column-aware rendering. |
 | ~~`try_wait()` polled on every event~~ | ~~Medium~~ | FIXED — Moved to PtyEof arm only, used for diagnostic logging. See DESIGN.md §19.2.6 |
 | ~~Thread handles discarded (fire-and-forget)~~ | ~~Medium~~ | FIXED — PTY reader JoinHandle stored and joined on exit. Stdin thread blocks on read (can't join portably). See DESIGN.md §19.2.8 |
 | ~~`looks_like_secret()` insufficient~~ | ~~Medium~~ | FIXED — Expanded with AWS keys (AKIA), JWTs (eyJ), Slack/GitLab/npm tokens, SSH private key content, high-entropy base64 heuristic. See DESIGN.md §19.2.9 |
@@ -289,6 +414,8 @@ context via journal piping, children run in isolated journals. Static binary shi
 | Append-only session journal (Ralph Loop) | 2026-02-12 | All session events written to JSONL file (`~/.local/share/unixagent/sessions/`). Each LLM call rebuilds conversation from journal with token budget (default 60k, configurable via `[journal].conversation_budget`). User shell commands captured on 133;D with exit code. Replaces `Vec<ConversationMessage>` accumulation, `compact_conversation()`, and `COMPACTION_THRESHOLD`. Journal entries: ShellCommand, Instruction, Response, ToolResult, Blocked, Checkpoint. Strict user/assistant alternation via `merge_or_push_user()`. |
 | Unbounded batch loop + descendant counting | 2026-02-11 | Batch mode `MAX_ITERATIONS` removed — loop runs until LLM stops or API error. System prompt no longer mentions budget. `count_descendant_agents()` walks process tree to count child agent instances via `list_all_pids()` (macOS: `proc_listallpids`, Linux: `/proc` enumeration). Testable `_core` variant uses fake process tables. |
 | Unix-native RLM (no delegate tool) | 2026-02-14 | No structured `delegate` tool needed. Model spawns child agents via existing shell tool + batch mode. `$UNIXAGENT_JOURNAL` env var exposes journal path. Model uses `jq` + command substitution to pipe selective context into child instructions. Each child creates its own isolated journal. Depth enforced via process tree. All RLM strategies (peek, grep, partition+map) fall out of Unix primitives the model already knows. |
+| Shell-native display over TUI overlay | 2026-02-15 | Original Phase 5 planned a ratatui TUI overlay with alternate screen. After prototyping 10 animated demos, decided against it: agent lives inside a real PTY, TUI chrome conflicts with shell output. Further refined: no cursor movement either — just forward-flowing lines on stderr. Subagent status via journal (already written) + PID-based paths (trivial change). No sidecar files, no IPC, no new protocols. The Unix answer: files that are already being written, made findable. |
+| ReplRenderer extraction (Linus forward-flow) | 2026-02-16 | Extracted ~30 ad-hoc `write!(stderr, ...)` calls from repl.rs into `ReplRenderer<W: Write>` in renderer.rs. Follows `BatchOutput<W>` pattern. Centralized `clear_spinner()` protocol: every persistent emit method clears spinner first, fixing spinner bleed into PTY output. Deleted `[ua] executing...` and `[ua] observing output` status lines. 30+ snapshot tests with `Vec<u8>` writer. |
 | Journal fidelity: user command output capture + output_mode | 2026-02-14 | `ShellCommand` journal entry gains `output: Option<String>` field (serde-default for backward compat). REPL captures terminal output between OSC 133;C and 133;D via `user_cmd_capture` buffer, mirroring how agent command output is captured. `convert_entries_to_messages()` appends output to `[ran: ...]` stub. Shell tool gains `output_mode` enum (`"full"` / `"final"`) — `"final"` mode uses `OutputHistory::with_cr_reset()` where `\r` clears `current_line`, collapsing progress bar output to only the final overwritten state. |
 
 ---

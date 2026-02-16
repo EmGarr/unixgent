@@ -26,10 +26,8 @@ use crate::judge::{self, JudgeVerdict};
 use crate::osc::{OscEvent, OscParser, TerminalState};
 use crate::policy::{analyze_pipe_chain, validate_arguments, ArgumentSafety, RiskLevel};
 use crate::pty::PtySession;
-use crate::style::{format_tokens, Style};
-
-/// Braille spinner frames.
-const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+use crate::renderer::ReplRenderer;
+use crate::style::Style;
 
 enum Event {
     Stdin(Vec<u8>),
@@ -281,15 +279,14 @@ enum CommandAction {
 /// It performs risk classification, deny checks, argument warnings, and
 /// decides whether to auto-approve, send to the judge, or go to approval UI.
 #[allow(clippy::too_many_arguments)]
-fn classify_and_gate(
+fn classify_and_gate<W: Write>(
     commands: Vec<String>,
     tool_use_ids: Vec<String>,
     iteration: usize,
     use_cr_reset: bool,
     config: &Config,
     audit: &mut AuditLogger,
-    style: &Style,
-    stderr: &mut impl Write,
+    renderer: &mut ReplRenderer<W>,
 ) -> CommandAction {
     if commands.is_empty() {
         return CommandAction::NoCommands;
@@ -306,13 +303,7 @@ fn classify_and_gate(
     let mut blocked = false;
     for (i, risk) in risk_levels.iter().enumerate() {
         if *risk == RiskLevel::Denied {
-            let _ = writeln!(
-                stderr,
-                "\r  ❯ {}  {}▐ DENIED{}",
-                commands[i].replace('\n', "\r\n"),
-                style.red_start(),
-                style.reset(),
-            );
+            renderer.emit_denied(&commands[i]);
             audit.log_blocked(&commands[i], risk.as_str(), "denied by policy");
             blocked = true;
         }
@@ -325,13 +316,7 @@ fn classify_and_gate(
     // Check for dangerous arguments
     for cmd in &commands {
         if let ArgumentSafety::Dangerous(reason) = validate_arguments(cmd) {
-            let _ = writeln!(
-                stderr,
-                "\r  {}⚠ {}{}",
-                style.yellow_start(),
-                reason,
-                style.reset()
-            );
+            renderer.emit_arg_warning(&reason);
         }
     }
 
@@ -342,13 +327,7 @@ fn classify_and_gate(
     if all_read_only && config.security.auto_approve_read_only {
         audit.log_approved(iteration, "auto", "all commands read-only");
         for cmd in &commands {
-            let safe = cmd.replace('\n', "\r\n");
-            let _ = writeln!(
-                stderr,
-                "\r  ❯ {safe}  {}▐ safe{}",
-                style.dim_start(),
-                style.reset(),
-            );
+            renderer.emit_command_safe(cmd);
         }
         CommandAction::AutoApprove {
             commands,
@@ -377,15 +356,14 @@ fn classify_and_gate(
     }
 }
 
-/// Handle a judge verdict: log to audit and write warnings/errors to stderr.
+/// Handle a judge verdict: log to audit and write warnings/errors via renderer.
 ///
 /// This is the pure side-effect logic extracted from the JudgeResult handler.
-fn handle_judge_verdict(
+fn handle_judge_verdict<W: Write>(
     verdict: &JudgeVerdict,
     iteration: usize,
     audit: &mut AuditLogger,
-    style: &Style,
-    stderr: &mut impl Write,
+    renderer: &mut ReplRenderer<W>,
 ) {
     match verdict {
         JudgeVerdict::Safe => {
@@ -394,27 +372,13 @@ fn handle_judge_verdict(
         JudgeVerdict::Unsafe { reasoning } => {
             let mut lines = reasoning.lines();
             if let Some(first) = lines.next() {
-                let _ = writeln!(
-                    stderr,
-                    "\r\x1b[K{}⚠ {}{}",
-                    style.yellow_start(),
-                    first,
-                    style.reset()
-                );
-            }
-            for line in lines {
-                let _ = writeln!(stderr, "\r  {}{}{}", style.dim_start(), line, style.reset());
+                let rest: Vec<&str> = lines.collect();
+                renderer.emit_judge_warning(first, &rest);
             }
             audit.log_judge_result(iteration, false, reasoning);
         }
         JudgeVerdict::Error(e) => {
-            let _ = writeln!(
-                stderr,
-                "\r\x1b[K{}judge: {}{}",
-                style.dim_start(),
-                e,
-                style.reset()
-            );
+            renderer.emit_judge_note(e);
         }
     }
 }
@@ -565,7 +529,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
     drop(tx);
 
     let mut stdout = io::stdout().lock();
-    let mut stderr = io::stderr();
+    let mut renderer = ReplRenderer::new(io::stderr(), style);
 
     while let Ok(event) = rx.recv() {
         match event {
@@ -612,9 +576,8 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                                     terminal_size,
                                                     0,
                                                     &tx_for_streaming,
-                                                    &mut stderr,
+                                                    &mut renderer,
                                                     child_pid,
-                                                    &style,
                                                 );
                                             }
                                         } else if !trimmed.is_empty() {
@@ -669,11 +632,10 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                             if debug_osc {
                                 for &b in &data {
                                     if b == b'#' {
-                                        let _ = writeln!(
-                                            stderr,
-                                            "\r[ua:osc] '#' ignored (state={:?})",
+                                        renderer.emit_debug(&format!(
+                                            "[ua:osc] '#' ignored (state={:?})",
                                             parser.terminal_state
-                                        );
+                                        ));
                                     }
                                 }
                             }
@@ -684,7 +646,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                         if !handled_instruction {
                             if let Err(e) = session.write_all(&data) {
                                 if debug_osc {
-                                    let _ = writeln!(stderr, "\r[ua] pty write error: {e}");
+                                    renderer.emit_pty_error(&e.to_string());
                                 }
                                 break;
                             }
@@ -699,7 +661,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                             if let Some(tx) = cancel_tx.take() {
                                 let _ = tx.send(());
                             }
-                            let _ = writeln!(stderr, "\r\n[ua] cancelled\r");
+                            renderer.emit_cancelled();
                             state = AgentState::Idle;
                             pending_instruction = None;
                         }
@@ -713,7 +675,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                             if let Some(tx) = cancel_tx.take() {
                                 let _ = tx.send(());
                             }
-                            let _ = writeln!(stderr, "\r\n[ua] cancelled\r");
+                            renderer.emit_cancelled();
                             state = AgentState::Idle;
                         }
                         // Other input is ignored during judging
@@ -746,7 +708,6 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                                     "typed_yes",
                                                     "user typed yes",
                                                 );
-                                                let _ = writeln!(stderr, "\r\n[ua] executing...\r");
 
                                                 total_commands += commands.len() as u32;
                                                 command_queue.enqueue(commands);
@@ -755,10 +716,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                                     if let Err(e) =
                                                         session.write_all(cmd.as_bytes())
                                                     {
-                                                        let _ = writeln!(
-                                                            stderr,
-                                                            "\r\n[ua] pty write error: {e}"
-                                                        );
+                                                        renderer.emit_pty_error(&e.to_string());
                                                         command_queue.clear();
                                                     } else {
                                                         let capture = if use_cr_reset {
@@ -783,10 +741,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                                     "user did not type yes",
                                                 );
                                             }
-                                            let _ = writeln!(
-                                                stderr,
-                                                "\r\n[ua] skipped (type 'yes' to approve)\r"
-                                            );
+                                            renderer.emit_skipped(Some("type 'yes' to approve"));
                                             total_input_tokens = 0;
                                             total_output_tokens = 0;
                                             total_commands = 0;
@@ -798,8 +753,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                     0x7f | 0x08 => {
                                         // Backspace
                                         if yes_buffer.pop().is_some() {
-                                            let _ = write!(stderr, "\x08 \x08");
-                                            let _ = stderr.flush();
+                                            renderer.emit_backspace();
                                         }
                                     }
                                     0x03 => {
@@ -811,7 +765,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                                 "user cancelled",
                                             );
                                         }
-                                        let _ = writeln!(stderr, "\r\n[ua] cancelled\r");
+                                        renderer.emit_cancelled();
                                         total_input_tokens = 0;
                                         total_output_tokens = 0;
                                         total_commands = 0;
@@ -821,8 +775,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                     }
                                     b if b >= 0x20 => {
                                         yes_buffer.push(b as char);
-                                        let _ = write!(stderr, "{}", b as char);
-                                        let _ = stderr.flush();
+                                        renderer.emit_char(b as char);
                                     }
                                     _ => {}
                                 }
@@ -845,17 +798,13 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                                 "keystroke",
                                                 "user pressed y",
                                             );
-                                            let _ = writeln!(stderr, "\r\n[ua] executing...\r");
 
                                             total_commands += commands.len() as u32;
                                             command_queue.enqueue(commands);
                                             if let Some(cmd) = command_queue.pop_immediate() {
                                                 let cmd = format!("{cmd}\n");
                                                 if let Err(e) = session.write_all(cmd.as_bytes()) {
-                                                    let _ = writeln!(
-                                                        stderr,
-                                                        "\r\n[ua] pty write error: {e}"
-                                                    );
+                                                    renderer.emit_pty_error(&e.to_string());
                                                     command_queue.clear();
                                                 } else {
                                                     let capture = if use_cr_reset {
@@ -881,7 +830,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                                 "user pressed n",
                                             );
                                         }
-                                        let _ = writeln!(stderr, "\r\n[ua] skipped\r");
+                                        renderer.emit_skipped(None);
                                         total_input_tokens = 0;
                                         total_output_tokens = 0;
                                         total_commands = 0;
@@ -890,8 +839,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                         break;
                                     }
                                     b'e' | b'E' => {
-                                        let _ =
-                                            writeln!(stderr, "\r\n  (edit not yet implemented)\r");
+                                        renderer.emit_edit_not_implemented();
                                     }
                                     _ => {
                                         // Ignore other keys
@@ -905,7 +853,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                         if data.contains(&0x03) {
                             let _ = session.write_all(&[0x03]);
                             command_queue.clear();
-                            let _ = writeln!(stderr, "\r\n[ua] cancelled\r");
+                            renderer.emit_cancelled();
                             total_input_tokens = 0;
                             total_output_tokens = 0;
                             total_commands = 0;
@@ -940,14 +888,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                 if let Some(nl_pos) = thinking_text.find('\n') {
                                     let first_line: String =
                                         thinking_text[..nl_pos].chars().take(70).collect();
-                                    let _ = write!(
-                                        stderr,
-                                        "\r\x1b[K{}# {}{}\r\n",
-                                        style.dim_start(),
-                                        first_line,
-                                        style.reset()
-                                    );
-                                    let _ = stderr.flush();
+                                    renderer.emit_thinking_line(&first_line);
                                     *thinking_first_line_shown = true;
                                 }
                             }
@@ -960,23 +901,15 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                     let first_line: String =
                                         thinking_text.chars().take(70).collect();
                                     if !first_line.is_empty() {
-                                        let _ = write!(
-                                            stderr,
-                                            "\r\x1b[K{}# {}{}\r\n",
-                                            style.dim_start(),
-                                            first_line,
-                                            style.reset()
-                                        );
+                                        renderer.emit_thinking_line(&first_line);
                                     } else {
-                                        let _ = write!(stderr, "\r\x1b[K");
+                                        renderer.emit_clear_line();
                                     }
                                 }
                             } else if display.streaming_text.is_empty() {
-                                let _ = write!(stderr, "\r\x1b[K");
+                                renderer.emit_clear_line();
                             }
-                            let raw_safe = text.replace('\n', "\r\n");
-                            let _ = write!(stderr, "{raw_safe}");
-                            let _ = stderr.flush();
+                            renderer.emit_text(text);
                         }
                         StreamEvent::ToolUse {
                             id,
@@ -1004,8 +937,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                         StreamEvent::Usage { .. } => {}
                         StreamEvent::Error(_) => {
                             if display.streaming_text.is_empty() {
-                                let _ = write!(stderr, "\r\x1b[K");
-                                let _ = stderr.flush();
+                                renderer.emit_clear_line();
                             }
                         }
                         _ => {}
@@ -1033,11 +965,11 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                     }
 
                     // Trailing newline
-                    let _ = writeln!(stderr, "\r");
+                    renderer.emit_stream_end();
 
                     match display.status {
                         crate::display::DisplayStatus::Error(ref msg) => {
-                            let _ = writeln!(stderr, "\r\n[ua] error: {msg}");
+                            renderer.emit_error(msg);
                             pending_instruction = None;
                         }
                         _ => {
@@ -1074,8 +1006,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                 use_cr_reset,
                                 config,
                                 &mut audit,
-                                &style,
-                                &mut stderr,
+                                &mut renderer,
                             );
 
                             match action {
@@ -1083,15 +1014,11 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                     // Emit footer stats for this agent turn
                                     if let Some(start) = turn_start.take() {
                                         let elapsed = start.elapsed().as_secs();
-                                        let _ = writeln!(
-                                            stderr,
-                                            "\r{}{}↑ {}↓  {} cmds  {}s{}",
-                                            style.dim_start(),
-                                            format_tokens(total_input_tokens),
-                                            format_tokens(total_output_tokens),
+                                        renderer.emit_footer(
+                                            total_input_tokens,
+                                            total_output_tokens,
                                             total_commands,
                                             elapsed,
-                                            style.reset(),
                                         );
                                     }
                                     total_input_tokens = 0;
@@ -1118,7 +1045,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                             });
                                         }
                                     }
-                                    let _ = writeln!(stderr, "\r[ua] command blocked by policy\r");
+                                    renderer.emit_blocked();
                                     total_input_tokens = 0;
                                     total_output_tokens = 0;
                                     total_commands = 0;
@@ -1137,8 +1064,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                     if let Some(cmd) = command_queue.pop_immediate() {
                                         let cmd = format!("{cmd}\n");
                                         if let Err(e) = session.write_all(cmd.as_bytes()) {
-                                            let _ =
-                                                writeln!(stderr, "\r\n[ua] pty write error: {e}");
+                                            renderer.emit_pty_error(&e.to_string());
                                             command_queue.clear();
                                         } else {
                                             let capture = if use_cr_reset {
@@ -1174,8 +1100,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                         has_privileged,
                                         use_cr_reset,
                                         &tx_for_streaming,
-                                        &mut stderr,
-                                        &style,
+                                        &mut renderer,
                                     );
                                 }
                                 CommandAction::Approve {
@@ -1191,8 +1116,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                         &risk_levels,
                                         has_privileged,
                                         config,
-                                        &style,
-                                        &mut stderr,
+                                        &mut renderer,
                                     );
                                     state = AgentState::Approving {
                                         commands,
@@ -1219,7 +1143,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                     ..
                 } = std::mem::replace(&mut state, AgentState::Idle)
                 {
-                    handle_judge_verdict(&verdict, iteration, &mut audit, &style, &mut stderr);
+                    handle_judge_verdict(&verdict, iteration, &mut audit, &mut renderer);
 
                     // Proceed to approval UI regardless of verdict
                     show_approval_ui(
@@ -1227,8 +1151,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                         &risk_levels,
                         has_privileged,
                         config,
-                        &style,
-                        &mut stderr,
+                        &mut renderer,
                     );
                     state = AgentState::Approving {
                         commands,
@@ -1265,11 +1188,10 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                 let events = parser.feed_bytes(&data);
                 if debug_osc {
                     for evt in &events {
-                        let _ = writeln!(
-                            stderr,
-                            "\r[ua:osc] {evt:?} -> state={:?}",
+                        renderer.emit_debug(&format!(
+                            "[ua:osc] {evt:?} -> state={:?}",
                             parser.terminal_state
-                        );
+                        ));
                     }
                 }
 
@@ -1315,7 +1237,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                         QueueEvent::Dispatch(cmd) => {
                             let cmd = format!("{cmd}\n");
                             if let Err(e) = session.write_all(cmd.as_bytes()) {
-                                let _ = writeln!(stderr, "\r\n[ua] pty write error: {e}");
+                                renderer.emit_pty_error(&e.to_string());
                                 command_queue.clear();
                                 state = AgentState::Idle;
                             }
@@ -1361,10 +1283,6 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
 
                                     let next_iteration = iteration + 1;
 
-                                    let _ = writeln!(
-                                        stderr,
-                                        "\r[ua] observing output (iteration {next_iteration})..."
-                                    );
                                     // Journal has the tool_result — rebuild
                                     // conversation fresh from journal.
                                     state = start_streaming(
@@ -1375,19 +1293,15 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                         terminal_size,
                                         next_iteration,
                                         &tx_for_streaming,
-                                        &mut stderr,
+                                        &mut renderer,
                                         child_pid,
-                                        &style,
                                     );
                                 }
                                 // else: no output — stay Idle
                             }
                         }
                         QueueEvent::Failed(code) => {
-                            let _ = writeln!(
-                                stderr,
-                                "\r[ua] command failed (exit code {code}), stopping"
-                            );
+                            renderer.emit_command_failed(code);
                             line_buf.clear();
                             state = AgentState::Idle;
                         }
@@ -1399,7 +1313,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                 // PTY closed — check exit code for diagnostics
                 if debug_osc {
                     if let Ok(Some(code)) = session.try_wait() {
-                        let _ = writeln!(stderr, "\r[ua] child exited with code {code}");
+                        renderer.emit_debug(&format!("[ua] child exited with code {code}"));
                     }
                 }
                 break;
@@ -1408,7 +1322,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                 terminal_size = (cols, rows);
                 if let Err(e) = session.resize(cols, rows) {
                     if debug_osc {
-                        let _ = writeln!(stderr, "\r[ua] resize error: {e}");
+                        renderer.emit_debug(&format!("[ua] resize error: {e}"));
                     }
                 }
             }
@@ -1426,15 +1340,8 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                         && !is_thinking
                         && !thinking_first_line_shown
                     {
-                        *spinner_frame = (*spinner_frame + 1) % SPINNER_FRAMES.len();
-                        let _ = write!(
-                            stderr,
-                            "\r\x1b[K{}{} thinking...{}",
-                            style.cyan_start(),
-                            SPINNER_FRAMES[*spinner_frame],
-                            style.reset()
-                        );
-                        let _ = stderr.flush();
+                        *spinner_frame += 1;
+                        renderer.emit_spinner_tick(*spinner_frame);
                     }
                 }
                 // SpinnerTick outside Streaming is silently ignored
@@ -1450,8 +1357,8 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                     let journal_path = sessions_dir.join(format!("agent-{pid}.jsonl"));
                     let task = agents::read_child_task(&journal_path, 40)
                         .unwrap_or_else(|| "agent".to_string());
-                    let line = agents::format_child_started(pid, &task, &style);
-                    let _ = writeln!(stderr, "\r{line}");
+                    let line = agents::format_child_started(pid, &task, renderer.style());
+                    renderer.emit_child_started(&line);
                 }
 
                 // Disappeared children: were known, now gone
@@ -1460,8 +1367,9 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                     let task = agents::read_child_task(&journal_path, 40)
                         .unwrap_or_else(|| "agent".to_string());
                     if let Some(summary) = agents::read_child_summary(&journal_path) {
-                        let line = agents::format_child_done(pid, &task, &summary, &style);
-                        let _ = writeln!(stderr, "\r{line}");
+                        let line =
+                            agents::format_child_done(pid, &task, &summary, renderer.style());
+                        renderer.emit_child_done(&line);
                     }
                 }
 
@@ -1481,7 +1389,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
 ///
 /// Rebuilds conversation context fresh from the journal each time.
 #[allow(clippy::too_many_arguments)]
-fn start_streaming(
+fn start_streaming<W: Write>(
     rt_handle: &Handle,
     config: &Config,
     journal: &mut Option<SessionJournal>,
@@ -1489,15 +1397,14 @@ fn start_streaming(
     terminal_size: (u16, u16),
     iteration: usize,
     tx: &mpsc::Sender<Event>,
-    stderr: &mut io::Stderr,
+    renderer: &mut ReplRenderer<W>,
     child_pid: Option<u32>,
-    style: &Style,
 ) -> AgentState {
     // Resolve API key
     let api_key = match config.backend.anthropic.resolve_api_key() {
         Ok(key) => key,
         Err(e) => {
-            let _ = writeln!(stderr, "\r\n[ua] error: {e}");
+            renderer.emit_error(&e.to_string());
             return AgentState::Idle;
         }
     };
@@ -1527,15 +1434,8 @@ fn start_streaming(
     let client = AnthropicClient::with_model(&api_key, &config.backend.anthropic.model);
     let stream = client.send(&request);
 
-    // Show initial spinner frame
-    let _ = write!(
-        stderr,
-        "\r\n{}{} thinking...{}",
-        style.cyan_start(),
-        SPINNER_FRAMES[0],
-        style.reset()
-    );
-    let _ = stderr.flush();
+    // Show initial spinner
+    renderer.emit_spinner_initial();
 
     // Spawn spinner timer thread (sends SpinnerTick every 80ms)
     let tx_spinner = tx.clone();
@@ -1583,44 +1483,26 @@ fn start_streaming(
     }
 }
 
-/// Format risk label with color.
-fn risk_color<'a>(risk: &RiskLevel, style: &'a Style) -> &'a str {
-    match risk {
-        RiskLevel::ReadOnly | RiskLevel::BuildTest => style.green_start(),
-        RiskLevel::Write | RiskLevel::Network => style.yellow_start(),
-        RiskLevel::Destructive | RiskLevel::Privileged | RiskLevel::Denied => style.red_start(),
-    }
-}
-
 /// Show the risk-aware approval UI for proposed commands.
-fn show_approval_ui(
+fn show_approval_ui<W: Write>(
     commands: &[String],
     risk_levels: &[RiskLevel],
     has_privileged: bool,
     config: &Config,
-    style: &Style,
-    stderr: &mut impl Write,
+    renderer: &mut ReplRenderer<W>,
 ) {
     for (i, cmd) in commands.iter().enumerate() {
-        let safe = cmd.replace('\n', "\r\n");
-        let risk = &risk_levels[i];
-        let color = risk_color(risk, style);
-        let label = risk.label();
-        let _ = writeln!(stderr, "\r  ❯ {safe}  {color}▐ {label}{}", style.reset());
+        renderer.emit_command_risk(cmd, &risk_levels[i]);
     }
 
-    if has_privileged && config.security.require_yes_for_privileged {
-        let _ = write!(stderr, "\rType 'yes' to approve: ");
-    } else {
-        let _ = write!(stderr, "\r[y] run  [n] skip  [e] edit ");
-    }
-    let _ = stderr.flush();
+    let privileged = has_privileged && config.security.require_yes_for_privileged;
+    renderer.emit_approval_prompt(privileged);
 }
 
 /// Spawn a tokio task to run the LLM security judge, forwarding the result through the mpsc channel.
 /// Returns the initial AgentState::Judging.
 #[allow(clippy::too_many_arguments)]
-fn start_judging(
+fn start_judging<W: Write>(
     rt_handle: &Handle,
     config: &Config,
     commands: &[String],
@@ -1632,23 +1514,15 @@ fn start_judging(
     has_privileged: bool,
     use_cr_reset: bool,
     tx: &mpsc::Sender<Event>,
-    stderr: &mut io::Stderr,
-    style: &Style,
+    renderer: &mut ReplRenderer<W>,
 ) -> AgentState {
     // Resolve API key
     let api_key = match config.backend.anthropic.resolve_api_key() {
         Ok(key) => key,
         Err(e) => {
-            let _ = writeln!(stderr, "\r[ua] judge error: {e}");
+            renderer.emit_judge_error(&e.to_string());
             // Fall through to approval UI without judge
-            show_approval_ui(
-                commands,
-                &risk_levels,
-                has_privileged,
-                config,
-                style,
-                stderr,
-            );
+            show_approval_ui(commands, &risk_levels, has_privileged, config, renderer);
             return AgentState::Approving {
                 commands: commands.to_vec(),
                 iteration,
@@ -1660,8 +1534,7 @@ fn start_judging(
         }
     };
 
-    let _ = write!(stderr, "\r[ua] evaluating safety...");
-    let _ = stderr.flush();
+    renderer.emit_judging();
 
     let client = AnthropicClient::with_model(&api_key, &config.backend.anthropic.model);
     let commands_owned: Vec<String> = commands.to_vec();
@@ -1696,6 +1569,7 @@ fn start_judging(
 mod tests {
     use super::*;
     use crate::config::SecurityConfig;
+    use crate::renderer::ReplRenderer;
     use ua_protocol::ConversationMessage;
 
     // --- Tool use command extraction tests ---
@@ -2243,7 +2117,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let mut audit = AuditLogger::new(&path).unwrap();
         let config = gate_config(true, true); // judge enabled but should be skipped
-        let mut stderr = Vec::new();
+        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
 
         let action = classify_and_gate(
             vec!["ls /tmp".to_string()],
@@ -2252,8 +2126,7 @@ mod tests {
             false,
             &config,
             &mut audit,
-            &Style::disabled(),
-            &mut stderr,
+            &mut renderer,
         );
 
         assert!(matches!(action, CommandAction::AutoApprove { .. }));
@@ -2283,7 +2156,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let mut audit = AuditLogger::new(&path).unwrap();
         let config = gate_config(true, true); // judge enabled
-        let mut stderr = Vec::new();
+        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
 
         // Use "rm build" (not "rm -rf /...") to avoid the deny pattern
         let action = classify_and_gate(
@@ -2293,8 +2166,7 @@ mod tests {
             false,
             &config,
             &mut audit,
-            &Style::disabled(),
-            &mut stderr,
+            &mut renderer,
         );
 
         assert!(
@@ -2320,7 +2192,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let mut audit = AuditLogger::new(&path).unwrap();
         let config = gate_config(true, false); // judge disabled
-        let mut stderr = Vec::new();
+        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
 
         let action = classify_and_gate(
             vec!["rm build".to_string()],
@@ -2329,8 +2201,7 @@ mod tests {
             false,
             &config,
             &mut audit,
-            &Style::disabled(),
-            &mut stderr,
+            &mut renderer,
         );
 
         assert!(
@@ -2345,7 +2216,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let mut audit = AuditLogger::new(&path).unwrap();
         let config = gate_config(true, true); // judge enabled but should be skipped
-        let mut stderr = Vec::new();
+        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
 
         // curl | bash is denied by policy
         let action = classify_and_gate(
@@ -2355,8 +2226,7 @@ mod tests {
             false,
             &config,
             &mut audit,
-            &Style::disabled(),
-            &mut stderr,
+            &mut renderer,
         );
 
         assert!(matches!(action, CommandAction::Blocked { .. }));
@@ -2366,8 +2236,8 @@ mod tests {
         assert!(lines.iter().any(|l| l["type"] == "proposed"));
         assert!(lines.iter().any(|l| l["type"] == "blocked"));
 
-        // Verify stderr shows DENIED
-        let output = String::from_utf8_lossy(&stderr);
+        // Verify renderer output shows DENIED
+        let output = String::from_utf8_lossy(&renderer.writer);
         assert!(output.contains("DENIED"));
     }
 
@@ -2375,18 +2245,10 @@ mod tests {
     fn judge_gate_no_commands_returns_idle() {
         let mut audit = AuditLogger::noop();
         let config = gate_config(true, true);
-        let mut stderr = Vec::new();
+        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
 
-        let action = classify_and_gate(
-            vec![],
-            vec![],
-            0,
-            false,
-            &config,
-            &mut audit,
-            &Style::disabled(),
-            &mut stderr,
-        );
+        let action =
+            classify_and_gate(vec![], vec![], 0, false, &config, &mut audit, &mut renderer);
 
         assert!(matches!(action, CommandAction::NoCommands));
     }
@@ -2397,7 +2259,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let mut audit = AuditLogger::new(&path).unwrap();
         let config = gate_config(true, true); // judge enabled
-        let mut stderr = Vec::new();
+        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
 
         let action = classify_and_gate(
             vec!["sudo reboot".to_string()],
@@ -2406,8 +2268,7 @@ mod tests {
             false,
             &config,
             &mut audit,
-            &Style::disabled(),
-            &mut stderr,
+            &mut renderer,
         );
 
         assert!(matches!(action, CommandAction::Judge { .. }));
@@ -2423,15 +2284,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
         let mut audit = AuditLogger::new(&path).unwrap();
-        let mut stderr = Vec::new();
+        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
 
-        handle_judge_verdict(
-            &JudgeVerdict::Safe,
-            0,
-            &mut audit,
-            &Style::disabled(),
-            &mut stderr,
-        );
+        handle_judge_verdict(&JudgeVerdict::Safe, 0, &mut audit, &mut renderer);
 
         // Audit should have judge_result with safe: true
         let lines = read_audit_lines(&path);
@@ -2439,8 +2294,8 @@ mod tests {
         assert_eq!(lines[0]["type"], "judge_result");
         assert_eq!(lines[0]["safe"], true);
 
-        // Stderr should NOT have a warning
-        let output = String::from_utf8_lossy(&stderr);
+        // Renderer output should NOT have a warning
+        let output = String::from_utf8_lossy(&renderer.writer);
         assert!(!output.contains("\u{26a0}"));
     }
 
@@ -2449,12 +2304,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
         let mut audit = AuditLogger::new(&path).unwrap();
-        let mut stderr = Vec::new();
+        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
 
         let verdict = JudgeVerdict::Unsafe {
             reasoning: "Downloads and executes remote script".to_string(),
         };
-        handle_judge_verdict(&verdict, 2, &mut audit, &Style::disabled(), &mut stderr);
+        handle_judge_verdict(&verdict, 2, &mut audit, &mut renderer);
 
         // Audit should have judge_result with safe: false
         let lines = read_audit_lines(&path);
@@ -2466,8 +2321,8 @@ mod tests {
             "Downloads and executes remote script"
         );
 
-        // Stderr should have the warning
-        let output = String::from_utf8_lossy(&stderr);
+        // Renderer output should have the warning
+        let output = String::from_utf8_lossy(&renderer.writer);
         assert!(output.contains("\u{26a0}"));
         assert!(output.contains("Downloads and executes remote script"));
     }
@@ -2477,17 +2332,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
         let mut audit = AuditLogger::new(&path).unwrap();
-        let mut stderr = Vec::new();
+        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
 
         let verdict = JudgeVerdict::Error("connection timeout".to_string());
-        handle_judge_verdict(&verdict, 0, &mut audit, &Style::disabled(), &mut stderr);
+        handle_judge_verdict(&verdict, 0, &mut audit, &mut renderer);
 
         // No audit entry for errors
         let lines = read_audit_lines(&path);
         assert_eq!(lines.len(), 0);
 
-        // Stderr should have dimmed error note
-        let output = String::from_utf8_lossy(&stderr);
+        // Renderer output should have dimmed error note
+        let output = String::from_utf8_lossy(&renderer.writer);
         assert!(output.contains("judge:"));
         assert!(output.contains("connection timeout"));
         // With Style::disabled(), no ANSI codes are emitted
@@ -2502,7 +2357,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let mut audit = AuditLogger::new(&path).unwrap();
         let config = gate_config(true, true);
-        let mut stderr = Vec::new();
+        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
 
         // Step 1: Simulate ToolUse event producing "rm /tmp/foo"
         let commands = vec!["rm /tmp/foo".to_string()];
@@ -2516,19 +2371,12 @@ mod tests {
             false,
             &config,
             &mut audit,
-            &Style::disabled(),
-            &mut stderr,
+            &mut renderer,
         );
         assert!(matches!(action, CommandAction::Judge { .. }));
 
         // Step 3: handle_judge_verdict(Safe)
-        handle_judge_verdict(
-            &JudgeVerdict::Safe,
-            0,
-            &mut audit,
-            &Style::disabled(),
-            &mut stderr,
-        );
+        handle_judge_verdict(&JudgeVerdict::Safe, 0, &mut audit, &mut renderer);
 
         // Step 4: Verify audit trail has both entries
         let lines = read_audit_lines(&path);
@@ -2547,7 +2395,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let mut audit = AuditLogger::new(&path).unwrap();
         let config = gate_config(true, true);
-        let mut stderr = Vec::new();
+        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
 
         // Step 1: classify_and_gate → Judge
         let action = classify_and_gate(
@@ -2557,8 +2405,7 @@ mod tests {
             false,
             &config,
             &mut audit,
-            &Style::disabled(),
-            &mut stderr,
+            &mut renderer,
         );
         assert!(
             matches!(action, CommandAction::Judge { .. }),
@@ -2569,10 +2416,10 @@ mod tests {
         let verdict = JudgeVerdict::Unsafe {
             reasoning: "Deletes build directory".to_string(),
         };
-        handle_judge_verdict(&verdict, 0, &mut audit, &Style::disabled(), &mut stderr);
+        handle_judge_verdict(&verdict, 0, &mut audit, &mut renderer);
 
         // Step 3: Verify warning was printed
-        let output = String::from_utf8_lossy(&stderr);
+        let output = String::from_utf8_lossy(&renderer.writer);
         assert!(output.contains("\u{26a0}"));
         assert!(output.contains("Deletes build directory"));
 

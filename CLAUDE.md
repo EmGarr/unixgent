@@ -102,6 +102,7 @@ ua-core/src/
   config.rs        Config loading (shell, backend, context, journal)
   context.rs       OutputHistory ring buffer, ANSI stripping, context assembly
   journal.rs       Append-only session journal (JSONL), context builder from journal
+  renderer.rs      ReplRenderer<W>: testable REPL display output (Linus forward-flow design)
   display.rs       Response stream accumulator (PlanDisplay)
   process.rs       Process introspection: depth counting, child CWD resolution
   shell_scripts.rs Shell integration scripts (bash/zsh/fish)

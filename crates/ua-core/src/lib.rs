@@ -10,6 +10,7 @@ pub mod osc;
 pub mod policy;
 pub mod process;
 pub mod pty;
+pub mod renderer;
 pub mod repl;
 pub mod shell_scripts;
 pub mod style;
