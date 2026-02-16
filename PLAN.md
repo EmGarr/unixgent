@@ -161,7 +161,7 @@ Cannot read `~/.ssh`. Proxy enforces domain allowlist.
 
 ---
 
-## Phase 5: Display Redesign — Shell-Native Agent UI — DRAFT
+## Phase 5: Display Redesign — Shell-Native Agent UI — WIP
 
 **No TUI. No sidecar files. No cursor gymnastics. Just files and lines.**
 
@@ -245,20 +245,20 @@ Parent reads just this one line (seek to end, scan back) to get the fold view.
 
 | # | Sub-task | Status | Files | Notes |
 |---|----------|--------|-------|-------|
-| 1 | Stop ignoring `StreamEvent::Usage` | TODO | `repl.rs`, `batch.rs`, `display.rs` | Three `{ .. } => {}` arms → accumulate in `PlanDisplay` |
-| 2 | Token counter in PlanDisplay | TODO | `display.rs` | `input_tokens: u32, output_tokens: u32`, summed per response |
-| 3 | Footer stats line | TODO | `repl.rs` | `{in}↑ {out}↓  {n} cmds  {t}s` — dim, after each interaction |
+| 1 | Stop ignoring `StreamEvent::Usage` | DONE | `repl.rs`, `batch.rs`, `display.rs` | Accumulated in PlanDisplay, surfaced in footer |
+| 2 | Token counter in PlanDisplay | DONE | `display.rs` | `input_tokens: u32, output_tokens: u32`, summed per response |
+| 3 | Footer stats line | DONE | `repl.rs` | `{in}↑ {out}↓  {n} cmds  {t}s` — dim, after each interaction |
 | 4 | Inline risk tags on proposed commands | DONE | `renderer.rs`, `repl.rs` | `❯ cmd  ▐ risk` via `ReplRenderer::emit_command_risk()` |
 | 5 | Judge reasoning as inline warning | DONE | `renderer.rs`, `repl.rs` | `⚠ reason` via `emit_judge_warning()` + `emit_judge_note()` |
 | 6 | Rework approval UI | DONE | `renderer.rs`, `repl.rs` | `[y] run  [n] skip  [e] edit` via `emit_approval_prompt()` |
 | 7 | Thinking display as dim comment | DONE | `renderer.rs`, `repl.rs` | `# summary` via `emit_thinking_line()`. Full thinking in journal only. |
 | 8 | Braille spinner | DONE | `renderer.rs`, `repl.rs` | `⠋ thinking...` via `emit_spinner_tick()`. `SPINNER_FRAMES` in renderer. |
 | 9 | Terminal width detection in REPL | DONE | `renderer.rs` | `ReplRenderer::new()` queries `crossterm::terminal::size()` |
-| 10 | PID-based batch journal paths | TODO | `batch.rs`, `journal.rs` | `agent-{pid}.jsonl` for batch mode, keep `s{hex}` for REPL |
-| 11 | `Summary` journal entry on batch exit | TODO | `journal.rs`, `batch.rs` | Final JSONL line with totals, written in `run_batch()` cleanup |
-| 12 | Parent reads child journals | TODO | `repl.rs` or new | On child PID exit: construct path, read `Summary` line, print fold |
-| 13 | Subagent status lines | TODO | `repl.rs` | `[PID] task ···` on spawn, `[PID] task  done  stats` on exit |
-| 14 | `NO_COLOR` support | TODO | `repl.rs`, `batch.rs` | Respect `NO_COLOR` env var. Basic 8 colors only otherwise. |
+| 10 | PID-based batch journal paths | DONE | `batch.rs`, `journal.rs` | `agent-{pid}.jsonl` for batch mode, keep `s{hex}` for REPL |
+| 11 | `Summary` journal entry on batch exit | DONE | `journal.rs`, `batch.rs` | Final JSONL line with totals, written in `run_batch()` cleanup |
+| 12 | Parent reads child journals | DONE | `agents.rs`, `repl.rs` | On child PID exit: construct path, read `Summary` line, print fold |
+| 13 | Subagent status lines | DONE | `agents.rs`, `repl.rs` | `[PID] task ···` on spawn, `[PID] task  done  stats` on exit |
+| 14 | `NO_COLOR` support | DONE | `style.rs` | `Style::new()` checks `NO_COLOR` env var via `color_enabled()`. Both repl.rs and batch.rs use `Style::new()`. |
 
 ### Anticipated Issues
 
@@ -374,11 +374,12 @@ context via journal piping, children run in isolated journals. Static binary shi
 | ~~CWD stale — shows parent process directory~~ | ~~High~~ | FIXED — `build_shell_context()` now queries child shell CWD via OS APIs (`proc_pidinfo` with `PROC_PIDVNODEPATHINFO` on macOS, `readlink /proc/{pid}/cwd` on Linux). Falls back to parent's `current_dir()` if unavailable. |
 | ~~Hard iteration cap + no compaction~~ | ~~High~~ | FIXED — Replaced reactive compaction with append-only session journal (Ralph Loop). `SessionJournal` writes JSONL entries for all events. Each LLM call rebuilds conversation from journal with token budget (default 60k). No in-memory accumulation, no compaction LLM call. |
 | ~~REPL stuck after subagent completion~~ | ~~Medium~~ | FIXED — `line_buf.clear()` in AllDone and Failed handlers prevents stale content from blocking `#` detection after command execution completes. |
+| Subagent auto-approve is massively risky | Critical | Batch mode auto-approves ALL non-denied commands (write, destructive, network, privileged) with no judge and no user gate. A prompt-injected subagent can `rm -rf .`, `git push --force`, `curl` data to attacker, etc. The deny list only catches catastrophic patterns. **Phase 4.5 sandbox is the intended fix** — until then, subagents run with full user privileges. |
 | Command echo duplication | Medium | Every command shows twice — once as our `❯ cmd ▐ risk` preview and once as the PTY echo at the real shell prompt. Fix requires PTY echo suppression (temporarily disabling ECHO, or filtering the echo from PtyOutput). |
 | Shell integration sourcing unverified | Medium | No check that `source` succeeded; `clear` hack; temp file leak on panic. See DESIGN.md §19.2.5 |
-| StreamEvent::Usage tokens discarded | Low | `Usage { .. } => {}` in repl.rs, batch.rs, and display.rs. Token counts parsed from API but never stored or displayed. Phase 5 will fix. |
-| No subagent status protocol | Medium | Parent discovers children via process tree (PID only). No access to child task name, token count, command count, or safety stats. Fix: PID-based journal paths (`agent-{pid}.jsonl`) + `Summary` entry on batch exit. Journal IS the protocol. |
-| REPL has no terminal width detection | Low | batch.rs uses `crossterm::terminal::size()` but REPL does not. Needed for Phase 5 column-aware rendering. |
+| ~~StreamEvent::Usage tokens discarded~~ | ~~Low~~ | FIXED — Token counts accumulated in PlanDisplay, displayed in footer stats line |
+| ~~No subagent status protocol~~ | ~~Medium~~ | FIXED — PID-based journal paths (`agent-{pid}.jsonl`) + `Summary` entry on batch exit. Parent reads child journals via `agents.rs`. |
+| ~~REPL has no terminal width detection~~ | ~~Low~~ | FIXED — `ReplRenderer::new()` queries `crossterm::terminal::size()` |
 | ~~`try_wait()` polled on every event~~ | ~~Medium~~ | FIXED — Moved to PtyEof arm only, used for diagnostic logging. See DESIGN.md §19.2.6 |
 | ~~Thread handles discarded (fire-and-forget)~~ | ~~Medium~~ | FIXED — PTY reader JoinHandle stored and joined on exit. Stdin thread blocks on read (can't join portably). See DESIGN.md §19.2.8 |
 | ~~`looks_like_secret()` insufficient~~ | ~~Medium~~ | FIXED — Expanded with AWS keys (AKIA), JWTs (eyJ), Slack/GitLab/npm tokens, SSH private key content, high-entropy base64 heuristic. See DESIGN.md §19.2.9 |

@@ -400,6 +400,8 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
     let mut pending_user_command: Option<String> = None;
     // Captures terminal output between 133;C and 133;D for user commands.
     let mut user_cmd_capture: Option<OutputHistory> = None;
+    // Buffer PTY output during Approving/Judging to prevent interleaving.
+    let mut pty_buffer: Vec<u8> = Vec::new();
 
     // Initialize session journal
     let session_id = generate_session_id();
@@ -663,6 +665,8 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                             }
                             renderer.emit_cancelled();
                             state = AgentState::Idle;
+                            // Nudge shell to redisplay prompt below agent output
+                            let _ = session.write_all(b"\n");
                             pending_instruction = None;
                         }
                         // Other input is ignored during streaming
@@ -675,8 +679,16 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                             if let Some(tx) = cancel_tx.take() {
                                 let _ = tx.send(());
                             }
+                            // Flush buffered PTY output before leaving Judging
+                            if !pty_buffer.is_empty() {
+                                stdout.write_all(&pty_buffer)?;
+                                stdout.flush()?;
+                                pty_buffer.clear();
+                            }
                             renderer.emit_cancelled();
                             state = AgentState::Idle;
+                            // Nudge shell to redisplay prompt below agent output
+                            let _ = session.write_all(b"\n");
                         }
                         // Other input is ignored during judging
                     }
@@ -703,6 +715,12 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                                 ..
                                             } = std::mem::replace(&mut state, AgentState::Idle)
                                             {
+                                                // Flush buffered PTY output before leaving Approving
+                                                if !pty_buffer.is_empty() {
+                                                    stdout.write_all(&pty_buffer)?;
+                                                    stdout.flush()?;
+                                                    pty_buffer.clear();
+                                                }
                                                 audit.log_approved(
                                                     iteration,
                                                     "typed_yes",
@@ -741,12 +759,20 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                                     "user did not type yes",
                                                 );
                                             }
+                                            // Flush buffered PTY output before leaving Approving
+                                            if !pty_buffer.is_empty() {
+                                                stdout.write_all(&pty_buffer)?;
+                                                stdout.flush()?;
+                                                pty_buffer.clear();
+                                            }
                                             renderer.emit_skipped(Some("type 'yes' to approve"));
                                             total_input_tokens = 0;
                                             total_output_tokens = 0;
                                             total_commands = 0;
                                             turn_start = None;
                                             state = AgentState::Idle;
+                                            // Nudge shell to redisplay prompt below agent output
+                                            let _ = session.write_all(b"\n");
                                         }
                                         break;
                                     }
@@ -765,12 +791,20 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                                 "user cancelled",
                                             );
                                         }
+                                        // Flush buffered PTY output before leaving Approving
+                                        if !pty_buffer.is_empty() {
+                                            stdout.write_all(&pty_buffer)?;
+                                            stdout.flush()?;
+                                            pty_buffer.clear();
+                                        }
                                         renderer.emit_cancelled();
                                         total_input_tokens = 0;
                                         total_output_tokens = 0;
                                         total_commands = 0;
                                         turn_start = None;
                                         state = AgentState::Idle;
+                                        // Nudge shell to redisplay prompt below agent output
+                                        let _ = session.write_all(b"\n");
                                         break;
                                     }
                                     b if b >= 0x20 => {
@@ -793,6 +827,12 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                             ..
                                         } = std::mem::replace(&mut state, AgentState::Idle)
                                         {
+                                            // Flush buffered PTY output before leaving Approving
+                                            if !pty_buffer.is_empty() {
+                                                stdout.write_all(&pty_buffer)?;
+                                                stdout.flush()?;
+                                                pty_buffer.clear();
+                                            }
                                             audit.log_approved(
                                                 iteration,
                                                 "keystroke",
@@ -830,12 +870,20 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                                 "user pressed n",
                                             );
                                         }
+                                        // Flush buffered PTY output before leaving Approving
+                                        if !pty_buffer.is_empty() {
+                                            stdout.write_all(&pty_buffer)?;
+                                            stdout.flush()?;
+                                            pty_buffer.clear();
+                                        }
                                         renderer.emit_skipped(None);
                                         total_input_tokens = 0;
                                         total_output_tokens = 0;
                                         total_commands = 0;
                                         turn_start = None;
                                         state = AgentState::Idle;
+                                        // Nudge shell to redisplay prompt below agent output
+                                        let _ = session.write_all(b"\n");
                                         break;
                                     }
                                     b'e' | b'E' => {
@@ -859,6 +907,8 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                             total_commands = 0;
                             turn_start = None;
                             state = AgentState::Idle;
+                            // Nudge shell to redisplay prompt below agent output
+                            let _ = session.write_all(b"\n");
                             pending_instruction = None;
                         } else {
                             // Forward other input to PTY (user may interact with commands)
@@ -1025,6 +1075,8 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                     total_output_tokens = 0;
                                     total_commands = 0;
                                     state = AgentState::Idle;
+                                    // Nudge shell to redisplay prompt below agent output
+                                    let _ = session.write_all(b"\n");
                                 }
                                 CommandAction::Blocked { tool_use_ids: ids } => {
                                     if !ids.is_empty() {
@@ -1051,6 +1103,8 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                     total_commands = 0;
                                     turn_start = None;
                                     state = AgentState::Idle;
+                                    // Nudge shell to redisplay prompt below agent output
+                                    let _ = session.write_all(b"\n");
                                     continue;
                                 }
                                 CommandAction::AutoApprove {
@@ -1143,6 +1197,12 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                     ..
                 } = std::mem::replace(&mut state, AgentState::Idle)
                 {
+                    // Flush buffered PTY output before leaving Judging
+                    if !pty_buffer.is_empty() {
+                        stdout.write_all(&pty_buffer)?;
+                        stdout.flush()?;
+                        pty_buffer.clear();
+                    }
                     handle_judge_verdict(&verdict, iteration, &mut audit, &mut renderer);
 
                     // Proceed to approval UI regardless of verdict
@@ -1164,8 +1224,21 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                 }
             }
             Event::PtyOutput(data) => {
-                stdout.write_all(&data)?;
-                stdout.flush()?;
+                // Buffer PTY output during Approving/Judging to prevent
+                // zsh job notifications from corrupting the approval UI.
+                if matches!(
+                    state,
+                    AgentState::Approving { .. } | AgentState::Judging { .. }
+                ) {
+                    pty_buffer.extend_from_slice(&data);
+                } else {
+                    if !pty_buffer.is_empty() {
+                        stdout.write_all(&pty_buffer)?;
+                        pty_buffer.clear();
+                    }
+                    stdout.write_all(&data)?;
+                    stdout.flush()?;
+                }
 
                 // Feed to output history
                 output_history.feed(&data);
@@ -1304,6 +1377,8 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                             renderer.emit_command_failed(code);
                             line_buf.clear();
                             state = AgentState::Idle;
+                            // Nudge shell to redisplay prompt below agent output
+                            let _ = session.write_all(b"\n");
                         }
                         QueueEvent::None => {}
                     }
@@ -1352,24 +1427,35 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                         .into_iter()
                         .collect();
 
+                // Suppress status emissions during Approving/Judging to prevent
+                // child status lines from corrupting the approval UI.
+                let suppress_emissions = matches!(
+                    state,
+                    AgentState::Approving { .. } | AgentState::Judging { .. }
+                );
+
                 // New children: appeared since last poll
                 for &pid in current_pids.difference(&known_children) {
-                    let journal_path = sessions_dir.join(format!("agent-{pid}.jsonl"));
-                    let task = agents::read_child_task(&journal_path, 40)
-                        .unwrap_or_else(|| "agent".to_string());
-                    let line = agents::format_child_started(pid, &task, renderer.style());
-                    renderer.emit_child_started(&line);
+                    if !suppress_emissions {
+                        let journal_path = sessions_dir.join(format!("agent-{pid}.jsonl"));
+                        let task = agents::read_child_task(&journal_path, 40)
+                            .unwrap_or_else(|| "agent".to_string());
+                        let line = agents::format_child_started(pid, &task, renderer.style());
+                        renderer.emit_child_started(&line);
+                    }
                 }
 
                 // Disappeared children: were known, now gone
                 for &pid in known_children.difference(&current_pids) {
-                    let journal_path = sessions_dir.join(format!("agent-{pid}.jsonl"));
-                    let task = agents::read_child_task(&journal_path, 40)
-                        .unwrap_or_else(|| "agent".to_string());
-                    if let Some(summary) = agents::read_child_summary(&journal_path) {
-                        let line =
-                            agents::format_child_done(pid, &task, &summary, renderer.style());
-                        renderer.emit_child_done(&line);
+                    if !suppress_emissions {
+                        let journal_path = sessions_dir.join(format!("agent-{pid}.jsonl"));
+                        let task = agents::read_child_task(&journal_path, 40)
+                            .unwrap_or_else(|| "agent".to_string());
+                        if let Some(summary) = agents::read_child_summary(&journal_path) {
+                            let line =
+                                agents::format_child_done(pid, &task, &summary, renderer.style());
+                            renderer.emit_child_done(&line);
+                        }
                     }
                 }
 
@@ -2435,5 +2521,198 @@ mod tests {
 
         // The state would proceed to Approving (warn+confirm, not hard block)
         // — verified by the fact that handle_judge_verdict doesn't return a "block" signal
+    }
+
+    // --- PTY buffering during Approving/Judging tests ---
+
+    /// Test that PTY data is buffered when state matches Approving/Judging,
+    /// and flushed to stdout when state does not match.
+    #[test]
+    fn pty_buffer_accumulates_during_approving() {
+        let state = AgentState::Approving {
+            commands: vec!["ls".to_string()],
+            iteration: 0,
+            tool_use_ids: vec!["toolu_1".to_string()],
+            has_privileged: false,
+            yes_buffer: String::new(),
+            use_cr_reset: false,
+        };
+        let mut pty_buffer: Vec<u8> = Vec::new();
+        let mut stdout_buf: Vec<u8> = Vec::new();
+
+        let data = b"[1] + 37597 done  unixagent\n";
+        // Simulate PtyOutput handler logic
+        if matches!(
+            state,
+            AgentState::Approving { .. } | AgentState::Judging { .. }
+        ) {
+            pty_buffer.extend_from_slice(data);
+        } else {
+            if !pty_buffer.is_empty() {
+                stdout_buf.extend_from_slice(&pty_buffer);
+                pty_buffer.clear();
+            }
+            stdout_buf.extend_from_slice(data);
+        }
+
+        // Buffer should hold the data; stdout should be empty
+        assert_eq!(pty_buffer, data);
+        assert!(stdout_buf.is_empty());
+    }
+
+    #[test]
+    fn pty_buffer_accumulates_during_judging() {
+        let (cancel_tx, _cancel_rx) = oneshot::channel::<()>();
+        let state = AgentState::Judging {
+            commands: vec!["rm build".to_string()],
+            iteration: 0,
+            tool_use_ids: vec!["toolu_2".to_string()],
+            risk_levels: vec![],
+            has_privileged: false,
+            cancel_tx: Some(cancel_tx),
+            use_cr_reset: false,
+        };
+        let mut pty_buffer: Vec<u8> = Vec::new();
+        let mut stdout_buf: Vec<u8> = Vec::new();
+
+        let data = b"[1] + 12345 done  some_bg_job\n";
+        if matches!(
+            state,
+            AgentState::Approving { .. } | AgentState::Judging { .. }
+        ) {
+            pty_buffer.extend_from_slice(data);
+        } else {
+            if !pty_buffer.is_empty() {
+                stdout_buf.extend_from_slice(&pty_buffer);
+                pty_buffer.clear();
+            }
+            stdout_buf.extend_from_slice(data);
+        }
+
+        assert_eq!(pty_buffer, data);
+        assert!(stdout_buf.is_empty());
+    }
+
+    #[test]
+    fn pty_buffer_flushes_on_idle() {
+        let state = AgentState::Idle;
+        let mut pty_buffer: Vec<u8> = b"buffered job notification\n".to_vec();
+        let mut stdout_buf: Vec<u8> = Vec::new();
+
+        let data = b"normal pty output";
+        if matches!(
+            state,
+            AgentState::Approving { .. } | AgentState::Judging { .. }
+        ) {
+            pty_buffer.extend_from_slice(data);
+        } else {
+            if !pty_buffer.is_empty() {
+                stdout_buf.extend_from_slice(&pty_buffer);
+                pty_buffer.clear();
+            }
+            stdout_buf.extend_from_slice(data);
+        }
+
+        // Buffer should be drained; stdout should have both buffered + new data
+        assert!(pty_buffer.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&stdout_buf),
+            "buffered job notification\nnormal pty output"
+        );
+    }
+
+    #[test]
+    fn pty_buffer_empty_no_extra_flush() {
+        let state = AgentState::Idle;
+        let mut pty_buffer: Vec<u8> = Vec::new();
+        let mut stdout_buf: Vec<u8> = Vec::new();
+
+        let data = b"normal output";
+        if matches!(
+            state,
+            AgentState::Approving { .. } | AgentState::Judging { .. }
+        ) {
+            pty_buffer.extend_from_slice(data);
+        } else {
+            if !pty_buffer.is_empty() {
+                stdout_buf.extend_from_slice(&pty_buffer);
+                pty_buffer.clear();
+            }
+            stdout_buf.extend_from_slice(data);
+        }
+
+        // Only the new data, no prefix from empty buffer
+        assert_eq!(String::from_utf8_lossy(&stdout_buf), "normal output");
+    }
+
+    // --- ChildPoll suppression tests ---
+
+    #[test]
+    fn child_poll_suppressed_during_approving() {
+        let state = AgentState::Approving {
+            commands: vec!["ls".to_string()],
+            iteration: 0,
+            tool_use_ids: vec![],
+            has_privileged: false,
+            yes_buffer: String::new(),
+            use_cr_reset: false,
+        };
+        let suppress = matches!(
+            state,
+            AgentState::Approving { .. } | AgentState::Judging { .. }
+        );
+        assert!(suppress);
+    }
+
+    #[test]
+    fn child_poll_suppressed_during_judging() {
+        let (cancel_tx, _cancel_rx) = oneshot::channel::<()>();
+        let state = AgentState::Judging {
+            commands: vec![],
+            iteration: 0,
+            tool_use_ids: vec![],
+            risk_levels: vec![],
+            has_privileged: false,
+            cancel_tx: Some(cancel_tx),
+            use_cr_reset: false,
+        };
+        let suppress = matches!(
+            state,
+            AgentState::Approving { .. } | AgentState::Judging { .. }
+        );
+        assert!(suppress);
+    }
+
+    #[test]
+    fn child_poll_not_suppressed_during_idle() {
+        let state = AgentState::Idle;
+        let suppress = matches!(
+            state,
+            AgentState::Approving { .. } | AgentState::Judging { .. }
+        );
+        assert!(!suppress);
+    }
+
+    #[test]
+    fn child_poll_not_suppressed_during_streaming() {
+        let (cancel_tx, _) = oneshot::channel::<()>();
+        let state = AgentState::Streaming {
+            cancel_tx: Some(cancel_tx),
+            display: PlanDisplay::new(),
+            is_thinking: false,
+            thinking_text: String::new(),
+            iteration: 0,
+            tool_commands: vec![],
+            tool_cr_resets: vec![],
+            tool_uses: vec![],
+            stream_start: Instant::now(),
+            spinner_frame: 0,
+            thinking_first_line_shown: false,
+        };
+        let suppress = matches!(
+            state,
+            AgentState::Approving { .. } | AgentState::Judging { .. }
+        );
+        assert!(!suppress);
     }
 }
