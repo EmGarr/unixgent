@@ -299,9 +299,19 @@ Terminal: {}x{}",
          Observe before acting: review the terminal output and working directory above \
          to understand the current state before running commands.\
          \n\n\
-         Your conversation context is rebuilt from a session journal with a token budget. \
-         Very old entries may no longer be visible to you. If you need to preserve \
-         important information across many turns, write it to a file.\
+         CONTEXT MANAGEMENT\n\
+         \n\
+         Your context window is finite (~200k tokens). Treat the filesystem as your \
+         working memory — it has no size limit.\n\
+         \n\
+         - Peek before reading: inspect structure first (wc -l, head -20, find, tree). \
+         Narrow with grep/awk before reading full content.\n\
+         - Write intermediate results to files, not your response. Subagents and future \
+         turns can read files — pass paths, not prose summaries.\n\
+         - Never try to hold large outputs in conversation. Redirect to files and \
+         inspect programmatically.\n\
+         - Your conversation context is rebuilt from a session journal with a token budget. \
+         Very old entries may no longer be visible. Persist important state to files.\
          \n\n\
          Act, don't describe. Think in your thinking block, act in your response. \
          For simple tasks, execute commands directly. For complex multi-step tasks, \

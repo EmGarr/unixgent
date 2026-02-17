@@ -342,40 +342,63 @@ pub fn build_agent_capabilities_prompt(depth: u32, max_depth: u32) -> String {
              shell commands, and prints its final answer to stdout. Each subagent can \
              handle ~200k tokens of context and runs its own multi-step tool use loop.\n\
              \n\
-             DECOMPOSE FIRST: For any task with 3+ steps, your first action should be to \
-             decompose it into independent subtasks and delegate them. Be an orchestrator, \
-             not a sequential executor. Each subagent runs its own multi-step reasoning \
-             chain with a fresh context window — use this aggressively.\n\
+             WHEN TO DELEGATE\n\
              \n\
-             Parallel delegation is your most powerful tool:\n\
+             Delegate when the task exceeds what fits in a single context window:\n\
+             - Data scale: files, logs, or outputs too large to read in one shot\n\
+             - Breadth: multiple independent subtasks that can run in parallel\n\
+             - Depth: multi-step reasoning chains that each need a fresh context\n\
              \n\
+             Do NOT delegate simple one-shot commands, tasks under 3 steps that fit in \
+             your context, or tasks that depend on your current conversation state.\n\
+             \n\
+             DECOMPOSITION STRATEGIES\n\
+             \n\
+             Choose the pattern that matches your task:\n\
+             \n\
+             Fan-out (parallel independent tasks):\n\
              \x20 {exe} \"subtask A\" > /tmp/a.txt 2>/dev/null &\n\
              \x20 {exe} \"subtask B\" > /tmp/b.txt 2>/dev/null &\n\
-             \x20 {exe} \"subtask C\" > /tmp/c.txt 2>/dev/null &\n\
-             \x20 wait\n\
-             \x20 cat /tmp/a.txt /tmp/b.txt /tmp/c.txt\n\
+             \x20 wait && cat /tmp/a.txt /tmp/b.txt\n\
              \n\
-             When NOT to delegate:\n\
-             - Simple one-shot commands (just run them directly)\n\
-             - Tasks that require fewer than 3 steps total\n\
-             - Tasks that depend on your current conversation state and cannot be isolated\n\
+             Chunk-map-reduce (large data → partition → parallel process → aggregate):\n\
+             \x20 split -l 500 huge.log /tmp/chunk_\n\
+             \x20 for f in /tmp/chunk_*; do\n\
+             \x20   {exe} \"Analyze $f for error patterns. Output: one line per pattern found.\" > ${{f}}.out 2>/dev/null &\n\
+             \x20 done\n\
+             \x20 wait && cat /tmp/chunk_*.out | sort | uniq -c | sort -rn\n\
              \n\
-             Tips:\n\
-             - Give each subagent a specific, self-contained instruction\n\
-             - Include enough context in the instruction for the subagent to work independently\n\
-             - Prefer many small focused subagents over one large sequential execution\n\
-             - Collect and synthesize results from subagents rather than re-doing their work\n\
+             Peek-then-delegate (unknown structure → sample → targeted delegation):\n\
+             \x20 # First, inspect structure yourself:\n\
+             \x20 wc -l data.csv && head -5 data.csv\n\
+             \x20 # Then delegate with specific knowledge:\n\
+             \x20 {exe} \"data.csv has 50k rows, cols: id,name,amount,date. Find all rows where amount > 10000.\"\n\
              \n\
-             JOURNAL CONTEXT SHARING\n\
+             WRITING EFFECTIVE SUBAGENT INSTRUCTIONS\n\
              \n\
-             You can share selective journal context with subagents:\n\
+             Each subagent starts with zero context. Your instruction is everything it knows.\n\
              \n\
-             \x20 # Share commands run so far:\n\
+             - State the specific question or task, not a vague goal\n\
+             - Include the file path(s) or data the subagent should work with\n\
+             - Specify the expected output format (one line per item, JSON, etc.)\n\
+             - Embed relevant context via command substitution when needed:\n\
              \x20 {exe} \"$(jq -r 'select(.type==\"shell_command\") | .command' $UNIXAGENT_JOURNAL) \
              Which of these modified config files?\"\n\
              \n\
-             \x20 # Share full journal context:\n\
-             \x20 {exe} \"$(cat $UNIXAGENT_JOURNAL) Continue this work: <specific task>\"\n\
+             Bad:  {exe} \"check the code\"\n\
+             Good: {exe} \"In src/auth.rs, find all unwrap() calls that could panic on user \
+             input. Output: file:line for each.\"\n\
+             \n\
+             RESULT AGGREGATION\n\
+             \n\
+             After subagents complete, synthesize — don't just concatenate:\n\
+             - Read all outputs: cat /tmp/*.out\n\
+             - Look for conflicts, duplicates, or complementary findings\n\
+             - Your final answer combines subagent work into a coherent response\n\
+             \n\
+             Write subagent results to files, not your context. Pass file paths to \
+             downstream subagents. Avoid re-reading large outputs into your conversation \
+             when a subagent can read them directly from disk.\n\
              \n\
              Subagents share the working directory, filesystem, and audit log. \
              They enforce the same security policy (deny list). \
@@ -769,11 +792,15 @@ mod tests {
     }
 
     #[test]
-    fn agent_capabilities_prompt_journal_sharing_only_with_delegation() {
+    fn agent_capabilities_prompt_strategies_only_with_delegation() {
         let with_delegation = build_agent_capabilities_prompt(0, 3);
         assert!(
-            with_delegation.contains("JOURNAL CONTEXT SHARING"),
-            "sharing section should be present when delegation is allowed"
+            with_delegation.contains("DECOMPOSITION STRATEGIES"),
+            "strategies section should be present when delegation is allowed"
+        );
+        assert!(
+            with_delegation.contains("RESULT AGGREGATION"),
+            "aggregation section should be present when delegation is allowed"
         );
 
         let without_delegation = build_agent_capabilities_prompt(2, 3);
@@ -782,8 +809,8 @@ mod tests {
             "no delegation at depth limit"
         );
         assert!(
-            !without_delegation.contains("JOURNAL CONTEXT SHARING"),
-            "sharing section should be absent at depth limit"
+            !without_delegation.contains("DECOMPOSITION STRATEGIES"),
+            "strategies section should be absent at depth limit"
         );
     }
 }
