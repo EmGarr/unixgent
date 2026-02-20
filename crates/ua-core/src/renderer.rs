@@ -5,6 +5,7 @@
 //! method clears the spinner first, preventing spinner bleed into PTY output.
 
 use std::io::Write;
+use std::path::PathBuf;
 
 use crate::policy::RiskLevel;
 use crate::style::{format_tokens, Style};
@@ -281,6 +282,22 @@ impl<W: Write> ReplRenderer<W> {
         self.clear_spinner();
         let _ = write!(self.writer, "\r[ua] evaluating safety...");
         let _ = self.writer.flush();
+    }
+
+    /// Show sandbox warning at startup with writable paths.
+    pub fn emit_sandbox_warning(&mut self, writable_paths: &[PathBuf]) {
+        self.clear_spinner();
+        let paths: Vec<String> = writable_paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let _ = writeln!(
+            self.writer,
+            "\r{}sandbox: r/w access limited to {}{}",
+            self.style.dim_start(),
+            paths.join(", "),
+            self.style.reset(),
+        );
     }
 
     /// Show judge error.
@@ -726,5 +743,30 @@ mod tests {
         r.emit_judge_note("timeout connecting to judge");
         let s = output_str(&r);
         assert!(s.contains("judge: timeout connecting to judge"));
+    }
+
+    // ── Sandbox warning ─────────────────────────────────────────────────
+
+    #[test]
+    fn emit_sandbox_warning_no_ansi() {
+        let mut r = make_renderer(Style::disabled());
+        r.emit_sandbox_warning(&[PathBuf::from("/home/user/project"), PathBuf::from("/tmp")]);
+        let s = output_str(&r);
+        assert!(s.contains("sandbox:"), "should say sandbox:");
+        assert!(
+            s.contains("/home/user/project"),
+            "should list writable path"
+        );
+        assert!(s.contains("/tmp"), "should list /tmp");
+    }
+
+    #[test]
+    fn emit_sandbox_warning_with_ansi() {
+        let mut r = make_renderer(Style::force_enabled());
+        r.emit_sandbox_warning(&[PathBuf::from("/tmp")]);
+        let s = output_str(&r);
+        assert!(s.contains("\x1b[2m"), "should have dim codes");
+        assert!(s.contains("sandbox:"));
+        assert!(s.contains("/tmp"));
     }
 }

@@ -1,5 +1,6 @@
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::io::{self, Read, Write};
+use ua_sandbox::SandboxPolicy;
 
 use crate::shell_scripts::{detect_shell, integration_script};
 
@@ -14,7 +15,14 @@ pub struct PtySession {
 impl PtySession {
     /// Spawn a shell in a PTY. Returns the session and a reader for the PTY output.
     /// The reader is returned separately so it can be moved to a different thread.
-    pub fn spawn(shell_cmd: &str, integration: bool) -> io::Result<(Self, Box<dyn Read + Send>)> {
+    ///
+    /// When `sandbox_policy` is `Some`, the shell runs inside an OS-level sandbox
+    /// via `unixagent --sandbox-exec`. When `None`, the shell runs directly (existing behavior).
+    pub fn spawn(
+        shell_cmd: &str,
+        integration: bool,
+        sandbox_policy: Option<&SandboxPolicy>,
+    ) -> io::Result<(Self, Box<dyn Read + Send>)> {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
 
         let pty_system = native_pty_system();
@@ -44,9 +52,21 @@ impl PtySession {
             None
         };
 
-        let mut cmd = CommandBuilder::new(shell_cmd);
-        // Pass -l for login shell behavior (profile sourcing).
-        cmd.arg("-l");
+        let mut cmd = if let Some(policy) = sandbox_policy {
+            // Sandbox mode: run via `unixagent --sandbox-exec <shell> -l`
+            let exe = std::env::current_exe().map_err(io::Error::other)?;
+            let mut c = CommandBuilder::new(exe);
+            c.arg("--sandbox-exec");
+            c.arg(shell_cmd);
+            c.arg("-l");
+            c.env(ua_sandbox::policy::SANDBOX_ENV_VAR, policy.to_json());
+            c
+        } else {
+            let mut c = CommandBuilder::new(shell_cmd);
+            // Pass -l for login shell behavior (profile sourcing).
+            c.arg("-l");
+            c
+        };
         // Start in the user's current directory.
         if let Ok(cwd) = std::env::current_dir() {
             cmd.cwd(cwd);
@@ -122,7 +142,8 @@ mod tests {
 
     #[test]
     fn spawn_and_echo() {
-        let (mut session, mut reader) = PtySession::spawn("/bin/sh", false).expect("spawn failed");
+        let (mut session, mut reader) =
+            PtySession::spawn("/bin/sh", false, None).expect("spawn failed");
 
         // Give the shell time to start
         thread::sleep(Duration::from_millis(200));

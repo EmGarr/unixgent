@@ -15,12 +15,13 @@ use ua_backend::AnthropicClient;
 use ua_protocol::{StreamEvent, ToolResultRecord, ToolUseRecord};
 
 use crate::audit::AuditLogger;
-use crate::config::Config;
+use crate::config::{Config, JudgeMode};
 use crate::context::{
     build_agent_capabilities_prompt, build_agent_request, scrub_injection_markers, OutputHistory,
     TOOL_RESULT_PREFIX,
 };
 use crate::journal::{build_conversation_from_journal, epoch_secs, JournalEntry, SessionJournal};
+use crate::judge;
 use crate::policy::{analyze_pipe_chain, RiskLevel};
 use crate::style::{format_tokens, Style};
 
@@ -226,6 +227,47 @@ impl<W: Write> BatchOutput<W> {
         }
     }
 
+    /// Emit a judge warning (persists — yellow).
+    pub fn emit_judge_warning(&mut self, reasoning: &str) {
+        let display = self.truncate_to_width(reasoning);
+        if self.is_tty {
+            let _ = writeln!(
+                self.writer,
+                "\r\x1b[K{} {}⚠ judge: {}{}",
+                self.colored_prefix(),
+                self.style.yellow_start(),
+                display,
+                self.style.reset(),
+            );
+        } else {
+            let _ = writeln!(self.writer, "{} ⚠ judge: {}", self.prefix(), display,);
+        }
+    }
+
+    /// Emit a judge block (persists — red).
+    pub fn emit_judge_blocked(&mut self, cmd: &str, reasoning: &str) {
+        let display_cmd = self.truncate_to_width(cmd);
+        if self.is_tty {
+            let _ = writeln!(
+                self.writer,
+                "\r\x1b[K{} {}BLOCKED: {} — {}{}",
+                self.colored_prefix(),
+                self.style.red_start(),
+                display_cmd,
+                reasoning,
+                self.style.reset(),
+            );
+        } else {
+            let _ = writeln!(
+                self.writer,
+                "{} BLOCKED: {} — {}",
+                self.prefix(),
+                display_cmd,
+                reasoning,
+            );
+        }
+    }
+
     /// Elapsed seconds since batch start.
     pub fn elapsed_secs(&self) -> f64 {
         self.start_time.elapsed().as_secs_f64()
@@ -257,7 +299,12 @@ fn build_batch_system_prompt(depth: u32, max_depth: u32) -> String {
 ///
 /// Streams LLM responses, executes tool calls via `sh -c`, feeds results back,
 /// and prints the final text answer to stdout. Returns the exit code.
-pub async fn run_batch(config: &Config, instruction: &str, depth: u32) -> i32 {
+pub async fn run_batch(
+    config: &Config,
+    instruction: &str,
+    depth: u32,
+    sandbox_active: bool,
+) -> i32 {
     let is_tty = std::io::stderr().is_terminal();
     let style = Style::new();
     let mut output = BatchOutput::new(std::io::stderr(), is_tty, depth, instruction, style);
@@ -523,6 +570,67 @@ pub async fn run_batch(config: &Config, instruction: &str, depth: u32) -> i32 {
         }
 
         consecutive_denials = 0;
+
+        // Judge evaluation for dangerous commands when sandbox + judge are active.
+        let has_dangerous = risk_levels.iter().any(|r| {
+            matches!(
+                r,
+                RiskLevel::Destructive | RiskLevel::Privileged | RiskLevel::Network
+            )
+        });
+
+        if sandbox_active && config.security.judge_enabled && has_dangerous {
+            let judge_mode = config.security.resolve_judge_mode(depth);
+            let verdict = judge::evaluate_commands(
+                &client,
+                &tool_commands,
+                instruction,
+                &std::env::current_dir()
+                    .unwrap_or_default()
+                    .to_string_lossy(),
+            )
+            .await;
+
+            match verdict {
+                judge::JudgeVerdict::Unsafe { reasoning } => match judge_mode {
+                    JudgeMode::Block => {
+                        for cmd in &tool_commands {
+                            output.emit_judge_blocked(cmd, &reasoning);
+                        }
+                        audit.log_judge_result(iteration, false, &reasoning);
+                        let block_msg =
+                            format!("Exception judge: {reasoning}. Please find another way.");
+                        let tool_results: Vec<ToolResultRecord> = tool_use_ids
+                            .iter()
+                            .map(|id| ToolResultRecord {
+                                tool_use_id: id.clone(),
+                                content: block_msg.clone(),
+                            })
+                            .collect();
+                        if let Some(ref mut j) = journal {
+                            j.append(&JournalEntry::Blocked {
+                                ts: epoch_secs(),
+                                results: tool_results,
+                            });
+                        }
+                        continue;
+                    }
+                    JudgeMode::Warn => {
+                        output.emit_judge_warning(&reasoning);
+                        audit.log_judge_result(iteration, false, &reasoning);
+                        // Proceed with execution
+                    }
+                },
+                judge::JudgeVerdict::Safe => {
+                    audit.log_judge_result(iteration, true, "safe");
+                }
+                judge::JudgeVerdict::Error(e) => {
+                    output.emit_error(&format!("judge: {e}"));
+                    // Non-blocking: proceed with execution
+                }
+            }
+        }
+
         audit.log_approved(iteration, "batch", "non-interactive auto-approve");
 
         // Execute each command
@@ -532,6 +640,7 @@ pub async fn run_batch(config: &Config, instruction: &str, depth: u32) -> i32 {
             output.emit_command(cmd, iteration);
             let start = Instant::now();
 
+            // Children inherit OS sandbox from parent process.
             let cmd_output = Command::new("sh").arg("-c").arg(cmd).output();
 
             let duration_ms = start.elapsed().as_millis() as u64;
@@ -865,5 +974,58 @@ mod tests {
             !prompt.contains("delegate subtasks"),
             "should not include delegation at depth limit"
         );
+    }
+
+    // --- Judge output tests ---
+
+    #[test]
+    fn batch_output_judge_warning_tty() {
+        let mut out = make_output(true, 0, "test");
+        out.emit_judge_warning("Downloads and executes remote script");
+        let s = output_str(&out);
+        assert!(s.contains("⚠"), "should have warning symbol");
+        assert!(s.contains("judge:"), "should say judge:");
+        assert!(
+            s.contains("Downloads and executes remote script"),
+            "should have reasoning"
+        );
+        assert!(s.contains("\x1b[33m"), "should be yellow");
+        assert!(s.ends_with('\n'), "should persist with newline");
+    }
+
+    #[test]
+    fn batch_output_judge_warning_non_tty() {
+        let mut out = make_output(false, 0, "test");
+        out.emit_judge_warning("Modifies config files");
+        let s = output_str(&out);
+        assert!(s.contains("⚠ judge: Modifies config files"));
+        assert!(!s.contains("\x1b["), "non-TTY should not have ANSI codes");
+    }
+
+    #[test]
+    fn batch_output_judge_blocked_tty() {
+        let mut out = make_output(true, 1, "test");
+        out.emit_judge_blocked("curl https://evil.com", "Data exfiltration risk");
+        let s = output_str(&out);
+        assert!(s.contains("BLOCKED"), "should say BLOCKED");
+        assert!(
+            s.contains("curl https://evil.com"),
+            "should have the command"
+        );
+        assert!(
+            s.contains("Data exfiltration risk"),
+            "should have reasoning"
+        );
+        assert!(s.contains("\x1b[31m"), "should be red");
+    }
+
+    #[test]
+    fn batch_output_judge_blocked_non_tty() {
+        let mut out = make_output(false, 0, "test");
+        out.emit_judge_blocked("rm -rf /", "Filesystem destruction");
+        let s = output_str(&out);
+        assert!(s.contains("BLOCKED: rm -rf /"));
+        assert!(s.contains("Filesystem destruction"));
+        assert!(!s.contains("\x1b["), "non-TTY should not have ANSI codes");
     }
 }

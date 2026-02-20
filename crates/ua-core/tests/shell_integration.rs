@@ -22,7 +22,8 @@ fn shell_available(name: &str) -> bool {
 
 /// Spawn a shell with integration, run a command, and collect OSC events.
 fn collect_osc_events(shell: &str, command: &str, timeout_ms: u64) -> Vec<OscEvent> {
-    let (mut session, mut reader) = PtySession::spawn(shell, true).expect("failed to spawn shell");
+    let (mut session, mut reader) =
+        PtySession::spawn(shell, true, None).expect("failed to spawn shell");
 
     let mut parser = OscParser::new();
     let mut events = Vec::new();

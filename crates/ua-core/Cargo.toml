@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 ua-protocol.workspace = true
 ua-backend.workspace = true
+ua-sandbox.workspace = true
 tokio.workspace = true
 futures.workspace = true
 serde.workspace = true

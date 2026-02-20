@@ -11,6 +11,7 @@ pub struct Config {
     pub context: ContextConfig,
     pub security: SecurityConfig,
     pub journal: JournalConfig,
+    pub sandbox: SandboxConfig,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -119,6 +120,16 @@ impl Default for ContextConfig {
     }
 }
 
+/// How the judge handles dangerous commands.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgeMode {
+    /// Show warning, still allow execution (main agent default).
+    Warn,
+    /// Return error to LLM, block execution (subagent default).
+    Block,
+}
+
 #[derive(Debug, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct SecurityConfig {
@@ -133,6 +144,9 @@ pub struct SecurityConfig {
     /// Enable LLM-based security judge for non-read-only commands.
     /// Adds latency (1-3s) and doubles API costs for evaluated batches.
     pub judge_enabled: bool,
+    /// Judge mode: "warn" shows warning (default for depth 0), "block" returns
+    /// error to LLM (default for depth > 0). If None, auto-detected from depth.
+    pub judge_mode: Option<JudgeMode>,
     /// Maximum nesting depth for batch-mode agent delegation.
     /// Verified via process tree inspection (tamper-proof).
     pub max_agent_depth: u32,
@@ -146,8 +160,43 @@ impl Default for SecurityConfig {
             audit_enabled: true,
             audit_log_path: None,
             judge_enabled: false,
+            judge_mode: None,
             max_agent_depth: 3,
         }
+    }
+}
+
+impl SecurityConfig {
+    /// Resolve the effective judge mode for a given nesting depth.
+    ///
+    /// If `judge_mode` is explicitly set in config, use that.
+    /// Otherwise: depth 0 → Warn, depth > 0 → Block.
+    pub fn resolve_judge_mode(&self, depth: u32) -> JudgeMode {
+        match &self.judge_mode {
+            Some(mode) => mode.clone(),
+            None => {
+                if depth == 0 {
+                    JudgeMode::Warn
+                } else {
+                    JudgeMode::Block
+                }
+            }
+        }
+    }
+
+    /// Resolve the audit log path, using the configured path or the XDG default.
+    pub fn resolve_audit_path(&self) -> PathBuf {
+        if let Some(ref custom) = self.audit_log_path {
+            return PathBuf::from(custom);
+        }
+
+        let base = std::env::var("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                PathBuf::from(home).join(".local").join("share")
+            });
+        base.join("unixagent").join("audit.jsonl")
     }
 }
 
@@ -189,20 +238,57 @@ impl JournalConfig {
     }
 }
 
-impl SecurityConfig {
-    /// Resolve the audit log path, using the configured path or the XDG default.
-    pub fn resolve_audit_path(&self) -> PathBuf {
-        if let Some(ref custom) = self.audit_log_path {
-            return PathBuf::from(custom);
-        }
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SandboxConfig {
+    /// Enable OS-level filesystem sandbox for batch-mode commands.
+    pub enabled: bool,
+    /// Paths the sandboxed process may write. Supports `$CWD` and `$HOME` placeholders.
+    pub writable_paths: Vec<String>,
+    /// Paths the sandboxed process may read. System paths added automatically.
+    pub readable_paths: Vec<String>,
+    /// Paths explicitly denied. Overrides readable/writable on supported platforms.
+    pub denied_paths: Vec<String>,
+}
 
-        let base = std::env::var("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                PathBuf::from(home).join(".local").join("share")
-            });
-        base.join("unixagent").join("audit.jsonl")
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            writable_paths: vec![
+                "$CWD".to_string(),
+                "/tmp".to_string(),
+                "$HOME/.local/share/unixagent".to_string(),
+            ],
+            readable_paths: vec![
+                "/usr".to_string(),
+                "/bin".to_string(),
+                "/sbin".to_string(),
+                "/lib".to_string(),
+                "/lib64".to_string(),
+                "/etc".to_string(),
+                "/opt".to_string(),
+                "/dev/null".to_string(),
+                "/dev/urandom".to_string(),
+                "/dev/tty".to_string(),
+            ],
+            denied_paths: vec![
+                "$HOME/.ssh".to_string(),
+                "$HOME/.gnupg".to_string(),
+                "$HOME/.aws".to_string(),
+            ],
+        }
+    }
+}
+
+impl SandboxConfig {
+    /// Build a `SandboxPolicy` from this config, resolving path placeholders.
+    pub fn to_policy(&self) -> ua_sandbox::SandboxPolicy {
+        ua_sandbox::SandboxPolicy::from_config(
+            &self.writable_paths,
+            &self.readable_paths,
+            &self.denied_paths,
+        )
     }
 }
 
@@ -447,6 +533,64 @@ conversation_budget = 30000
     }
 
     #[test]
+    fn sandbox_config_defaults() {
+        let cfg = SandboxConfig::default();
+        assert!(cfg.enabled);
+        assert!(cfg.writable_paths.contains(&"$CWD".to_string()));
+        assert!(cfg.writable_paths.contains(&"/tmp".to_string()));
+        assert!(cfg
+            .writable_paths
+            .contains(&"$HOME/.local/share/unixagent".to_string()));
+        assert!(cfg.denied_paths.contains(&"$HOME/.ssh".to_string()));
+        assert!(cfg.denied_paths.contains(&"$HOME/.aws".to_string()));
+    }
+
+    #[test]
+    fn parse_sandbox_config() {
+        let toml_str = r#"
+[sandbox]
+enabled = false
+writable_paths = ["/tmp", "/home/user/project"]
+readable_paths = ["/usr"]
+denied_paths = ["$HOME/.ssh"]
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(!cfg.sandbox.enabled);
+        assert_eq!(
+            cfg.sandbox.writable_paths,
+            vec!["/tmp", "/home/user/project"]
+        );
+        assert_eq!(cfg.sandbox.readable_paths, vec!["/usr"]);
+        assert_eq!(cfg.sandbox.denied_paths, vec!["$HOME/.ssh"]);
+    }
+
+    #[test]
+    fn sandbox_config_to_policy() {
+        let cfg = SandboxConfig::default();
+        let policy = cfg.to_policy();
+        // Policy should have CWD resolved
+        let cwd = std::env::current_dir().unwrap();
+        assert!(policy.writable.contains(&cwd));
+        assert!(policy.writable.contains(&PathBuf::from("/tmp")));
+        // Denied should have resolved $HOME
+        let home = std::env::var("HOME").unwrap();
+        assert!(policy
+            .denied
+            .contains(&PathBuf::from(format!("{home}/.ssh"))));
+    }
+
+    #[test]
+    fn parse_toml_without_sandbox_uses_defaults() {
+        let toml_str = r#"
+[shell]
+command = "/bin/bash"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.sandbox.enabled);
+        assert!(cfg.sandbox.writable_paths.contains(&"$CWD".to_string()));
+    }
+
+    #[test]
     fn resolve_api_key_cmd_failure_fallback() {
         // If api_key_cmd fails, should try env var
         let cfg = AnthropicConfig {
@@ -458,5 +602,81 @@ conversation_budget = 30000
         let result = cfg.resolve_api_key();
         // We can't assert success here since it depends on env, but we verify it doesn't panic
         let _ = result;
+    }
+
+    #[test]
+    fn parse_judge_mode_warn() {
+        let toml_str = r#"
+[security]
+judge_enabled = true
+judge_mode = "warn"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.security.judge_enabled);
+        assert_eq!(cfg.security.judge_mode, Some(JudgeMode::Warn));
+    }
+
+    #[test]
+    fn parse_judge_mode_block() {
+        let toml_str = r#"
+[security]
+judge_enabled = true
+judge_mode = "block"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.security.judge_enabled);
+        assert_eq!(cfg.security.judge_mode, Some(JudgeMode::Block));
+    }
+
+    #[test]
+    fn judge_mode_defaults_none() {
+        let cfg = SecurityConfig::default();
+        assert!(cfg.judge_mode.is_none());
+    }
+
+    #[test]
+    fn resolve_judge_mode_depth_zero_warn() {
+        let cfg = SecurityConfig::default();
+        assert_eq!(cfg.resolve_judge_mode(0), JudgeMode::Warn);
+    }
+
+    #[test]
+    fn resolve_judge_mode_depth_positive_block() {
+        let cfg = SecurityConfig::default();
+        assert_eq!(cfg.resolve_judge_mode(1), JudgeMode::Block);
+        assert_eq!(cfg.resolve_judge_mode(3), JudgeMode::Block);
+    }
+
+    #[test]
+    fn resolve_judge_mode_explicit_overrides_depth() {
+        let cfg = SecurityConfig {
+            judge_mode: Some(JudgeMode::Warn),
+            ..Default::default()
+        };
+        // Even at depth > 0, explicit Warn wins
+        assert_eq!(cfg.resolve_judge_mode(2), JudgeMode::Warn);
+
+        let cfg2 = SecurityConfig {
+            judge_mode: Some(JudgeMode::Block),
+            ..Default::default()
+        };
+        // Even at depth 0, explicit Block wins
+        assert_eq!(cfg2.resolve_judge_mode(0), JudgeMode::Block);
+    }
+
+    #[test]
+    fn security_config_defaults_include_judge_mode() {
+        let cfg = SecurityConfig::default();
+        assert!(cfg.judge_mode.is_none());
+        assert!(!cfg.judge_enabled);
+    }
+
+    #[test]
+    fn sandbox_default_denied_paths_no_config_dir() {
+        let cfg = SandboxConfig::default();
+        assert!(!cfg
+            .denied_paths
+            .contains(&"$HOME/.config/unixagent".to_string()));
+        assert!(cfg.denied_paths.contains(&"$HOME/.ssh".to_string()));
     }
 }

@@ -71,8 +71,9 @@ to run the full build + test + clippy suite on Linux.
 ```
 crates/
   ua-protocol/   Shared types, message definitions (no internal deps)
+  ua-sandbox/    OS-level filesystem sandbox (no internal deps — standalone)
   ua-backend/    LLM provider adapters (depends on ua-protocol)
-  ua-core/       Binary + agent logic (depends on ua-protocol, ua-backend)
+  ua-core/       Binary + agent logic (depends on ua-protocol, ua-backend, ua-sandbox)
 ```
 
 Dependency flow:
@@ -80,6 +81,7 @@ Dependency flow:
 ```
 ua-core → ua-backend → ua-protocol
       └───────────────┘
+      └→ ua-sandbox
 ```
 
 ### Key modules
@@ -94,12 +96,18 @@ ua-backend/src/
   anthropic.rs     Anthropic API client with SSE streaming + extended thinking
   mock.rs          Mock provider for testing (StreamEvent-level)
 
+ua-sandbox/src/
+  lib.rs           Public API: apply(), exec_sandboxed(), SandboxError
+  policy.rs        SandboxPolicy struct, path resolution, env var serialization
+  seatbelt.rs      macOS Seatbelt FFI (sandbox_init, SBPL generation)
+  landlock.rs      Linux Landlock implementation (ABI V5)
+
 ua-core/src/
-  main.rs          Entry point, CLI args, tokio runtime
+  main.rs          Entry point, CLI args, --sandbox-exec dispatch, sandbox-on-self, tokio runtime
   repl.rs          REPL loop, # detection, command extraction, OSC 133 dispatch
   pty.rs           PTY session management
   osc.rs           OSC 133 parser + terminal state machine
-  config.rs        Config loading (shell, backend, context, journal)
+  config.rs        Config loading (shell, backend, context, journal, security/JudgeMode)
   context.rs       OutputHistory ring buffer, ANSI stripping, context assembly
   journal.rs       Append-only session journal (JSONL), context builder from journal
   renderer.rs      ReplRenderer<W>: testable REPL display output (Linus forward-flow design)

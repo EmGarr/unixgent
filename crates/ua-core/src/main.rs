@@ -42,9 +42,21 @@ fn print_help() {
     println!("  --no-integration  Disable shell integration (OSC 133 injection)");
     println!("  --version         Print version");
     println!("  --help            Print this help");
+    println!();
+    println!("Internal:");
+    println!("  --sandbox-exec <cmd> [args...]  Apply sandbox and exec (used by agent)");
 }
 
 fn main() {
+    // --sandbox-exec: apply sandbox and exec command. Must happen before
+    // anything else — no panic hook, no config, no tokio runtime.
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.len() >= 3 && args[1] == "--sandbox-exec" {
+            ua_sandbox::exec_sandboxed(&args[2..]);
+        }
+    }
+
     // Install panic handler that restores terminal
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -68,6 +80,25 @@ fn main() {
     let no_integration = args.iter().any(|a| a == "--no-integration");
 
     let config = Config::load_or_default();
+
+    // Apply sandbox to agent process (children inherit).
+    // Must happen AFTER config load (needs to read ~/.config/unixagent/config.toml)
+    // and BEFORE any LLM-driven execution.
+    let sandbox_active = if config.sandbox.enabled {
+        let policy = config.sandbox.to_policy();
+        match ua_sandbox::apply(&policy) {
+            Ok(()) => {
+                eprintln!("[ua:sandbox] active");
+                true
+            }
+            Err(e) => {
+                eprintln!("[ua:sandbox] warning: failed to apply: {e}");
+                false
+            }
+        }
+    } else {
+        false
+    };
 
     // Detect batch mode: positional arg (non-flag) or piped stdin
     let non_flag_args: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
@@ -107,7 +138,7 @@ fn main() {
             }
         };
 
-        let code = runtime.block_on(run_batch(&config, &instruction, depth));
+        let code = runtime.block_on(run_batch(&config, &instruction, depth, sandbox_active));
         std::process::exit(code);
     }
 
@@ -148,7 +179,7 @@ fn main() {
         }
     };
 
-    let result = run_repl(&config, debug_osc, runtime.handle());
+    let result = run_repl(&config, debug_osc, runtime.handle(), sandbox_active);
 
     drop(guard);
 

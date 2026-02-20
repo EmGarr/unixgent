@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ua-core", "crates/ua-backend", "crates/ua-protocol"]
+members = ["crates/ua-core", "crates/ua-backend", "crates/ua-protocol", "crates/ua-sandbox"]
 
 [workspace.package]
 version = "0.1.0"
@@ -24,3 +24,4 @@ signal-hook = "0.3"
 libc = "0.2"
 ua-protocol = { path = "crates/ua-protocol" }
 ua-backend = { path = "crates/ua-backend" }
+ua-sandbox = { path = "crates/ua-sandbox" }

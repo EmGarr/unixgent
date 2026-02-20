@@ -1,6 +1,6 @@
 # UnixAgent — Implementation Plan
 
-**Last updated**: 2026-02-16
+**Last updated**: 2026-02-19
 
 This document tracks the implementation status of every phase and sub-task.
 It is the single source of truth for "where are we at". See DESIGN.md for
@@ -134,7 +134,7 @@ implementation — no OS-level sandbox yet (that's Phase 4.5).
 
 ---
 
-## Phase 4.5: OS-Level Sandbox — TODO
+## Phase 4.5: OS-Level Sandbox — WIP
 
 **See SECURITY.md sections 3.1–3.6 for full specification.**
 
@@ -142,18 +142,59 @@ Kernel-enforced sandbox for the child shell process. Filesystem isolation,
 network isolation via proxy, syscall filtering. This is the critical
 security layer — it works even when prompt injection succeeds.
 
+### Phase 4.5a: Filesystem Sandbox — DONE
+
+Independent `ua-sandbox` crate with Seatbelt (macOS) and Landlock (Linux).
+`--sandbox-exec` subcommand: parent serializes policy as JSON env var,
+child deserializes, applies sandbox, execs command.
+
 | Sub-task | Status | Files |
 |----------|--------|-------|
-| Linux: bubblewrap integration | TODO | `ua-core/src/sandbox/linux.rs` |
-| Linux: Landlock fallback | TODO | `ua-core/src/sandbox/landlock.rs` |
-| Linux: seccomp-bpf filter generation | TODO | `ua-core/src/sandbox/seccomp.rs` |
-| macOS: Seatbelt SBPL profile generation | TODO | `ua-core/src/sandbox/macos.rs` |
-| macOS: sandbox-exec integration | TODO | `ua-core/src/sandbox/macos.rs` |
-| Network proxy (HTTP/SOCKS5 on Unix socket) | TODO | `ua-core/src/sandbox/proxy.rs` |
-| Domain allowlist enforcement | TODO | `ua-core/src/sandbox/proxy.rs` |
-| Sandbox violation logging | TODO | `ua-core/src/sandbox/mod.rs` |
-| `[sandbox]` config section | TODO | `ua-core/src/config.rs` |
-| PTY spawn refactor (exec inside sandbox) | TODO | `ua-core/src/pty.rs` |
+| `ua-sandbox` crate (standalone, zero internal deps) | DONE | `crates/ua-sandbox/` |
+| `SandboxPolicy` with path resolution + serialization | DONE | `ua-sandbox/src/policy.rs` |
+| macOS: Seatbelt SBPL generation + `sandbox_init` FFI | DONE | `ua-sandbox/src/seatbelt.rs` |
+| Linux: Landlock ABI V5 with BestEffort compat | DONE | `ua-sandbox/src/landlock.rs` |
+| `exec_sandboxed()` entry point | DONE | `ua-sandbox/src/lib.rs` |
+| `--sandbox-exec` early detection in `main.rs` | DONE | `ua-core/src/main.rs` |
+| `SandboxConfig` with defaults | DONE | `ua-core/src/config.rs` |
+| Batch mode sandbox integration | DONE | `ua-core/src/batch.rs` |
+| PTY spawn sandbox parameter (infra, REPL passes None) | DONE | `ua-core/src/pty.rs` |
+| Deny list expansion (reverse shells, exfiltration, etc.) | DONE | `ua-core/src/policy.rs` |
+| Integration tests (allow /tmp, deny ~/.ssh, exit 126) | DONE | `ua-sandbox/tests/` |
+| 381 tests pass, `make check` clean | DONE | |
+
+### Phase 4.5a-2: Sandbox-on-Self + Judge Rework — DONE
+
+Sandbox applied to the agent process itself (children inherit via
+Seatbelt/Landlock). Judge refocused on dangerous/network commands only.
+Auto-approve normal reads/writes within sandbox boundaries.
+
+| Sub-task | Status | Files |
+|----------|--------|-------|
+| Remove `~/.config/unixagent` from denied paths (agent needs config) | DONE | `ua-sandbox/src/policy.rs`, `ua-core/src/config.rs` |
+| `JudgeMode` enum (Warn/Block) with depth-based auto-detection | DONE | `ua-core/src/config.rs` |
+| Apply sandbox to agent process in `main.rs` (before batch/REPL) | DONE | `ua-core/src/main.rs` |
+| Remove `--sandbox-exec` wrapping from batch.rs (children inherit) | DONE | `ua-core/src/batch.rs` |
+| Sandbox-aware `classify_and_gate()` (Write/ReadOnly/BuildTest → auto-approve) | DONE | `ua-core/src/repl.rs` |
+| Judge evaluation in batch mode (Block returns error to LLM) | DONE | `ua-core/src/batch.rs` |
+| `BatchOutput::emit_judge_warning()`, `emit_judge_blocked()` | DONE | `ua-core/src/batch.rs` |
+| Startup sandbox warning in REPL (`emit_sandbox_warning`) | DONE | `ua-core/src/renderer.rs`, `ua-core/src/repl.rs` |
+| New tests (sandbox-aware gate, judge mode, batch output, renderer) | DONE | `ua-core/src/repl.rs`, `ua-core/src/config.rs`, `ua-core/src/batch.rs`, `ua-core/src/renderer.rs` |
+| 454 tests pass, `make check` clean | DONE | |
+
+### Phase 4.5b: Network Proxy — TODO
+
+| Sub-task | Status | Files |
+|----------|--------|-------|
+| Network proxy (HTTP/SOCKS5 on Unix socket) | TODO | |
+| Domain allowlist enforcement | TODO | |
+
+### Phase 4.5c: Syscall Filtering — TODO
+
+| Sub-task | Status | Files |
+|----------|--------|-------|
+| Linux: bubblewrap namespace isolation | TODO | |
+| Linux: seccomp-bpf filter generation | TODO | |
 
 **Exit criteria**: Child shell runs in namespace/Seatbelt sandbox.
 Cannot write outside project directory. Cannot access network directly.
@@ -374,7 +415,7 @@ context via journal piping, children run in isolated journals. Static binary shi
 | ~~CWD stale — shows parent process directory~~ | ~~High~~ | FIXED — `build_shell_context()` now queries child shell CWD via OS APIs (`proc_pidinfo` with `PROC_PIDVNODEPATHINFO` on macOS, `readlink /proc/{pid}/cwd` on Linux). Falls back to parent's `current_dir()` if unavailable. |
 | ~~Hard iteration cap + no compaction~~ | ~~High~~ | FIXED — Replaced reactive compaction with append-only session journal (Ralph Loop). `SessionJournal` writes JSONL entries for all events. Each LLM call rebuilds conversation from journal with token budget (default 60k). No in-memory accumulation, no compaction LLM call. |
 | ~~REPL stuck after subagent completion~~ | ~~Medium~~ | FIXED — `line_buf.clear()` in AllDone and Failed handlers prevents stale content from blocking `#` detection after command execution completes. |
-| Subagent auto-approve is massively risky | Critical | Batch mode auto-approves ALL non-denied commands (write, destructive, network, privileged) with no judge and no user gate. A prompt-injected subagent can `rm -rf .`, `git push --force`, `curl` data to attacker, etc. The deny list only catches catastrophic patterns. **Phase 4.5 sandbox is the intended fix** — until then, subagents run with full user privileges. |
+| Subagent auto-approve partially mitigated | High | Batch mode auto-approves all non-denied commands but now runs them inside OS-level filesystem sandbox (Seatbelt on macOS, Landlock on Linux). Sandboxed commands can only write to CWD and /tmp, cannot read ~/.ssh/~/.aws/~/.gnupg. Deny list expanded with reverse shells, data exfiltration, credential theft, history tampering patterns. **Remaining gaps**: network not yet proxied (Phase 4.5b), no syscall filtering (Phase 4.5c). |
 | Command echo duplication | Medium | Every command shows twice — once as our `❯ cmd ▐ risk` preview and once as the PTY echo at the real shell prompt. Fix requires PTY echo suppression (temporarily disabling ECHO, or filtering the echo from PtyOutput). |
 | Shell integration sourcing unverified | Medium | No check that `source` succeeded; `clear` hack; temp file leak on panic. See DESIGN.md §19.2.5 |
 | ~~StreamEvent::Usage tokens discarded~~ | ~~Low~~ | FIXED — Token counts accumulated in PlanDisplay, displayed in footer stats line |
@@ -418,6 +459,7 @@ context via journal piping, children run in isolated journals. Static binary shi
 | Shell-native display over TUI overlay | 2026-02-15 | Original Phase 5 planned a ratatui TUI overlay with alternate screen. After prototyping 10 animated demos, decided against it: agent lives inside a real PTY, TUI chrome conflicts with shell output. Further refined: no cursor movement either — just forward-flowing lines on stderr. Subagent status via journal (already written) + PID-based paths (trivial change). No sidecar files, no IPC, no new protocols. The Unix answer: files that are already being written, made findable. |
 | ReplRenderer extraction (Linus forward-flow) | 2026-02-16 | Extracted ~30 ad-hoc `write!(stderr, ...)` calls from repl.rs into `ReplRenderer<W: Write>` in renderer.rs. Follows `BatchOutput<W>` pattern. Centralized `clear_spinner()` protocol: every persistent emit method clears spinner first, fixing spinner bleed into PTY output. Deleted `[ua] executing...` and `[ua] observing output` status lines. 30+ snapshot tests with `Vec<u8>` writer. |
 | Journal fidelity: user command output capture + output_mode | 2026-02-14 | `ShellCommand` journal entry gains `output: Option<String>` field (serde-default for backward compat). REPL captures terminal output between OSC 133;C and 133;D via `user_cmd_capture` buffer, mirroring how agent command output is captured. `convert_entries_to_messages()` appends output to `[ran: ...]` stub. Shell tool gains `output_mode` enum (`"full"` / `"final"`) — `"final"` mode uses `OutputHistory::with_cr_reset()` where `\r` clears `current_line`, collapsing progress bar output to only the final overwritten state. |
+| OS-level filesystem sandbox via `--sandbox-exec` | 2026-02-19 | Independent `ua-sandbox` crate with Seatbelt (macOS) + Landlock (Linux). Parent stays unsandboxed (needs API, journal, audit). Child commands run via `unixagent --sandbox-exec sh -c "cmd"` — policy serialized as JSON in `__UA_SANDBOX_POLICY` env var. Child deserializes, applies irreversible OS sandbox, execs. Seatbelt strategy: `(deny default)` + `(allow file*)` + `(deny file-write*)` + selective write allows. Landlock: default-deny, explicit PathBeneath rules. Batch mode wraps all commands; REPL passes `None` (human approval is the defense). Deny list expanded from 11 to 50+ patterns covering reverse shells, data exfiltration, credential theft, history tampering. |
 
 ---
 

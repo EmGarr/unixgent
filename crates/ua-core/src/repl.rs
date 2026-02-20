@@ -287,6 +287,7 @@ fn classify_and_gate<W: Write>(
     config: &Config,
     audit: &mut AuditLogger,
     renderer: &mut ReplRenderer<W>,
+    sandbox_active: bool,
 ) -> CommandAction {
     if commands.is_empty() {
         return CommandAction::NoCommands;
@@ -320,11 +321,31 @@ fn classify_and_gate<W: Write>(
         }
     }
 
-    // Auto-approve if all read-only
+    // Determine whether all commands are "safe" (sandbox-enforceable).
     let all_read_only = risk_levels.iter().all(|r| *r == RiskLevel::ReadOnly);
+    let all_sandbox_safe = risk_levels.iter().all(|r| {
+        matches!(
+            r,
+            RiskLevel::ReadOnly | RiskLevel::BuildTest | RiskLevel::Write
+        )
+    });
     let has_privileged = risk_levels.contains(&RiskLevel::Privileged);
 
-    if all_read_only && config.security.auto_approve_read_only {
+    // When sandbox is active, auto-approve Write/ReadOnly/BuildTest —
+    // the OS sandbox enforces WHERE, so only Destructive/Privileged/Network
+    // need human/judge review.
+    if sandbox_active && all_sandbox_safe {
+        audit.log_approved(iteration, "auto", "sandbox-safe commands");
+        for cmd in &commands {
+            renderer.emit_command_safe(cmd);
+        }
+        CommandAction::AutoApprove {
+            commands,
+            tool_use_ids,
+            iteration,
+            use_cr_reset,
+        }
+    } else if all_read_only && config.security.auto_approve_read_only {
         audit.log_approved(iteration, "auto", "all commands read-only");
         for cmd in &commands {
             renderer.emit_command_safe(cmd);
@@ -383,9 +404,15 @@ fn handle_judge_verdict<W: Write>(
     }
 }
 
-pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Result<()> {
+pub fn run_repl(
+    config: &Config,
+    debug_osc: bool,
+    rt_handle: &Handle,
+    sandbox_active: bool,
+) -> io::Result<()> {
     let shell_cmd = config.shell_command();
-    let (mut session, pty_reader) = PtySession::spawn(&shell_cmd, config.shell.integration)?;
+    // REPL passes None for sandbox — human approval is the defense here.
+    let (mut session, pty_reader) = PtySession::spawn(&shell_cmd, config.shell.integration, None)?;
     let mut parser = OscParser::new();
     let mut line_buf = String::new();
     let mut output_history = OutputHistory::new(config.context.max_terminal_lines);
@@ -532,6 +559,10 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
 
     let mut stdout = io::stdout().lock();
     let mut renderer = ReplRenderer::new(io::stderr(), style);
+
+    if sandbox_active {
+        renderer.emit_sandbox_warning(&config.sandbox.to_policy().writable);
+    }
 
     while let Ok(event) = rx.recv() {
         match event {
@@ -1057,6 +1088,7 @@ pub fn run_repl(config: &Config, debug_osc: bool, rt_handle: &Handle) -> io::Res
                                 config,
                                 &mut audit,
                                 &mut renderer,
+                                sandbox_active,
                             );
 
                             match action {
@@ -2213,6 +2245,7 @@ mod tests {
             &config,
             &mut audit,
             &mut renderer,
+            false,
         );
 
         assert!(matches!(action, CommandAction::AutoApprove { .. }));
@@ -2253,6 +2286,7 @@ mod tests {
             &config,
             &mut audit,
             &mut renderer,
+            false,
         );
 
         assert!(
@@ -2288,6 +2322,7 @@ mod tests {
             &config,
             &mut audit,
             &mut renderer,
+            false,
         );
 
         assert!(
@@ -2313,6 +2348,7 @@ mod tests {
             &config,
             &mut audit,
             &mut renderer,
+            false,
         );
 
         assert!(matches!(action, CommandAction::Blocked { .. }));
@@ -2333,8 +2369,16 @@ mod tests {
         let config = gate_config(true, true);
         let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
 
-        let action =
-            classify_and_gate(vec![], vec![], 0, false, &config, &mut audit, &mut renderer);
+        let action = classify_and_gate(
+            vec![],
+            vec![],
+            0,
+            false,
+            &config,
+            &mut audit,
+            &mut renderer,
+            false,
+        );
 
         assert!(matches!(action, CommandAction::NoCommands));
     }
@@ -2355,6 +2399,7 @@ mod tests {
             &config,
             &mut audit,
             &mut renderer,
+            false,
         );
 
         assert!(matches!(action, CommandAction::Judge { .. }));
@@ -2458,6 +2503,7 @@ mod tests {
             &config,
             &mut audit,
             &mut renderer,
+            false,
         );
         assert!(matches!(action, CommandAction::Judge { .. }));
 
@@ -2492,6 +2538,7 @@ mod tests {
             &config,
             &mut audit,
             &mut renderer,
+            false,
         );
         assert!(
             matches!(action, CommandAction::Judge { .. }),
@@ -2714,5 +2761,142 @@ mod tests {
             AgentState::Approving { .. } | AgentState::Judging { .. }
         );
         assert!(!suppress);
+    }
+
+    // --- Group D: Sandbox-aware classify_and_gate tests ---
+
+    #[test]
+    fn gate_write_auto_approves_when_sandbox_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut audit = AuditLogger::new(&path).unwrap();
+        let config = gate_config(true, true);
+        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
+
+        // mkdir is Write — should auto-approve when sandbox is active
+        let action = classify_and_gate(
+            vec!["mkdir foo".to_string()],
+            vec!["toolu_1".to_string()],
+            0,
+            false,
+            &config,
+            &mut audit,
+            &mut renderer,
+            true, // sandbox_active
+        );
+
+        assert!(
+            matches!(action, CommandAction::AutoApprove { .. }),
+            "Write command should auto-approve when sandbox active, got: {action:?}"
+        );
+
+        // Verify audit says "sandbox-safe"
+        let lines = read_audit_lines(&path);
+        let approved = lines.iter().find(|l| l["type"] == "approved").unwrap();
+        assert_eq!(approved["reason"], "sandbox-safe commands");
+    }
+
+    #[test]
+    fn gate_destructive_goes_to_judge_with_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut audit = AuditLogger::new(&path).unwrap();
+        let config = gate_config(true, true); // judge enabled
+        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
+
+        // rm is Destructive — should go to Judge even when sandbox is active
+        let action = classify_and_gate(
+            vec!["rm file.txt".to_string()],
+            vec!["toolu_1".to_string()],
+            0,
+            false,
+            &config,
+            &mut audit,
+            &mut renderer,
+            true, // sandbox_active
+        );
+
+        assert!(
+            matches!(action, CommandAction::Judge { .. }),
+            "Destructive command should go to Judge with sandbox, got: {action:?}"
+        );
+    }
+
+    #[test]
+    fn gate_network_goes_to_judge_with_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut audit = AuditLogger::new(&path).unwrap();
+        let config = gate_config(true, true); // judge enabled
+        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
+
+        // curl is Network — should go to Judge when sandbox is active
+        let action = classify_and_gate(
+            vec!["curl https://example.com".to_string()],
+            vec!["toolu_1".to_string()],
+            0,
+            false,
+            &config,
+            &mut audit,
+            &mut renderer,
+            true, // sandbox_active
+        );
+
+        assert!(
+            matches!(action, CommandAction::Judge { .. }),
+            "Network command should go to Judge with sandbox, got: {action:?}"
+        );
+    }
+
+    #[test]
+    fn gate_write_needs_approval_no_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut audit = AuditLogger::new(&path).unwrap();
+        let config = gate_config(true, false); // judge disabled
+        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
+
+        // mkdir is Write — without sandbox, should go to Approve (not auto-approve)
+        let action = classify_and_gate(
+            vec!["mkdir foo".to_string()],
+            vec!["toolu_1".to_string()],
+            0,
+            false,
+            &config,
+            &mut audit,
+            &mut renderer,
+            false, // sandbox_active = false
+        );
+
+        assert!(
+            matches!(action, CommandAction::Approve { .. }),
+            "Write command without sandbox should go to Approve, got: {action:?}"
+        );
+    }
+
+    #[test]
+    fn gate_build_test_auto_approves_with_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut audit = AuditLogger::new(&path).unwrap();
+        let config = gate_config(true, true);
+        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
+
+        // cargo build is BuildTest — should auto-approve with sandbox
+        let action = classify_and_gate(
+            vec!["cargo build".to_string()],
+            vec!["toolu_1".to_string()],
+            0,
+            false,
+            &config,
+            &mut audit,
+            &mut renderer,
+            true, // sandbox_active
+        );
+
+        assert!(
+            matches!(action, CommandAction::AutoApprove { .. }),
+            "BuildTest command should auto-approve with sandbox, got: {action:?}"
+        );
     }
 }
