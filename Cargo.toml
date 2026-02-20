@@ -22,6 +22,7 @@ async-stream = "0.3"
 tempfile = "3"
 signal-hook = "0.3"
 libc = "0.2"
+base64 = "0.22"
 ua-protocol = { path = "crates/ua-protocol" }
 ua-backend = { path = "crates/ua-backend" }
 ua-sandbox = { path = "crates/ua-sandbox" }

@@ -372,12 +372,41 @@ fn build_messages(request: &AgentRequest) -> Vec<ApiMessage> {
         }
     }
 
-    // Add current instruction (skip if empty — agentic continuation)
-    if !request.instruction.is_empty() {
-        messages.push(ApiMessage {
-            role: "user".to_string(),
-            content: ApiContent::Text(request.instruction.clone()),
-        });
+    // Add current instruction (skip if empty — agentic continuation).
+    // If attachments are present, include them as image content blocks.
+    if !request.instruction.is_empty() || !request.attachments.is_empty() {
+        let has_attachments = !request.attachments.is_empty();
+        let has_instruction = !request.instruction.is_empty();
+
+        if has_attachments {
+            let mut blocks: Vec<ApiContentBlock> = request
+                .attachments
+                .iter()
+                .map(|att| ApiContentBlock::Image {
+                    source: ImageSource {
+                        source_type: "base64".to_string(),
+                        media_type: att.media_type.clone(),
+                        data: att.data.clone(),
+                    },
+                    cache_control: None,
+                })
+                .collect();
+            if has_instruction {
+                blocks.push(ApiContentBlock::Text {
+                    text: request.instruction.clone(),
+                    cache_control: None,
+                });
+            }
+            messages.push(ApiMessage {
+                role: "user".to_string(),
+                content: ApiContent::Blocks(blocks),
+            });
+        } else {
+            messages.push(ApiMessage {
+                role: "user".to_string(),
+                content: ApiContent::Text(request.instruction.clone()),
+            });
+        }
     }
 
     // Mark the last user message with cache_control for prompt caching.
@@ -405,6 +434,9 @@ fn mark_cache_control(msg: &mut ApiMessage) {
                         *cache_control = Some(EPHEMERAL);
                     }
                     ApiContentBlock::ToolResult { cache_control, .. } => {
+                        *cache_control = Some(EPHEMERAL);
+                    }
+                    ApiContentBlock::Image { cache_control, .. } => {
                         *cache_control = Some(EPHEMERAL);
                     }
                     ApiContentBlock::ToolUse { .. } => {
@@ -589,11 +621,25 @@ struct ApiMessage {
 }
 
 #[derive(Debug, Serialize)]
+struct ImageSource {
+    #[serde(rename = "type")]
+    source_type: String,
+    media_type: String,
+    data: String,
+}
+
+#[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 enum ApiContentBlock {
     #[serde(rename = "text")]
     Text {
         text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
+    #[serde(rename = "image")]
+    Image {
+        source: ImageSource,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
@@ -643,7 +689,8 @@ enum ResponseContentBlock {
 mod tests {
     use super::*;
     use ua_protocol::{
-        ConversationMessage, ShellContext, TerminalHistory, ToolResultRecord, ToolUseRecord,
+        Attachment, ConversationMessage, ShellContext, TerminalHistory, ToolResultRecord,
+        ToolUseRecord,
     };
 
     #[test]
@@ -661,6 +708,7 @@ mod tests {
             terminal_history: TerminalHistory::new(),
             conversation: vec![],
             system_prompt_extra: None,
+            attachments: vec![],
         };
 
         let prompt = build_system_prompt(&request);
@@ -689,6 +737,7 @@ mod tests {
             terminal_history: TerminalHistory::new(),
             conversation: vec![],
             system_prompt_extra: None,
+            attachments: vec![],
         };
 
         let prompt = build_system_prompt(&request);
@@ -708,6 +757,7 @@ mod tests {
             ]),
             conversation: vec![],
             system_prompt_extra: None,
+            attachments: vec![],
         };
 
         let prompt = build_system_prompt(&request);
@@ -724,6 +774,7 @@ mod tests {
             terminal_history: TerminalHistory::new(),
             conversation: vec![],
             system_prompt_extra: None,
+            attachments: vec![],
         };
 
         let messages = build_messages(&request);
@@ -742,6 +793,7 @@ mod tests {
                 ConversationMessage::assistant("I'll use ls to list files"),
             ],
             system_prompt_extra: None,
+            attachments: vec![],
         };
 
         let messages = build_messages(&request);
@@ -920,6 +972,7 @@ mod tests {
                 ),
             ],
             system_prompt_extra: None,
+            attachments: vec![],
         };
 
         let messages = build_messages(&request);
@@ -947,6 +1000,7 @@ mod tests {
                 content: "file1.txt\nfile2.txt".to_string(),
             }])],
             system_prompt_extra: None,
+            attachments: vec![],
         };
 
         let messages = build_messages(&request);
@@ -983,6 +1037,7 @@ mod tests {
                 }]),
             ],
             system_prompt_extra: None,
+            attachments: vec![],
         };
 
         let messages = build_messages(&request);
@@ -1004,6 +1059,7 @@ mod tests {
                 ConversationMessage::assistant("hello"),
             ],
             system_prompt_extra: None,
+            attachments: vec![],
         };
 
         let messages = build_messages(&request);
@@ -1026,6 +1082,7 @@ mod tests {
                 }],
             )],
             system_prompt_extra: None,
+            attachments: vec![],
         };
 
         let messages = build_messages(&request);
@@ -1201,6 +1258,7 @@ mod tests {
             terminal_history: TerminalHistory::new(),
             conversation: vec![],
             system_prompt_extra: None,
+            attachments: vec![],
         };
 
         let messages = build_messages(&request);
@@ -1227,6 +1285,7 @@ mod tests {
                 content: "output".to_string(),
             }])],
             system_prompt_extra: None,
+            attachments: vec![],
         };
 
         let messages = build_messages(&request);
@@ -1249,6 +1308,7 @@ mod tests {
                 ConversationMessage::assistant("ok"),
             ],
             system_prompt_extra: None,
+            attachments: vec![],
         };
 
         let messages = build_messages(&request);
@@ -1304,5 +1364,110 @@ mod tests {
             .unwrap();
         let reqwest_resp = reqwest::Response::from(resp);
         assert!(parse_retry_after(&reqwest_resp).is_none());
+    }
+
+    #[test]
+    fn image_content_block_serialization() {
+        let block = ApiContentBlock::Image {
+            source: ImageSource {
+                source_type: "base64".to_string(),
+                media_type: "image/png".to_string(),
+                data: "iVBORdata".to_string(),
+            },
+            cache_control: None,
+        };
+        let json = serde_json::to_string(&block).unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "image");
+        assert_eq!(v["source"]["type"], "base64");
+        assert_eq!(v["source"]["media_type"], "image/png");
+        assert_eq!(v["source"]["data"], "iVBORdata");
+    }
+
+    #[test]
+    fn build_messages_with_attachments() {
+        let request = AgentRequest {
+            instruction: "What is in this image?".to_string(),
+            context: ShellContext::default(),
+            terminal_history: TerminalHistory::new(),
+            conversation: vec![],
+            system_prompt_extra: None,
+            attachments: vec![Attachment {
+                filename: "test.png".to_string(),
+                media_type: "image/png".to_string(),
+                data: "base64data".to_string(),
+            }],
+        };
+
+        let messages = build_messages(&request);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+        let json = serde_json::to_string(&messages[0].content).unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        // Should be an array of blocks: [image, text]
+        let blocks = v.as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "image");
+        assert_eq!(blocks[0]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[1]["text"], "What is in this image?");
+    }
+
+    #[test]
+    fn build_messages_attachments_only_no_instruction() {
+        let request = AgentRequest {
+            instruction: String::new(),
+            context: ShellContext::default(),
+            terminal_history: TerminalHistory::new(),
+            conversation: vec![ConversationMessage::user("describe the image")],
+            system_prompt_extra: None,
+            attachments: vec![Attachment {
+                filename: "photo.jpg".to_string(),
+                media_type: "image/jpeg".to_string(),
+                data: "jpegdata".to_string(),
+            }],
+        };
+
+        let messages = build_messages(&request);
+        // conversation message + attachments-only message
+        assert_eq!(messages.len(), 2);
+        let json = serde_json::to_string(&messages[1].content).unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        let blocks = v.as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "image");
+    }
+
+    #[test]
+    fn build_messages_multiple_attachments() {
+        let request = AgentRequest {
+            instruction: "Compare these".to_string(),
+            context: ShellContext::default(),
+            terminal_history: TerminalHistory::new(),
+            conversation: vec![],
+            system_prompt_extra: None,
+            attachments: vec![
+                Attachment {
+                    filename: "a.png".to_string(),
+                    media_type: "image/png".to_string(),
+                    data: "data1".to_string(),
+                },
+                Attachment {
+                    filename: "b.jpg".to_string(),
+                    media_type: "image/jpeg".to_string(),
+                    data: "data2".to_string(),
+                },
+            ],
+        };
+
+        let messages = build_messages(&request);
+        assert_eq!(messages.len(), 1);
+        let json = serde_json::to_string(&messages[0].content).unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        let blocks = v.as_array().unwrap();
+        assert_eq!(blocks.len(), 3); // 2 images + 1 text
+        assert_eq!(blocks[0]["type"], "image");
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[2]["type"], "text");
     }
 }

@@ -20,7 +20,9 @@ use crate::context::{
     build_agent_capabilities_prompt, build_agent_request, scrub_injection_markers, OutputHistory,
     TOOL_RESULT_PREFIX,
 };
-use crate::journal::{build_conversation_from_journal, epoch_secs, JournalEntry, SessionJournal};
+use crate::journal::{
+    build_conversation_from_journal, epoch_secs, AttachmentMeta, JournalEntry, SessionJournal,
+};
 use crate::judge;
 use crate::policy::{analyze_pipe_chain, RiskLevel};
 use crate::style::{format_tokens, Style};
@@ -304,6 +306,7 @@ pub async fn run_batch(
     instruction: &str,
     depth: u32,
     sandbox_active: bool,
+    attachments: Vec<ua_protocol::Attachment>,
 ) -> i32 {
     let is_tty = std::io::stderr().is_terminal();
     let style = Style::new();
@@ -360,9 +363,18 @@ pub async fn run_batch(
 
     // Write initial instruction to journal
     if let Some(ref mut j) = journal {
+        let meta: Vec<AttachmentMeta> = attachments
+            .iter()
+            .map(|a| AttachmentMeta {
+                filename: a.filename.clone(),
+                media_type: a.media_type.clone(),
+                size_bytes: a.data.len() as u64 * 3 / 4, // approximate decoded size
+            })
+            .collect();
         j.append(&JournalEntry::Instruction {
             ts: epoch_secs(),
             text: instruction.to_string(),
+            attachments: meta,
         });
     }
 
@@ -404,6 +416,8 @@ pub async fn run_batch(
         };
 
         // Build request — instruction is empty; journal carries it.
+        // Attachments are passed on every iteration since the journal
+        // only stores metadata, not the base64 data.
         let mut request = build_agent_request(
             "",
             config,
@@ -413,6 +427,7 @@ pub async fn run_batch(
             None, // No PTY child in batch mode
         );
         request.system_prompt_extra = Some(system_extra.clone());
+        request.attachments = attachments.clone();
 
         // Log system prompt to journal for trajectory reconstruction
         if let Some(ref mut j) = journal {

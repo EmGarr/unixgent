@@ -414,6 +414,7 @@ pub fn build_agent_request(
         terminal_history,
         conversation,
         system_prompt_extra,
+        attachments: Vec::new(),
     }
 }
 

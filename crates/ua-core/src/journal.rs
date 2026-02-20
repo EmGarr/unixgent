@@ -37,6 +37,14 @@ pub fn generate_session_id() -> String {
 // JournalEntry — serde-tagged JSONL format
 // ---------------------------------------------------------------------------
 
+/// Metadata about an attachment, logged to the journal without base64 data.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AttachmentMeta {
+    pub filename: String,
+    pub media_type: String,
+    pub size_bytes: u64,
+}
+
 /// A single entry in the session journal.
 // NOTE: If you add a variant, also update build_agent_capabilities_prompt() in context.rs
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -53,7 +61,12 @@ pub enum JournalEntry {
     },
     /// User typed `# instruction` for the LLM.
     #[serde(rename = "instruction")]
-    Instruction { ts: u64, text: String },
+    Instruction {
+        ts: u64,
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<AttachmentMeta>,
+    },
     /// LLM response (thinking + text + optional tool_use blocks).
     #[serde(rename = "response")]
     Response {
@@ -400,6 +413,7 @@ mod tests {
         let entry = JournalEntry::Instruction {
             ts: 1000,
             text: "what files are here".to_string(),
+            attachments: vec![],
         };
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: JournalEntry = serde_json::from_str(&json).unwrap();
@@ -526,6 +540,7 @@ mod tests {
             JournalEntry::Instruction {
                 ts: 1,
                 text: "hello".to_string(),
+                attachments: vec![],
             },
             JournalEntry::SystemPrompt {
                 ts: 1,
@@ -558,6 +573,7 @@ mod tests {
         journal.append(&JournalEntry::Instruction {
             ts: 1000,
             text: "hello".to_string(),
+            attachments: vec![],
         });
         journal.append(&JournalEntry::Response {
             ts: 1001,
@@ -602,6 +618,7 @@ mod tests {
             JournalEntry::Instruction {
                 ts: 1,
                 text: "what files?".to_string(),
+                attachments: vec![],
             },
             JournalEntry::Response {
                 ts: 2,
@@ -644,6 +661,7 @@ mod tests {
             JournalEntry::Instruction {
                 ts: 2,
                 text: "what did I just run?".to_string(),
+                attachments: vec![],
             },
         ];
 
@@ -672,6 +690,7 @@ mod tests {
             JournalEntry::Instruction {
                 ts: 3,
                 text: "explain".to_string(),
+                attachments: vec![],
             },
         ];
 
@@ -688,6 +707,7 @@ mod tests {
             JournalEntry::Instruction {
                 ts: 1,
                 text: "old instruction".to_string(),
+                attachments: vec![],
             },
             JournalEntry::Response {
                 ts: 2,
@@ -702,6 +722,7 @@ mod tests {
             JournalEntry::Instruction {
                 ts: 4,
                 text: "new instruction".to_string(),
+                attachments: vec![],
             },
         ];
 
@@ -721,6 +742,7 @@ mod tests {
             JournalEntry::Instruction {
                 ts: 1,
                 text: big_text.clone(),
+                attachments: vec![],
             },
             JournalEntry::Response {
                 ts: 2,
@@ -731,6 +753,7 @@ mod tests {
             JournalEntry::Instruction {
                 ts: 3,
                 text: "recent".to_string(),
+                attachments: vec![],
             },
             JournalEntry::Response {
                 ts: 4,
@@ -753,6 +776,7 @@ mod tests {
             JournalEntry::Instruction {
                 ts: 1,
                 text: "run something".to_string(),
+                attachments: vec![],
             },
             JournalEntry::Response {
                 ts: 2,
@@ -821,6 +845,7 @@ mod tests {
             JournalEntry::Instruction {
                 ts: 2,
                 text: "what files?".to_string(),
+                attachments: vec![],
             },
         ];
 
@@ -849,6 +874,7 @@ mod tests {
         let entries = vec![JournalEntry::Instruction {
             ts: 1,
             text: "x".repeat(4000), // ~1000 tokens
+            attachments: vec![],
         }];
 
         // Budget of 1 token — still includes the single entry
@@ -864,6 +890,7 @@ mod tests {
             JournalEntry::Instruction {
                 ts: 1,
                 text: "do it".to_string(),
+                attachments: vec![],
             },
             JournalEntry::Response {
                 ts: 2,
@@ -982,6 +1009,7 @@ mod tests {
             JournalEntry::Instruction {
                 ts: 1,
                 text: "x".repeat(400), // ~100 tokens
+                attachments: vec![],
             },
             JournalEntry::SystemPrompt {
                 ts: 1,
@@ -996,6 +1024,7 @@ mod tests {
             JournalEntry::Instruction {
                 ts: 3,
                 text: "recent".to_string(),
+                attachments: vec![],
             },
         ];
 
@@ -1015,6 +1044,7 @@ mod tests {
             JournalEntry::Instruction {
                 ts: 1,
                 text: "what files?".to_string(),
+                attachments: vec![],
             },
             JournalEntry::SystemPrompt {
                 ts: 1,
@@ -1130,6 +1160,7 @@ mod tests {
             JournalEntry::Instruction {
                 ts: 1,
                 text: "hello".to_string(),
+                attachments: vec![],
             },
             JournalEntry::Response {
                 ts: 2,
@@ -1155,5 +1186,63 @@ mod tests {
         assert_eq!(msgs[0].content, "hello");
         assert_eq!(msgs[1].role, ua_protocol::Role::Assistant);
         assert_eq!(msgs[1].content, "Hi!");
+    }
+
+    #[test]
+    fn serde_roundtrip_attachment_meta() {
+        let meta = AttachmentMeta {
+            filename: "test.png".to_string(),
+            media_type: "image/png".to_string(),
+            size_bytes: 12345,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let parsed: AttachmentMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(meta, parsed);
+    }
+
+    #[test]
+    fn serde_roundtrip_instruction_with_attachments() {
+        let entry = JournalEntry::Instruction {
+            ts: 1000,
+            text: "describe this image".to_string(),
+            attachments: vec![AttachmentMeta {
+                filename: "photo.png".to_string(),
+                media_type: "image/png".to_string(),
+                size_bytes: 5000,
+            }],
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("attachments"));
+        let parsed: JournalEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(entry, parsed);
+    }
+
+    #[test]
+    fn serde_instruction_without_attachments_backward_compat() {
+        // Old journal entries without the attachments field should parse fine
+        let json = r#"{"type":"instruction","ts":1000,"text":"hello"}"#;
+        let parsed: JournalEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed,
+            JournalEntry::Instruction {
+                ts: 1000,
+                text: "hello".to_string(),
+                attachments: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn serde_instruction_empty_attachments_skipped() {
+        let entry = JournalEntry::Instruction {
+            ts: 1000,
+            text: "hello".to_string(),
+            attachments: vec![],
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(
+            !json.contains("attachments"),
+            "empty attachments should be skipped in serialization"
+        );
     }
 }

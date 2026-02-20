@@ -1,6 +1,8 @@
 use std::io::{self, IsTerminal, Read};
+use std::path::Path;
 
 use crossterm::terminal;
+use ua_core::attachment::load_attachment;
 use ua_core::batch::run_batch;
 use ua_core::config::Config;
 use ua_core::process;
@@ -36,15 +38,75 @@ fn print_help() {
     println!("  unixagent                   Interactive REPL mode");
     println!("  unixagent \"instruction\"      Batch mode (non-interactive)");
     println!("  echo \"instruction\" | unixagent  Batch mode via stdin pipe");
+    println!("  unixagent -p \"prompt\" --attachments img.png  Multimodal batch mode");
     println!();
     println!("Options:");
-    println!("  --debug-osc       Print OSC 133 events and state transitions to stderr");
-    println!("  --no-integration  Disable shell integration (OSC 133 injection)");
-    println!("  --version         Print version");
-    println!("  --help            Print this help");
+    println!("  -p, --prompt <text>          Instruction text for batch mode");
+    println!("  --attachments <files...>     Image files to attach (png, jpg, gif, webp)");
+    println!("  --debug-osc                  Print OSC 133 events to stderr");
+    println!("  --no-integration             Disable shell integration (OSC 133 injection)");
+    println!("  --version                    Print version");
+    println!("  --help                       Print this help");
     println!();
     println!("Internal:");
     println!("  --sandbox-exec <cmd> [args...]  Apply sandbox and exec (used by agent)");
+}
+
+/// Parsed CLI arguments.
+struct CliArgs {
+    debug_osc: bool,
+    no_integration: bool,
+    prompt: Option<String>,
+    attachment_paths: Vec<String>,
+    positional: Vec<String>,
+}
+
+fn parse_args(args: &[String]) -> CliArgs {
+    let mut result = CliArgs {
+        debug_osc: false,
+        no_integration: false,
+        prompt: None,
+        attachment_paths: Vec::new(),
+        positional: Vec::new(),
+    };
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        match arg.as_str() {
+            "--debug-osc" => result.debug_osc = true,
+            "--no-integration" => result.no_integration = true,
+            "-p" | "--prompt" => {
+                i += 1;
+                if i < args.len() {
+                    result.prompt = Some(args[i].clone());
+                } else {
+                    eprintln!("error: {arg} requires a value");
+                    std::process::exit(1);
+                }
+            }
+            "--attachments" => {
+                // Consume all subsequent non-flag args as attachment paths
+                i += 1;
+                while i < args.len() && !args[i].starts_with('-') {
+                    result.attachment_paths.push(args[i].clone());
+                    i += 1;
+                }
+                if result.attachment_paths.is_empty() {
+                    eprintln!("error: --attachments requires at least one file path");
+                    std::process::exit(1);
+                }
+                continue; // don't increment i again
+            }
+            _ if !arg.starts_with('-') => {
+                result.positional.push(arg.clone());
+            }
+            _ => {} // ignore unknown flags (already handled: --help, --version, --sandbox-exec)
+        }
+        i += 1;
+    }
+
+    result
 }
 
 fn main() {
@@ -76,8 +138,7 @@ fn main() {
         return;
     }
 
-    let debug_osc = args.iter().any(|a| a == "--debug-osc");
-    let no_integration = args.iter().any(|a| a == "--no-integration");
+    let cli = parse_args(&args);
 
     let config = Config::load_or_default();
 
@@ -100,12 +161,18 @@ fn main() {
         false
     };
 
-    // Detect batch mode: positional arg (non-flag) or piped stdin
-    let non_flag_args: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    // Determine instruction: -p flag, positional arg, or stdin pipe
     let stdin_is_pipe = !io::stdin().is_terminal();
 
-    let instruction = if let Some(arg) = non_flag_args.first() {
-        Some((*arg).clone())
+    if cli.prompt.is_some() && !cli.positional.is_empty() {
+        eprintln!("error: cannot use both -p/--prompt and a positional instruction");
+        std::process::exit(1);
+    }
+
+    let instruction = if let Some(ref p) = cli.prompt {
+        Some(p.clone())
+    } else if let Some(arg) = cli.positional.first() {
+        Some(arg.clone())
     } else if stdin_is_pipe {
         let mut buf = String::new();
         if io::stdin().read_to_string(&mut buf).is_ok() && !buf.trim().is_empty() {
@@ -117,8 +184,26 @@ fn main() {
         None
     };
 
+    // --attachments requires an instruction (batch mode)
+    if !cli.attachment_paths.is_empty() && instruction.is_none() {
+        eprintln!("error: --attachments requires an instruction (-p or positional arg)");
+        std::process::exit(1);
+    }
+
     // Batch mode
     if let Some(instruction) = instruction {
+        // Load attachments
+        let attachments: Vec<ua_protocol::Attachment> = cli
+            .attachment_paths
+            .iter()
+            .map(|path| {
+                load_attachment(Path::new(path)).unwrap_or_else(|e| {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                })
+            })
+            .collect();
+
         let max_depth = config.security.max_agent_depth;
         let depth = match process::check_depth(max_depth) {
             Ok(d) => d,
@@ -138,13 +223,24 @@ fn main() {
             }
         };
 
-        let code = runtime.block_on(run_batch(&config, &instruction, depth, sandbox_active));
+        let code = runtime.block_on(run_batch(
+            &config,
+            &instruction,
+            depth,
+            sandbox_active,
+            attachments,
+        ));
         std::process::exit(code);
     }
 
     // REPL mode
+    if !cli.attachment_paths.is_empty() {
+        eprintln!("error: --attachments is only supported in batch mode (provide an instruction)");
+        std::process::exit(1);
+    }
+
     let mut config = config;
-    if no_integration {
+    if cli.no_integration {
         config.shell.integration = false;
     }
 
@@ -179,7 +275,7 @@ fn main() {
         }
     };
 
-    let result = run_repl(&config, debug_osc, runtime.handle(), sandbox_active);
+    let result = run_repl(&config, cli.debug_osc, runtime.handle(), sandbox_active);
 
     drop(guard);
 

@@ -22,3 +22,4 @@ toml.workspace = true
 tempfile.workspace = true
 signal-hook.workspace = true
 libc.workspace = true
+base64.workspace = true

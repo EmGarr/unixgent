@@ -117,6 +117,17 @@ impl ConversationMessage {
     }
 }
 
+/// A resolved image attachment: file already read and base64-encoded.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Attachment {
+    /// Original file name (e.g., "screenshot.png").
+    pub filename: String,
+    /// MIME type (e.g., "image/png").
+    pub media_type: String,
+    /// Base64-encoded file data.
+    pub data: String,
+}
+
 /// A complete request to the agent backend.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentRequest {
@@ -128,6 +139,9 @@ pub struct AgentRequest {
     /// The backend appends this if present; callers compose it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt_extra: Option<String>,
+    /// Image attachments to include with the instruction.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
 }
 
 impl AgentRequest {
@@ -138,6 +152,7 @@ impl AgentRequest {
             terminal_history: TerminalHistory::new(),
             conversation: Vec::new(),
             system_prompt_extra: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -148,6 +163,11 @@ impl AgentRequest {
 
     pub fn with_conversation(mut self, conversation: Vec<ConversationMessage>) -> Self {
         self.conversation = conversation;
+        self
+    }
+
+    pub fn with_attachments(mut self, attachments: Vec<Attachment>) -> Self {
+        self.attachments = attachments;
         self
     }
 }
@@ -308,5 +328,40 @@ mod tests {
         let msg = ConversationMessage::assistant("test");
         assert!(msg.tool_uses.is_empty());
         assert!(msg.tool_results.is_empty());
+    }
+
+    #[test]
+    fn attachment_roundtrip() {
+        let att = Attachment {
+            filename: "test.png".to_string(),
+            media_type: "image/png".to_string(),
+            data: "iVBOR...".to_string(),
+        };
+        let json = serde_json::to_string(&att).unwrap();
+        let att2: Attachment = serde_json::from_str(&json).unwrap();
+        assert_eq!(att, att2);
+    }
+
+    #[test]
+    fn agent_request_with_attachments_roundtrip() {
+        let ctx = ShellContext::default();
+        let attachments = vec![Attachment {
+            filename: "img.png".to_string(),
+            media_type: "image/png".to_string(),
+            data: "base64data".to_string(),
+        }];
+        let request = AgentRequest::new("describe this", ctx).with_attachments(attachments);
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("attachments"));
+        let request2: AgentRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(request, request2);
+    }
+
+    #[test]
+    fn agent_request_without_attachments_omits_field() {
+        let ctx = ShellContext::default();
+        let request = AgentRequest::new("hello", ctx);
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("attachments"));
     }
 }

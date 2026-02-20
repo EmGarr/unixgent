@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod attachment;
 pub mod audit;
 pub mod batch;
 pub mod config;

@@ -594,6 +594,7 @@ pub fn run_repl(
                                                     j.append(&JournalEntry::Instruction {
                                                         ts: epoch_secs(),
                                                         text: instruction.to_string(),
+                                                        attachments: vec![],
                                                     });
                                                 }
 
