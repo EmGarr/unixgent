@@ -50,11 +50,43 @@ pub struct ToolUseRecord {
     pub input_json: String,
 }
 
+/// Reference to a media file on disk (serialized to journal).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MediaRef {
+    pub media_type: String,
+    pub filename: String,
+}
+
+/// Resolved media ready for API call (NOT serialized to journal).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedMedia {
+    pub media_type: String,
+    pub data: String, // base64-encoded
+}
+
 /// A tool_result block from a user message.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolResultRecord {
     pub tool_use_id: String,
     pub content: String,
+    /// References to media files on disk (serialized to journal).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<MediaRef>,
+    /// Resolved media with loaded data (NOT serialized — populated at runtime).
+    #[serde(skip)]
+    pub resolved_media: Vec<ResolvedMedia>,
+}
+
+impl ToolResultRecord {
+    /// Create a text-only tool result (no media).
+    pub fn text(tool_use_id: String, content: String) -> Self {
+        Self {
+            tool_use_id,
+            content,
+            media: Vec::new(),
+            resolved_media: Vec::new(),
+        }
+    }
 }
 
 /// Role in a conversation.
@@ -253,13 +285,57 @@ mod tests {
 
     #[test]
     fn tool_result_record_roundtrip() {
-        let record = ToolResultRecord {
-            tool_use_id: "toolu_123".to_string(),
-            content: "file1.txt\nfile2.txt".to_string(),
-        };
+        let record =
+            ToolResultRecord::text("toolu_123".to_string(), "file1.txt\nfile2.txt".to_string());
         let json = serde_json::to_string(&record).unwrap();
         let record2: ToolResultRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(record, record2);
+    }
+
+    #[test]
+    fn tool_result_record_with_media_roundtrip() {
+        let record = ToolResultRecord {
+            tool_use_id: "toolu_abc".to_string(),
+            content: "[binary: 204800 bytes, image/png]".to_string(),
+            media: vec![MediaRef {
+                media_type: "image/png".to_string(),
+                filename: "toolu_abc.png".to_string(),
+            }],
+            resolved_media: vec![ResolvedMedia {
+                media_type: "image/png".to_string(),
+                data: "base64data".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("\"media\""));
+        // resolved_media should NOT appear in JSON
+        assert!(!json.contains("resolved_media"));
+        let record2: ToolResultRecord = serde_json::from_str(&json).unwrap();
+        // media refs should survive roundtrip
+        assert_eq!(record2.media, record.media);
+        // resolved_media should be empty after deserialization
+        assert!(record2.resolved_media.is_empty());
+    }
+
+    #[test]
+    fn tool_result_record_backward_compat() {
+        // Old journal entries without media field should parse fine
+        let json = r#"{"tool_use_id":"toolu_1","content":"output"}"#;
+        let record: ToolResultRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(record.tool_use_id, "toolu_1");
+        assert_eq!(record.content, "output");
+        assert!(record.media.is_empty());
+        assert!(record.resolved_media.is_empty());
+    }
+
+    #[test]
+    fn tool_result_record_empty_media_skipped() {
+        let record = ToolResultRecord::text("toolu_1".to_string(), "output".to_string());
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(
+            !json.contains("media"),
+            "empty media should be skipped in serialization"
+        );
     }
 
     #[test]
@@ -278,10 +354,10 @@ mod tests {
 
     #[test]
     fn conversation_message_tool_result() {
-        let results = vec![ToolResultRecord {
-            tool_use_id: "toolu_abc".to_string(),
-            content: "/home/user".to_string(),
-        }];
+        let results = vec![ToolResultRecord::text(
+            "toolu_abc".to_string(),
+            "/home/user".to_string(),
+        )];
         let msg = ConversationMessage::tool_result(results.clone());
         assert_eq!(msg.role, Role::User);
         assert!(msg.content.is_empty());

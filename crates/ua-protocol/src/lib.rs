@@ -7,7 +7,7 @@ pub mod context;
 pub mod message;
 
 pub use context::{
-    AgentRequest, Attachment, ConversationMessage, Role, ShellContext, TerminalHistory,
-    ToolResultRecord, ToolUseRecord,
+    AgentRequest, Attachment, ConversationMessage, MediaRef, ResolvedMedia, Role, ShellContext,
+    TerminalHistory, ToolResultRecord, ToolUseRecord,
 };
 pub use message::StreamEvent;

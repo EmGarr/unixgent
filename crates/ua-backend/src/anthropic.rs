@@ -353,10 +353,31 @@ fn build_messages(request: &AgentRequest) -> Vec<ApiMessage> {
             let blocks = msg
                 .tool_results
                 .iter()
-                .map(|tr| ApiContentBlock::ToolResult {
-                    tool_use_id: tr.tool_use_id.clone(),
-                    content: tr.content.clone(),
-                    cache_control: None,
+                .map(|tr| {
+                    let content = if tr.resolved_media.is_empty() {
+                        ToolResultContent::Text(tr.content.clone())
+                    } else {
+                        let mut inner_blocks: Vec<ToolResultBlock> = tr
+                            .resolved_media
+                            .iter()
+                            .map(|rm| ToolResultBlock::Image {
+                                source: ImageSource {
+                                    source_type: "base64".to_string(),
+                                    media_type: rm.media_type.clone(),
+                                    data: rm.data.clone(),
+                                },
+                            })
+                            .collect();
+                        inner_blocks.push(ToolResultBlock::Text {
+                            text: tr.content.clone(),
+                        });
+                        ToolResultContent::Blocks(inner_blocks)
+                    };
+                    ApiContentBlock::ToolResult {
+                        tool_use_id: tr.tool_use_id.clone(),
+                        content,
+                        cache_control: None,
+                    }
                 })
                 .collect();
             messages.push(ApiMessage {
@@ -652,10 +673,39 @@ enum ApiContentBlock {
     #[serde(rename = "tool_result")]
     ToolResult {
         tool_use_id: String,
-        content: String,
+        content: ToolResultContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
+}
+
+/// Content of a tool_result: either a plain string or an array of content blocks.
+/// The Anthropic API accepts both forms.
+#[derive(Debug)]
+enum ToolResultContent {
+    /// Plain text result — serializes as a JSON string.
+    Text(String),
+    /// Mixed content (images + text) — serializes as a JSON array.
+    Blocks(Vec<ToolResultBlock>),
+}
+
+/// A content block inside an array-form tool_result.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+enum ToolResultBlock {
+    #[serde(rename = "image")]
+    Image { source: ImageSource },
+    #[serde(rename = "text")]
+    Text { text: String },
+}
+
+impl Serialize for ToolResultContent {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            ToolResultContent::Text(s) => serializer.serialize_str(s),
+            ToolResultContent::Blocks(blocks) => blocks.serialize(serializer),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -995,10 +1045,9 @@ mod tests {
             instruction: "".to_string(),
             context: ShellContext::default(),
             terminal_history: TerminalHistory::new(),
-            conversation: vec![ConversationMessage::tool_result(vec![ToolResultRecord {
-                tool_use_id: "toolu_123".to_string(),
-                content: "file1.txt\nfile2.txt".to_string(),
-            }])],
+            conversation: vec![ConversationMessage::tool_result(vec![
+                ToolResultRecord::text("toolu_123".to_string(), "file1.txt\nfile2.txt".to_string()),
+            ])],
             system_prompt_extra: None,
             attachments: vec![],
         };
@@ -1031,10 +1080,10 @@ mod tests {
                         input_json: r#"{"command":"ls"}"#.to_string(),
                     }],
                 ),
-                ConversationMessage::tool_result(vec![ToolResultRecord {
-                    tool_use_id: "toolu_1".to_string(),
-                    content: "file.txt".to_string(),
-                }]),
+                ConversationMessage::tool_result(vec![ToolResultRecord::text(
+                    "toolu_1".to_string(),
+                    "file.txt".to_string(),
+                )]),
             ],
             system_prompt_extra: None,
             attachments: vec![],
@@ -1242,7 +1291,7 @@ mod tests {
     fn tool_result_with_cache_control_serialization() {
         let block = ApiContentBlock::ToolResult {
             tool_use_id: "t1".to_string(),
-            content: "output".to_string(),
+            content: ToolResultContent::Text("output".to_string()),
             cache_control: Some(EPHEMERAL),
         };
         let json = serde_json::to_value(&block).unwrap();
@@ -1280,10 +1329,9 @@ mod tests {
             instruction: "".to_string(),
             context: ShellContext::default(),
             terminal_history: TerminalHistory::new(),
-            conversation: vec![ConversationMessage::tool_result(vec![ToolResultRecord {
-                tool_use_id: "toolu_1".to_string(),
-                content: "output".to_string(),
-            }])],
+            conversation: vec![ConversationMessage::tool_result(vec![
+                ToolResultRecord::text("toolu_1".to_string(), "output".to_string()),
+            ])],
             system_prompt_extra: None,
             attachments: vec![],
         };
@@ -1469,5 +1517,92 @@ mod tests {
         assert_eq!(blocks[0]["type"], "image");
         assert_eq!(blocks[1]["type"], "image");
         assert_eq!(blocks[2]["type"], "text");
+    }
+
+    // --- tool_result content serialization ---
+
+    #[test]
+    fn tool_result_content_text_serializes_as_string() {
+        let content = ToolResultContent::Text("hello".to_string());
+        let json = serde_json::to_value(&content).unwrap();
+        assert_eq!(json, "hello");
+    }
+
+    #[test]
+    fn tool_result_content_blocks_serializes_as_array() {
+        let content = ToolResultContent::Blocks(vec![
+            ToolResultBlock::Image {
+                source: ImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: "image/png".to_string(),
+                    data: "iVBORdata".to_string(),
+                },
+            },
+            ToolResultBlock::Text {
+                text: "[binary: 200 bytes, image/png]".to_string(),
+            },
+        ]);
+        let json = serde_json::to_value(&content).unwrap();
+        let blocks = json.as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "image");
+        assert_eq!(blocks[0]["source"]["type"], "base64");
+        assert_eq!(blocks[0]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[1]["text"], "[binary: 200 bytes, image/png]");
+    }
+
+    #[test]
+    fn build_messages_tool_result_with_resolved_media() {
+        use ua_protocol::ResolvedMedia;
+        let mut tr = ToolResultRecord::text(
+            "toolu_1".to_string(),
+            "[binary: 100 bytes, image/png]".to_string(),
+        );
+        tr.resolved_media.push(ResolvedMedia {
+            media_type: "image/png".to_string(),
+            data: "base64imagedata".to_string(),
+        });
+        let request = AgentRequest {
+            instruction: "".to_string(),
+            context: ShellContext::default(),
+            terminal_history: TerminalHistory::new(),
+            conversation: vec![ConversationMessage::tool_result(vec![tr])],
+            system_prompt_extra: None,
+            attachments: vec![],
+        };
+
+        let messages = build_messages(&request);
+        assert_eq!(messages.len(), 1);
+        let json = serde_json::to_value(&messages[0].content).unwrap();
+        let outer_blocks = json.as_array().unwrap();
+        assert_eq!(outer_blocks.len(), 1);
+        assert_eq!(outer_blocks[0]["type"], "tool_result");
+        // Content should be an array, not a string
+        let inner = outer_blocks[0]["content"].as_array().unwrap();
+        assert_eq!(inner.len(), 2); // image + text
+        assert_eq!(inner[0]["type"], "image");
+        assert_eq!(inner[0]["source"]["data"], "base64imagedata");
+        assert_eq!(inner[1]["type"], "text");
+    }
+
+    #[test]
+    fn build_messages_tool_result_without_media_stays_string() {
+        let request = AgentRequest {
+            instruction: "".to_string(),
+            context: ShellContext::default(),
+            terminal_history: TerminalHistory::new(),
+            conversation: vec![ConversationMessage::tool_result(vec![
+                ToolResultRecord::text("toolu_1".to_string(), "output text".to_string()),
+            ])],
+            system_prompt_extra: None,
+            attachments: vec![],
+        };
+
+        let messages = build_messages(&request);
+        let json = serde_json::to_value(&messages[0].content).unwrap();
+        let blocks = json.as_array().unwrap();
+        // Content should be a plain string
+        assert_eq!(blocks[0]["content"], "output text");
     }
 }

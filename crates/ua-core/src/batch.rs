@@ -9,11 +9,13 @@ use std::io::Write;
 use std::process::Command;
 use std::time::Instant;
 
+use base64::Engine;
 use futures::StreamExt;
 use ua_backend::anthropic::build_system_prompt;
 use ua_backend::AnthropicClient;
-use ua_protocol::{StreamEvent, ToolResultRecord, ToolUseRecord};
+use ua_protocol::{MediaRef, ResolvedMedia, StreamEvent, ToolResultRecord, ToolUseRecord};
 
+use crate::attachment::detect_media_type;
 use crate::audit::AuditLogger;
 use crate::config::{Config, JudgeMode};
 use crate::context::{
@@ -21,7 +23,8 @@ use crate::context::{
     TOOL_RESULT_PREFIX,
 };
 use crate::journal::{
-    build_conversation_from_journal, epoch_secs, AttachmentMeta, JournalEntry, SessionJournal,
+    build_conversation_from_journal, epoch_secs, resolve_media_refs, AttachmentMeta, JournalEntry,
+    SessionJournal,
 };
 use crate::judge;
 use crate::policy::{analyze_pipe_chain, RiskLevel};
@@ -406,14 +409,19 @@ pub async fn run_batch(
 
     let mut iteration: usize = 0;
     loop {
-        // Rebuild conversation from journal
-        let conversation = match journal {
+        // Rebuild conversation from journal, resolving media refs
+        let mut conversation = match journal {
             Some(ref j) => {
                 let entries = j.read_all();
                 build_conversation_from_journal(&entries, config.journal.conversation_budget)
             }
             None => Vec::new(),
         };
+        if let Some(ref j) = journal {
+            for msg in &mut conversation {
+                resolve_media_refs(&mut msg.tool_results, j.media_dir());
+            }
+        }
 
         // Build request — instruction is empty; journal carries it.
         // Attachments are passed on every iteration since the journal
@@ -570,10 +578,7 @@ pub async fn run_batch(
             let denial_msg = "Command blocked by security policy. Suggest a safer alternative.";
             let tool_results: Vec<ToolResultRecord> = tool_use_ids
                 .iter()
-                .map(|id| ToolResultRecord {
-                    tool_use_id: id.clone(),
-                    content: denial_msg.to_string(),
-                })
+                .map(|id| ToolResultRecord::text(id.clone(), denial_msg.to_string()))
                 .collect();
             if let Some(ref mut j) = journal {
                 j.append(&JournalEntry::Blocked {
@@ -617,10 +622,7 @@ pub async fn run_batch(
                             format!("Exception judge: {reasoning}. Please find another way.");
                         let tool_results: Vec<ToolResultRecord> = tool_use_ids
                             .iter()
-                            .map(|id| ToolResultRecord {
-                                tool_use_id: id.clone(),
-                                content: block_msg.clone(),
-                            })
+                            .map(|id| ToolResultRecord::text(id.clone(), block_msg.clone()))
                             .collect();
                         if let Some(ref mut j) = journal {
                             j.append(&JournalEntry::Blocked {
@@ -665,22 +667,46 @@ pub async fn run_batch(
                     let exit_code = out.status.code();
                     audit.log_executed(cmd, exit_code, duration_ms);
 
-                    let mut stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                    let mut media_refs = Vec::new();
+                    let mut resolved = Vec::new();
+                    let stdout_text;
+
+                    if let Some(media_type) = detect_media_type(&out.stdout) {
+                        // Binary output — store as sidecar, encode for API
+                        let ext = media_type.rsplit('/').next().unwrap_or("bin");
+                        let filename = format!("{}.{}", &tool_use_ids[i], ext);
+                        if let Some(ref j) = journal {
+                            let _ = j.store_media(&filename, &out.stdout);
+                        }
+                        let encoded = base64::engine::general_purpose::STANDARD.encode(&out.stdout);
+                        media_refs.push(MediaRef {
+                            media_type: media_type.to_string(),
+                            filename,
+                        });
+                        resolved.push(ResolvedMedia {
+                            media_type: media_type.to_string(),
+                            data: encoded,
+                        });
+                        stdout_text =
+                            format!("[binary: {} bytes, {}]", out.stdout.len(), media_type);
+                    } else {
+                        let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+                        if text.len() > MAX_OUTPUT_BYTES {
+                            let total = text.len();
+                            text.truncate(MAX_OUTPUT_BYTES);
+                            text.push_str(&format!("\n[truncated, {total} bytes total]"));
+                        }
+                        stdout_text = text;
+                    }
+
                     let stderr_text = String::from_utf8_lossy(&out.stderr).to_string();
 
-                    // Cap output size
-                    if stdout.len() > MAX_OUTPUT_BYTES {
-                        let total = stdout.len();
-                        stdout.truncate(MAX_OUTPUT_BYTES);
-                        stdout.push_str(&format!("\n[truncated, {total} bytes total]"));
-                    }
-
                     let mut result = String::from(TOOL_RESULT_PREFIX);
-                    if !stdout.is_empty() {
-                        result.push_str(&stdout);
+                    if !stdout_text.is_empty() {
+                        result.push_str(&stdout_text);
                     }
                     if !stderr_text.is_empty() {
-                        if !stdout.is_empty() {
+                        if !stdout_text.is_empty() {
                             result.push('\n');
                         }
                         result.push_str("STDERR:\n");
@@ -696,14 +722,16 @@ pub async fn run_batch(
                     all_results.push(ToolResultRecord {
                         tool_use_id: tool_use_ids[i].clone(),
                         content: scrubbed,
+                        media: media_refs,
+                        resolved_media: resolved,
                     });
                 }
                 Err(e) => {
                     audit.log_executed(cmd, None, duration_ms);
-                    all_results.push(ToolResultRecord {
-                        tool_use_id: tool_use_ids[i].clone(),
-                        content: format!("Failed to execute: {e}"),
-                    });
+                    all_results.push(ToolResultRecord::text(
+                        tool_use_ids[i].clone(),
+                        format!("Failed to execute: {e}"),
+                    ));
                 }
             }
         }

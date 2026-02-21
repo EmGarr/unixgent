@@ -8,6 +8,27 @@ use ua_protocol::Attachment;
 /// Maximum file size in bytes (20 MB — Anthropic's limit).
 const MAX_FILE_SIZE: u64 = 20 * 1024 * 1024;
 
+/// Detect media type from magic bytes at the start of raw output.
+/// Returns the MIME type if recognized, `None` for text/unknown.
+pub fn detect_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if bytes.starts_with(b"\xff\xd8\xff") {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
+        return Some("audio/wav");
+    }
+    None
+}
+
 /// Map file extension to MIME type. Returns `None` for unsupported formats.
 fn mime_type_for_extension(ext: &str) -> Option<&'static str> {
     match ext.to_ascii_lowercase().as_str() {
@@ -140,5 +161,64 @@ mod tests {
             .decode(&att.data)
             .unwrap();
         assert_eq!(decoded, original);
+    }
+
+    // --- detect_media_type tests ---
+
+    #[test]
+    fn detect_png() {
+        assert_eq!(
+            detect_media_type(b"\x89PNG\r\n\x1a\nmore data"),
+            Some("image/png")
+        );
+    }
+
+    #[test]
+    fn detect_jpeg() {
+        assert_eq!(
+            detect_media_type(b"\xff\xd8\xff\xe0more data"),
+            Some("image/jpeg")
+        );
+    }
+
+    #[test]
+    fn detect_gif87a() {
+        assert_eq!(detect_media_type(b"GIF87amore data"), Some("image/gif"));
+    }
+
+    #[test]
+    fn detect_gif89a() {
+        assert_eq!(detect_media_type(b"GIF89amore data"), Some("image/gif"));
+    }
+
+    #[test]
+    fn detect_webp() {
+        assert_eq!(
+            detect_media_type(b"RIFF\x00\x00\x00\x00WEBPmore"),
+            Some("image/webp")
+        );
+    }
+
+    #[test]
+    fn detect_wav() {
+        assert_eq!(
+            detect_media_type(b"RIFF\x00\x00\x00\x00WAVEmore"),
+            Some("audio/wav")
+        );
+    }
+
+    #[test]
+    fn detect_text_returns_none() {
+        assert_eq!(detect_media_type(b"hello world\n"), None);
+    }
+
+    #[test]
+    fn detect_empty_returns_none() {
+        assert_eq!(detect_media_type(b""), None);
+    }
+
+    #[test]
+    fn detect_short_bytes_returns_none() {
+        assert_eq!(detect_media_type(b"RI"), None);
     }
 }

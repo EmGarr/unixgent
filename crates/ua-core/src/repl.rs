@@ -1118,9 +1118,11 @@ pub fn run_repl(
                                             Please suggest a safer alternative.";
                                         let tool_results: Vec<ToolResultRecord> = ids
                                             .iter()
-                                            .map(|id| ToolResultRecord {
-                                                tool_use_id: id.clone(),
-                                                content: denial_msg.to_string(),
+                                            .map(|id| {
+                                                ToolResultRecord::text(
+                                                    id.clone(),
+                                                    denial_msg.to_string(),
+                                                )
                                             })
                                             .collect();
                                         if let Some(ref mut j) = journal {
@@ -1372,9 +1374,8 @@ pub fn run_repl(
                                     // Write tool result to journal
                                     let tool_results: Vec<ToolResultRecord> = tool_use_ids
                                         .iter()
-                                        .map(|id| ToolResultRecord {
-                                            tool_use_id: id.clone(),
-                                            content: observation.clone(),
+                                        .map(|id| {
+                                            ToolResultRecord::text(id.clone(), observation.clone())
                                         })
                                         .collect();
                                     if let Some(ref mut j) = journal {
@@ -2163,10 +2164,7 @@ mod tests {
 
         let tool_results: Vec<ToolResultRecord> = tool_use_ids
             .iter()
-            .map(|id| ToolResultRecord {
-                tool_use_id: id.clone(),
-                content: observation.clone(),
-            })
+            .map(|id| ToolResultRecord::text(id.clone(), observation.clone()))
             .collect();
 
         assert_eq!(tool_results.len(), 2);

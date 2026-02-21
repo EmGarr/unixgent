@@ -11,8 +11,9 @@ use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
 use serde::{Deserialize, Serialize};
-use ua_protocol::{ConversationMessage, ToolResultRecord, ToolUseRecord};
+use ua_protocol::{ConversationMessage, ResolvedMedia, ToolResultRecord, ToolUseRecord};
 
 // ---------------------------------------------------------------------------
 // Shared utilities (also used by audit.rs)
@@ -114,10 +115,14 @@ pub enum JournalEntry {
 // SessionJournal — append-only JSONL file
 // ---------------------------------------------------------------------------
 
+/// Approximate token cost for an image in the Anthropic API.
+const IMAGE_TOKEN_COST: usize = 1600;
+
 /// Append-only session journal backed by a JSONL file.
 pub struct SessionJournal {
     writer: BufWriter<File>,
     path: PathBuf,
+    media_dir: PathBuf,
 }
 
 impl SessionJournal {
@@ -127,9 +132,12 @@ impl SessionJournal {
             fs::create_dir_all(parent)?;
         }
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        // Derive media dir: replace .jsonl with .media/
+        let media_dir = path.with_extension("media");
         Ok(Self {
             writer: BufWriter::new(file),
             path,
+            media_dir,
         })
     }
 
@@ -164,11 +172,42 @@ impl SessionJournal {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Get the media sidecar directory path.
+    pub fn media_dir(&self) -> &Path {
+        &self.media_dir
+    }
+
+    /// Store raw binary media alongside the journal.
+    /// Creates the media directory on first use.
+    pub fn store_media(&self, filename: &str, data: &[u8]) -> io::Result<()> {
+        fs::create_dir_all(&self.media_dir)?;
+        fs::write(self.media_dir.join(filename), data)
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Context builder — journal entries → ConversationMessage
 // ---------------------------------------------------------------------------
+
+/// Resolve media references in tool results by loading sidecar files.
+///
+/// For each `MediaRef`, reads the raw file from `media_dir`, base64-encodes it,
+/// and pushes a `ResolvedMedia` onto `resolved_media`. Silently skips missing files.
+pub fn resolve_media_refs(results: &mut [ToolResultRecord], media_dir: &Path) {
+    for result in results.iter_mut() {
+        for mref in &result.media {
+            let path = media_dir.join(&mref.filename);
+            if let Ok(data) = fs::read(&path) {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+                result.resolved_media.push(ResolvedMedia {
+                    media_type: mref.media_type.clone(),
+                    data: encoded,
+                });
+            }
+        }
+    }
+}
 
 /// Approximate token count for a string (chars / 4).
 fn approx_tokens(s: &str) -> usize {
@@ -203,9 +242,10 @@ fn entry_tokens(entry: &JournalEntry) -> usize {
             }
             t
         }
-        JournalEntry::ToolResult { results, .. } | JournalEntry::Blocked { results, .. } => {
-            results.iter().map(|r| approx_tokens(&r.content)).sum()
-        }
+        JournalEntry::ToolResult { results, .. } | JournalEntry::Blocked { results, .. } => results
+            .iter()
+            .map(|r| approx_tokens(&r.content) + r.media.len() * IMAGE_TOKEN_COST)
+            .sum(),
         JournalEntry::Checkpoint { summary, .. } => approx_tokens(summary),
         JournalEntry::SystemPrompt { .. } => 0, // Not included in conversation messages
         JournalEntry::Summary { .. } => 0,      // Metadata, not conversation
@@ -347,6 +387,7 @@ fn merge_or_push_user(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ua_protocol::MediaRef;
 
     // --- Serde roundtrip tests ---
 
@@ -458,10 +499,10 @@ mod tests {
     fn serde_roundtrip_tool_result() {
         let entry = JournalEntry::ToolResult {
             ts: 1000,
-            results: vec![ToolResultRecord {
-                tool_use_id: "toolu_1".to_string(),
-                content: "file.txt\n".to_string(),
-            }],
+            results: vec![ToolResultRecord::text(
+                "toolu_1".to_string(),
+                "file.txt\n".to_string(),
+            )],
         };
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: JournalEntry = serde_json::from_str(&json).unwrap();
@@ -472,10 +513,10 @@ mod tests {
     fn serde_roundtrip_blocked() {
         let entry = JournalEntry::Blocked {
             ts: 1000,
-            results: vec![ToolResultRecord {
-                tool_use_id: "toolu_1".to_string(),
-                content: "Command blocked".to_string(),
-            }],
+            results: vec![ToolResultRecord::text(
+                "toolu_1".to_string(),
+                "Command blocked".to_string(),
+            )],
         };
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: JournalEntry = serde_json::from_str(&json).unwrap();
@@ -632,10 +673,10 @@ mod tests {
             },
             JournalEntry::ToolResult {
                 ts: 3,
-                results: vec![ToolResultRecord {
-                    tool_use_id: "toolu_1".to_string(),
-                    content: "file.txt\n".to_string(),
-                }],
+                results: vec![ToolResultRecord::text(
+                    "toolu_1".to_string(),
+                    "file.txt\n".to_string(),
+                )],
             },
         ];
 
@@ -790,10 +831,10 @@ mod tests {
             },
             JournalEntry::Blocked {
                 ts: 3,
-                results: vec![ToolResultRecord {
-                    tool_use_id: "toolu_1".to_string(),
-                    content: "Command blocked".to_string(),
-                }],
+                results: vec![ToolResultRecord::text(
+                    "toolu_1".to_string(),
+                    "Command blocked".to_string(),
+                )],
             },
         ];
 
@@ -904,10 +945,10 @@ mod tests {
             },
             JournalEntry::ToolResult {
                 ts: 3,
-                results: vec![ToolResultRecord {
-                    tool_use_id: "t1".to_string(),
-                    content: "file.txt".to_string(),
-                }],
+                results: vec![ToolResultRecord::text(
+                    "t1".to_string(),
+                    "file.txt".to_string(),
+                )],
             },
             JournalEntry::Response {
                 ts: 4,
@@ -921,10 +962,10 @@ mod tests {
             },
             JournalEntry::ToolResult {
                 ts: 5,
-                results: vec![ToolResultRecord {
-                    tool_use_id: "t2".to_string(),
-                    content: "hello world".to_string(),
-                }],
+                results: vec![ToolResultRecord::text(
+                    "t2".to_string(),
+                    "hello world".to_string(),
+                )],
             },
         ];
 
@@ -1062,10 +1103,10 @@ mod tests {
             },
             JournalEntry::ToolResult {
                 ts: 3,
-                results: vec![ToolResultRecord {
-                    tool_use_id: "t1".to_string(),
-                    content: "foo.txt".to_string(),
-                }],
+                results: vec![ToolResultRecord::text(
+                    "t1".to_string(),
+                    "foo.txt".to_string(),
+                )],
             },
             JournalEntry::SystemPrompt {
                 ts: 3,
@@ -1243,6 +1284,99 @@ mod tests {
         assert!(
             !json.contains("attachments"),
             "empty attachments should be skipped in serialization"
+        );
+    }
+
+    // --- Media sidecar tests ---
+
+    #[test]
+    fn journal_media_dir_derived_from_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let journal = SessionJournal::new(path).unwrap();
+        assert!(journal.media_dir().ends_with("test.media"));
+    }
+
+    #[test]
+    fn store_and_read_media() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let journal = SessionJournal::new(path).unwrap();
+
+        let data = b"\x89PNG\r\n\x1a\nfake png data";
+        journal.store_media("toolu_abc.png", data).unwrap();
+
+        let stored = std::fs::read(journal.media_dir().join("toolu_abc.png")).unwrap();
+        assert_eq!(stored, data);
+    }
+
+    #[test]
+    fn resolve_media_refs_loads_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let media_dir = dir.path().join("test.media");
+        std::fs::create_dir_all(&media_dir).unwrap();
+        std::fs::write(media_dir.join("toolu_1.png"), b"raw png bytes").unwrap();
+
+        let mut results = vec![ToolResultRecord {
+            tool_use_id: "toolu_1".to_string(),
+            content: "[binary: 13 bytes, image/png]".to_string(),
+            media: vec![MediaRef {
+                media_type: "image/png".to_string(),
+                filename: "toolu_1.png".to_string(),
+            }],
+            resolved_media: vec![],
+        }];
+
+        resolve_media_refs(&mut results, &media_dir);
+        assert_eq!(results[0].resolved_media.len(), 1);
+        assert_eq!(results[0].resolved_media[0].media_type, "image/png");
+        // Verify it's valid base64
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&results[0].resolved_media[0].data)
+            .unwrap();
+        assert_eq!(decoded, b"raw png bytes");
+    }
+
+    #[test]
+    fn resolve_media_refs_missing_file_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let media_dir = dir.path().join("test.media");
+        // Don't create the file — it's missing
+
+        let mut results = vec![ToolResultRecord {
+            tool_use_id: "toolu_1".to_string(),
+            content: "[binary: 100 bytes, image/png]".to_string(),
+            media: vec![MediaRef {
+                media_type: "image/png".to_string(),
+                filename: "toolu_1.png".to_string(),
+            }],
+            resolved_media: vec![],
+        }];
+
+        resolve_media_refs(&mut results, &media_dir);
+        // Should silently skip, not crash
+        assert!(results[0].resolved_media.is_empty());
+    }
+
+    #[test]
+    fn entry_tokens_media_ref_uses_fixed_cost() {
+        let entry = JournalEntry::ToolResult {
+            ts: 1,
+            results: vec![ToolResultRecord {
+                tool_use_id: "toolu_1".to_string(),
+                content: "[binary: 204800 bytes, image/png]".to_string(),
+                media: vec![MediaRef {
+                    media_type: "image/png".to_string(),
+                    filename: "toolu_1.png".to_string(),
+                }],
+                resolved_media: vec![],
+            }],
+        };
+        let tokens = entry_tokens(&entry);
+        // Should include IMAGE_TOKEN_COST (1600) for the media ref
+        assert!(
+            tokens >= IMAGE_TOKEN_COST,
+            "tokens={tokens}, expected >= {IMAGE_TOKEN_COST}"
         );
     }
 }
