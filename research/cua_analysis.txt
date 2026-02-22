@@ -1,0 +1,687 @@
+Perfect! Now I have enough information. Let me compile a comprehensive analysis document.
+
+## Deep Code Analysis: CUA (Computer-Use Agents) Project
+
+Based on my thorough exploration of the CUA codebase, here is a detailed technical analysis:
+
+---
+
+## 1. ARCHITECTURE OVERVIEW
+
+### High-Level Structure
+CUA is a **multi-layered, multi-platform agent orchestration framework** that enables AI agents to control desktop/mobile environments through:
+
+- **Agent SDK** (Python) - High-level API for agent developers
+- **Computer SDK** (Python/TypeScript) - Cross-platform computer interface abstraction
+- **Computer Server** (Python/FastAPI) - OS-level automation handler running on target machine
+- **VM Providers** (Swift/Python) - Infrastructure management (Lume, Docker, Cloud, QEMU)
+- **CuaBot** (TypeScript/Node) - Multi-agent sandboxing CLI with web GUI integration
+
+**Key Crates Structure:**
+```
+cua/
+├── libs/python/
+│   ├── agent/         # ComputerAgent + multi-model orchestration
+│   ├── computer/      # Computer interface SDK
+│   ├── computer-server/  # FastAPI server for sandbox execution
+│   ├── core/          # Telemetry + shared utilities
+│   ├── som/           # Set-of-Mark visual grounding
+│   ├── bench-ui/      # Benchmark UI components
+│   └── cua-cli/       # CLI tools
+├── libs/typescript/
+│   ├── computer/      # TypeScript Computer SDK
+│   ├── agent/         # TypeScript agent orchestration
+│   ├── cua-cli/       # CLI command interface
+│   └── core/          # Shared types + utilities
+├── libs/lume/         # Swift VM management (Apple Virtualization.Framework)
+├── libs/lumier/       # Docker-compatible VM interface
+├── libs/cuabot/       # Multi-agent sandbox with native window support
+├── libs/kasm/         # Kasm-based Linux desktop container
+└── libs/qemu-docker/  # QEMU VM provider
+```
+
+---
+
+## 2. SANDBOX/VM SYSTEM
+
+### Multi-Provider Architecture (`libs/python/computer/computer/providers/`)
+
+**Supported Providers (VMProviderType enum):**
+
+1. **LUME** - Native macOS/Linux VMs
+   - File: `/libs/python/computer/computer/providers/lume/provider.py`
+   - Uses Swift library (`libs/lume/src/VM/`) for Apple Virtualization.Framework
+   - Zero-copy disk images, VNC via localhost
+   - Supports DHCP lease parsing for IP resolution
+
+2. **LUMIER** - Docker-compatible VM interface
+   - Docker container wrapper around Lume VMs
+   - noVNC web interface on port 8006
+   - File sharing via volume mounts
+   - Uses `lumier-server` inside container
+
+3. **CLOUD/CLOUDV2** - Cloud-hosted containers
+   - File: `/libs/python/computer/computer/providers/cloud/provider.py` and `providerv2.py`
+   - API authentication via `X-API-Key` header
+   - Container name verification via cua.ai API
+   - Session caching (TTL configurable via `CUA_AUTH_TTL_SECONDS`)
+
+4. **DOCKER** - Local Docker containers
+   - Direct Docker API usage
+   - Kasm-based Ubuntu containers from `libs/kasm/`
+
+5. **WINSANDBOX** - Windows Sandbox (ephemeral only)
+   - Minimal overhead alternative to full VMs
+
+6. **QEMU** - QEMU-based VMs (Linux)
+   - Docker-based QEMU runner
+
+### VM Lifecycle Management
+
+**Swift VM Implementation** (`libs/lume/src/VM/VM.swift`):
+```swift
+class VM {
+    var vmDirContext: VMDirContext
+    var virtualizationService: VMVirtualizationService?
+    var vncService: VNCService
+    
+    // State tracking
+    var isRunning: Bool { DHCPLeaseParser + NetworkUtils.isReachable() }
+    var details: VMDetails { IP, VNC URL, disk size, etc. }
+}
+```
+
+**Key classes:**
+- `DarwinVM` - macOS-specific (uses Apple Virtualization.Framework)
+- `LinuxVM` - QEMU/KVM-based
+- VNC service for display sharing
+- ClipboardWatcher for shared clipboard
+
+**Base Provider Interface** (`libs/python/computer/computer/providers/base.py`):
+```python
+class BaseVMProvider(AsyncContextManager):
+    async def get_vm(name: str, storage: Optional[str]) -> Dict[str, Any]
+    async def run_vm(image: str, name: str, run_opts: Dict) -> Dict[str, Any]
+    async def get_ip(name: str) -> str  # Wait indefinitely for VM IP
+    async def stop_vm(name: str) -> Dict[str, Any]
+    async def restart_vm(name: str) -> Dict[str, Any]
+```
+
+---
+
+## 3. HOW AGENTS CONTROL THE COMPUTER
+
+### Desktop Interaction Protocol
+
+**Two-layer communication model:**
+
+#### Layer 1: Client → Computer Server
+**Protocol:** WebSocket + REST API (depending on feature)
+**Endpoint:** `ws://vm-ip:8000/ws` or `https://vm-ip:8443/ws` (with API key)
+
+**File:** `/libs/python/computer/computer/interface/generic.py`
+
+**Commands flow:**
+```python
+async def left_click(x: Optional[int], y: Optional[int]) -> None:
+    await self._send_command("left_click", {"x": x, "y": y})
+    await self._handle_delay(delay)
+```
+
+**_send_command implementation:**
+- Uses WebSocket for primary communication
+- Falls back to REST for Playwright/browser commands
+- Authentication headers: `X-API-Key`, `X-Container-Name`
+- Message format: `{"command": "...", "params": {...}}`
+
+#### Layer 2: Computer Server → OS Automation
+**File:** `/libs/python/computer-server/computer_server/main.py`
+
+**Handler Factory pattern** (`computer_server/handlers/factory.py`):
+```python
+handlers = {
+    # Mouse actions
+    "left_click": automation_handler.left_click,
+    "right_click": automation_handler.right_click,
+    "mouse_down": automation_handler.mouse_down,
+    "drag_to": automation_handler.drag_to,
+    
+    # Keyboard
+    "type_text": automation_handler.type_text,
+    "press_key": automation_handler.press_key,
+    "hotkey": automation_handler.hotkey,
+    
+    # Screenshots
+    "screenshot": automation_handler.screenshot,
+    
+    # File operations
+    "read_text": file_handler.read_text,
+    "write_text": file_handler.write_text,
+    "list_dir": file_handler.list_dir,
+    
+    # Window management
+    "open": window_handler.open,
+    "launch": window_handler.launch,
+    "get_application_windows": window_handler.get_application_windows,
+    
+    # Accessibility
+    "get_accessibility_tree": accessibility_handler.get_accessibility_tree,
+    
+    # Desktop
+    "get_desktop_environment": desktop_handler.get_desktop_environment,
+    
+    # Shell
+    "run_command": automation_handler.run_command,
+}
+```
+
+**Platform-specific handlers:**
+- `linux.py` - pyautogui + DBus accessibility
+- `macos.py` - PyObjC + Accessibility APIs
+- `windows.py` - pyautogui + UIAutomation
+- `android.py` - ADB + Uiautomator2
+- `generic.py` - Base implementation
+
+### Screenshot Handling
+
+```python
+async def screenshot(
+    boxes: Optional[List[Tuple[int,int,int,int]]] = None,
+    box_color: str = "#FF0000",
+    scale_factor: float = 1.0,
+) -> bytes:
+    result = await self._send_command("screenshot")
+    screenshot = decode_base64_image(result["image_data"])
+    # Optional: Draw boxes and scale
+    return screenshot
+```
+
+**Base64 encoding for transport** - Images sent as base64 in JSON responses
+
+### Authentication & Security
+
+**Cloud provider authentication:**
+```python
+class AuthenticationManager:
+    async def auth(container_name: str, api_key: str) -> bool:
+        # 1. VM identity verification (container_name match)
+        # 2. Session caching (with configurable TTL)
+        # 3. TryCUA API verification: 
+        #    GET https://www.cua.ai/api/vm/auth?container_name=X
+        #    Header: Authorization: Bearer {api_key}
+```
+
+---
+
+## 4. AGENT SDK
+
+### ComputerAgent Architecture
+
+**File:** `/libs/python/agent/agent/agent.py` (43KB)
+
+**Key classes:**
+```python
+class ComputerAgent:
+    def __init__(
+        self,
+        model: str,  # liteLLM model ID
+        tools: Optional[List[Any]] = None,
+        custom_loop: Optional[Callable] = None,
+        callbacks: Optional[List[Any]] = None,
+        instructions: Optional[str] = None,
+        trajectory_dir: Optional[str] = None,
+        max_trajectory_budget: Optional[float | dict] = None,
+        use_prompt_caching: Optional[bool] = False,
+        ...
+    )
+    
+    async def run(
+        self,
+        messages: List[Dict[str, Any]],
+        stream: bool = False,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        # Runs agent loop, yields results
+```
+
+**Agent Loop Selection (adapter-based):**
+```python
+from .adapters import (
+    AzureMLAdapter,
+    CUAAdapter,
+    HuggingFaceLocalAdapter,
+    MLXVLMAdapter,
+)
+```
+
+Maps model strings to:
+1. **CUAAdapter** - Anthropic Claude + OpenAI (uses `_default_loop`)
+2. **HuggingFaceLocalAdapter** - Local HF models (UI-TARS)
+3. **MLXVLMAdapter** - Apple MLX models
+4. **AzureMLAdapter** - Azure hosted models
+
+### Tool Definition & Execution
+
+**Multi-tool framework:**
+```python
+from .tools.base import BaseComputerTool, BaseTool
+
+# Custom tools via docstring introspection:
+def save_note(content: str, filename: str = "note.txt") -> str:
+    """Save content to a note file
+    
+    Parameters
+    ----------
+    content : str
+        Content to save
+    """
+    # Implementation
+```
+
+**Tool callbacks (instrumentation):**
+```python
+from .callbacks import (
+    BudgetManagerCallback,
+    ImageRetentionCallback,
+    LoggingCallback,
+    OtelCallback,
+    PromptInstructionsCallback,
+    TelemetryCallback,
+    TrajectorySaverCallback,
+)
+```
+
+### Message Streaming & Response Types
+
+**Output message types:**
+```python
+# computer_call - Agent executed desktop action
+{"type": "computer_call", "action": {"type": "left_click", "x": 100, "y": 200}}
+
+# computer_call_output - Result of desktop action
+{"type": "computer_call_output", "output": {"image_url": "base64/..."}}
+
+# function_call - Custom tool invocation
+{"type": "function_call", "name": "save_note", "arguments": {...}}
+
+# function_call_output - Custom tool result
+{"type": "function_call_output", "output": "Saved note to note.txt"}
+
+# message - LLM text response
+{"type": "message", "content": [{"type": "text", "text": "..."}]}
+```
+
+### Model Support
+
+**Tested models:**
+- Anthropic: claude-opus-4, claude-sonnet-4, claude-3.5-sonnet
+- OpenAI: computer-use-preview, gpt-4-turbo
+- Local: UI-TARS, OmniParser
+- Azure: Custom deployments
+
+**Vision capabilities:**
+- Screenshot → base64 PNG
+- Image coordinates → screen coordinates (with scaling)
+- Bounding box visualization
+
+---
+
+## 5. MULTI-PLATFORM SUPPORT
+
+### Cross-Platform Interface Abstraction
+
+**File:** `/libs/python/computer/computer/interface/` with subclasses:
+
+```
+interface/
+├── base.py          # BaseComputerInterface ABC
+├── generic.py       # GenericComputerInterface (WebSocket/REST)
+├── linux.py         # LinuxComputerInterface (extends Generic)
+├── macos.py         # MacOSComputerInterface (extends Generic)
+├── windows.py       # WindowsComputerInterface (extends Generic)
+├── android.py       # AndroidComputerInterface (extends Generic)
+└── factory.py       # OSType factory
+```
+
+**Initialization chain:**
+```python
+# Computer detects OS from provider
+if os_type == "macos":
+    interface = MacOSComputerInterface(ip_address, ...)
+elif os_type == "linux":
+    interface = LinuxComputerInterface(ip_address, ...)
+elif os_type == "windows":
+    interface = WindowsComputerInterface(ip_address, ...)
+elif os_type == "android":
+    interface = AndroidComputerInterface(ip_address, ...)
+```
+
+**All extend GenericComputerInterface which handles:**
+- WebSocket connection management with auto-reconnect
+- Base64 image encoding/decoding
+- Command timeout & retry logic
+- Delay handling between operations
+
+### Server-Side Handler Implementation
+
+**Factory pattern in computer-server:**
+```python
+# File: computer_server/handlers/factory.py
+(accessibility_handler,
+ automation_handler,
+ diorama_handler,
+ file_handler,
+ desktop_handler,
+ window_handler) = HandlerFactory.create_handlers()
+
+# OS detection via environment or pyplatform
+if OS_TYPE == "linux":
+    handlers = LinuxAutomationHandler()
+elif OS_TYPE == "darwin":
+    handlers = MacOSAutomationHandler()
+elif OS_TYPE == "windows":
+    handlers = WindowsAutomationHandler()
+elif OS_TYPE == "android":
+    handlers = AndroidAutomationHandler()
+```
+
+**Handler depth in each platform:**
+- **Linux (21KB)** - DBus accessibility, X11/Wayland awareness
+- **macOS (52KB)** - PyObjC, Accessibility APIs, AXUIElement introspection
+- **Windows (28KB)** - Windows UIAutomation, Win32 APIs
+- **Android (35KB)** - ADB integration, Uiautomator2
+
+---
+
+## 6. SDK: Building Agents on CUA
+
+### Python SDK Example
+
+**File:** `/libs/python/agent/example.py`
+
+```python
+from computer import Computer
+from agent import ComputerAgent
+
+async with Computer(
+    os_type="linux",
+    provider_type="cloud",
+    name=os.getenv("CUA_CONTAINER_NAME"),
+    api_key=os.getenv("CUA_API_KEY"),
+) as computer:
+    agent = ComputerAgent(
+        model="anthropic/claude-sonnet-4-5-20250929",
+        tools=[computer],
+        only_n_most_recent_images=3,
+        trajectory_dir="trajectories",
+        use_prompt_caching=True,
+    )
+    
+    history = []
+    async for result in agent.run(history, stream=False):
+        history += result["output"]
+```
+
+### TypeScript SDK
+
+**File:** `/libs/typescript/computer/src/`
+
+Provides equivalent bindings to Python SDK for Node.js/browser agents.
+
+### Custom Tools (Python)
+
+**Via docstring inspection:**
+```python
+@sandboxed()  # Decorator marks tool as sandboxed
+def read_file(location: str) -> str:
+    """Read contents of a file
+    
+    Parameters
+    ----------
+    location : str
+        Path to the file to read
+    
+    Returns
+    -------
+    str
+        Contents of the file
+    """
+    with open(location, "r") as f:
+        return f.read()
+
+# Register with agent
+agent = ComputerAgent(
+    model="...",
+    tools=[computer, read_file, save_note],
+)
+```
+
+### Trajectory Saving & Replay
+
+**Agent saves execution trajectories** (JSONL format):
+```python
+ComputerAgent(
+    trajectory_dir="trajectories",
+    max_trajectory_budget={
+        "max_budget": 1.0,  # $1 cost limit
+        "raise_error": True,
+        "reset_after_each_run": False,
+    }
+)
+```
+
+**Trajectory format:**
+- Timestamped actions + screenshots
+- Tool invocations + results
+- Cost tracking per operation
+- Useful for training RL models (cua-bench)
+
+---
+
+## 7. INTERESTING/NOVEL INFRASTRUCTURE PATTERNS
+
+### 1. **WebSocket + REST Dual Protocol**
+- Primary: WebSocket for continuous agent-computer interaction
+- Fallback: REST for browser commands (Playwright integration)
+- Handles large file transfers via base64 chunking (5MB chunks)
+
+### 2. **Set-of-Mark (SOM) Visual Grounding**
+**File:** `/libs/python/som/`
+
+Generates numbered bounding boxes on screenshots for structured visual understanding:
+```
+Agent sees: "Click on button 5"
+Server renders: Screenshot with numbered boxes
+Agent executes: left_click(x_of_box_5, y_of_box_5)
+```
+
+### 3. **Multi-Model Orchestration via liteLLM**
+Single SDK supports 100+ models via liteLLM abstraction:
+- Anthropic Claude (vision + extended thinking)
+- OpenAI GPT-4V (computer-use-preview)
+- Local models (UI-TARS, OmniParser)
+- Azure deployments
+- LM Studio, Ollama proxies
+
+### 4. **Playground UI (Real-time Agent Debugging)**
+**File:** `/libs/python/agent/agent/ui/`
+
+Browser-based UI showing:
+- Live agent thinking
+- Screenshot with action overlays
+- Message history
+- Tool execution results
+
+### 5. **DHCP Lease Parsing for VM IP Detection**
+(Swift) Reads macOS DHCP lease files to find VM IP without constant polling:
+```swift
+DHCPLeaseParser.getIPAddress(forMAC: macAddress) -> String?
+```
+
+### 6. **CuaBot Multi-Agent Sandboxing**
+**File:** `/libs/cuabot/src/cuabotd.ts`
+
+HTTP server (port 7842) that:
+- Spawns Docker containers with native window proxying (Xpra HTML5)
+- Provides screenshot + click/type API
+- Manages session lifecycle
+- Works with multiple concurrent agents
+
+**Key features:**
+- Playwright-based screenshot overlays
+- Window manager integration
+- Shell session management (via node-pty)
+- Telemetry event streaming
+
+### 7. **MCP (Model Context Protocol) Integration**
+**File:** `/libs/python/computer-server/computer_server/mcp_server.py`
+
+Computer-server also exposes MCP endpoint at `/mcp` for:
+- Integration with Claude AI
+- Tool discovery
+- Schema generation
+
+### 8. **Accessibility Tree Extraction**
+**Platform-specific accessibility APIs:**
+- Linux: DBus + AT-SPI2
+- macOS: NSAccessibility (PyObjC)
+- Windows: UIAutomation
+- Android: Uiautomator2
+
+Returns structured XML/JSON of UI elements for text-only understanding
+
+### 9. **Automatic Image Scaling & Coordinate Transformation**
+Handles screenshots at different resolutions:
+```python
+screen_size = await interface.get_screen_size()  # 1920x1080
+screenshot = await interface.screenshot()         # 1024x768
+
+# Internal scaling factor applied
+# Coordinates from agent automatically scaled
+```
+
+### 10. **Telemetry & Cost Tracking**
+**File:** `/libs/python/core/telemetry.py`
+
+OpenTelemetry integration:
+- Token counting per API call
+- Cost calculation (Claude/OpenAI rates)
+- Budget enforcement (raise error if exceeded)
+- Event streaming for agent monitoring
+
+---
+
+## 8. LIMITATIONS & WEAKNESSES
+
+### 1. **Single-Monitor Assumption**
+- Screenshot always full primary display
+- No multi-monitor support
+- No viewport-specific rendering
+
+### 2. **Latency-Sensitive Operations**
+- Each action = separate WebSocket round-trip
+- ~100-200ms overhead per click/keystroke
+- No batch operation support
+- Inefficient for rapid UI interactions
+
+### 3. **Vision Model Dependency**
+- Relies entirely on LLM vision capabilities
+- No built-in OCR (depends on model)
+- No structural HTML parsing for web
+- Screenshots only (no DOM access)
+
+### 4. **Complex State Management**
+- Agent must maintain full conversation history
+- No automatic context compression
+- Memory grows unbounded for long runs
+- No built-in session persistence
+
+### 5. **Limited File Transfer Optimization**
+- Large files sent as base64 (3x size increase)
+- Chunked at 1MB/5MB (slow for GBs of data)
+- No streaming upload/download
+- Network overhead significant
+
+### 6. **OS-Specific Behavior Drift**
+- 7 different handler implementations
+- Easy to have feature gaps across platforms
+- Hard to test all combinations
+- Windows/macOS/Linux feature parity unknown
+
+### 7. **Authentication Architecture**
+- Cloud provider requires external API call (`cua.ai/api/vm/auth`)
+- Single point of failure
+- Session caching only 60 seconds (default)
+- No offline/local auth fallback
+
+### 8. **No Cross-VM Coordination**
+- Each agent controls one VM
+- No swarm/multi-agent orchestration
+- Can't share clipboard between agents
+- No inter-VM communication protocol
+
+### 9. **Fixed Command Set**
+- ~60 hardcoded commands in server
+- Custom handlers require code changes
+- No plugin/extension mechanism
+- New OS feature support = new handler code
+
+### 10. **Limited Accessibility for Non-Visual Tasks**
+- Heavily dependent on vision (screenshot-based)
+- Text-only accessibility tree rarely used
+- No command-line SSH equivalent
+- Bad for headless automation
+
+---
+
+## 9. KEY FILE REFERENCES
+
+### Core Architecture
+- `/libs/python/computer/computer/computer.py` - Main Computer class (80KB)
+- `/libs/python/agent/agent/agent.py` - ComputerAgent orchestration (43KB)
+- `/libs/python/computer-server/computer_server/main.py` - FastAPI server (38KB)
+
+### Interface Layer
+- `/libs/python/computer/computer/interface/generic.py` - WebSocket client (50KB)
+- `/libs/python/computer-server/computer_server/handlers/generic.py` - Base handler (16KB)
+
+### VM Management
+- `/libs/lume/src/VM/VM.swift` - VM lifecycle management (Swift)
+- `/libs/python/computer/computer/providers/base.py` - Provider interface
+- `/libs/python/computer/computer/providers/cloud/provider.py` - Cloud provider impl
+- `/libs/python/computer/computer/providers/lume/provider.py` - Lume provider impl
+
+### Agent SDK
+- `/libs/python/agent/agent/decorators.py` - Tool registration
+- `/libs/python/agent/agent/callbacks.py` - Instrumentation hooks
+- `/libs/python/agent/agent/loops/` - Agent loop implementations
+
+### Multi-platform
+- `/libs/python/computer-server/computer_server/handlers/linux.py` (21KB)
+- `/libs/python/computer-server/computer_server/handlers/macos.py` (52KB)
+- `/libs/python/computer-server/computer_server/handlers/windows.py` (28KB)
+- `/libs/python/computer-server/computer_server/handlers/android.py` (35KB)
+
+### Sandboxing
+- `/libs/cuabot/src/cuabotd.ts` - Multi-agent sandbox server
+- `/libs/cuabot/src/client.ts` - Client bindings
+- `/libs/kasm/Dockerfile` - Kasm-based Linux desktop
+
+### Testing & Benchmarking
+- `/libs/cua-bench/` - OSWorld, ScreenSpot, Windows Arena adapters
+- `/libs/python/agent/benchmarks/` - Example benchmark scripts
+
+---
+
+## SUMMARY
+
+**CUA is a sophisticated, production-grade framework for agent-computer interaction** that:
+
+1. **Abstracts multiple VM backends** (Lume, Docker, Cloud, QEMU) with pluggable providers
+2. **Implements platform-agnostic desktop automation** via OS-specific handler factories
+3. **Uses modern protocols** (WebSocket + REST) with retry/reconnection logic
+4. **Supports 100+ LLM models** through liteLLM integration
+5. **Provides instrumentation** (telemetry, cost tracking, trajectory saving) for research
+6. **Includes multi-agent sandboxing** (CuaBot) with native window proxying
+7. **Handles complex state** (screenshots, accessibility trees, file I/O, shell commands)
+
+**Weaknesses are primarily around scalability** (latency per action), **feature coverage** (7 independent handler implementations), and **fundamental architectural constraints** (screenshot-only vision, external auth dependency).

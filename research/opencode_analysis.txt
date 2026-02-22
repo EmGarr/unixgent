@@ -1,0 +1,422 @@
+Excellent! Now I have a comprehensive understanding of the OpenCode project. Let me compile the analysis:
+
+## Comprehensive Deep Code Analysis of OpenCode
+
+I've thoroughly analyzed the OpenCode project. Here's my detailed technical analysis:
+
+### 1. **Architecture Overview**
+
+**Language & Framework:** Go 1.24+, built with:
+- **TUI Framework:** Bubble Tea (Charm) for terminal UI
+- **LLM Integration:** Multi-provider support (Claude, OpenAI, Gemini, Groq, AWS Bedrock, Azure, Google Vertex AI, GitHub Copilot, OpenRouter)
+- **Database:** SQLite3 via `ncruces/go-sqlite3`
+- **IPC/CLI:** Cobra for CLI argument handling
+
+**Project Structure:**
+```
+opencode/
+├── cmd/root.go              # CLI entry point, TUI setup
+├── main.go                  # Simple dispatcher
+├── internal/
+│   ├── app/                 # Core application services
+│   ├── config/              # Configuration loading & management
+│   ├── db/                  # SQLite database layer (sqlc generated)
+│   ├── llm/
+│   │   ├── provider/        # LLM provider implementations
+│   │   ├── agent/           # Agentic logic & tool orchestration
+│   │   ├── models/          # Model registry & definitions
+│   │   ├── tools/           # Tool implementations
+│   │   └── prompt/          # System prompts for agents
+│   ├── tui/                 # Terminal UI components
+│   ├── message/             # Message types & serialization
+│   ├── session/             # Session management
+│   ├── permission/          # Permission system for tools
+│   ├── lsp/                 # Language Server Protocol integration
+│   ├── history/             # File change tracking
+│   ├── pubsub/              # Event pub-sub broker
+│   └── logging/             # Logging infrastructure
+└── go.mod, go.sum           # Dependencies
+```
+
+### 2. **How It Controls the Computer - Shell Execution**
+
+**Bash Tool Implementation** (`/internal/llm/tools/bash.go`):
+
+The bash tool uses a **persistent shell session** model:
+- **Location:** `/internal/llm/tools/shell/shell.go`
+- **Architecture:** Singleton pattern with `GetPersistentShell()` that creates one shell per working directory
+- **Implementation:** Executes shell commands via `exec.Cmd` with stdin/stdout/stderr pipes
+- **Configuration:** Shell path and args from config, defaults to `$SHELL` env var or `/bin/bash`
+- **Features:**
+  - Persistent state across commands (environment variables, CWD, virtual envs persist)
+  - Timeout support (1 min default, 10 min max)
+  - Output truncation (30KB max, shows first/last 15KB with middle truncated)
+  - Command queue with concurrent execution handling
+  - Exit code and stderr tracking
+
+**Security Features:**
+- **Banned commands:** curl, wget, nc, telnet, lynx, w3m, firefox, chrome, etc. (prevents unintended downloads/network calls)
+- **Safe read-only whitelist:** ls, git, go, npm commands are auto-approved
+- **Permission system:** Non-safe commands trigger permission dialogs
+- **Truncation:** Prevents LLM context exhaustion from large outputs
+
+### 3. **TUI Implementation**
+
+**Framework:** Bubble Tea (Charm's TUI framework)
+- **File:** `/internal/tui/tui.go` (965 lines)
+- **Pattern:** Elm-inspired component model with `Update()` and `View()` methods
+
+**Architecture:**
+```
+TUI Root Model (appModel)
+├── Pages (Page ID-based routing)
+│   ├── Chat Page (messages, editor, session)
+│   └── Logs Page
+├── Dialogs
+│   ├── Permission Dialog (request approval)
+│   ├── Session Switcher
+│   ├── Commands Dialog (custom & built-in commands)
+│   ├── Model Selector
+│   ├── File Picker
+│   ├── Theme Selector
+│   ├── Help Dialog
+│   ├── Quit Confirmation
+│   └── Custom Arguments Dialog
+└── Status Bar
+```
+
+**Key Components:**
+- **Chat Component** (`/internal/tui/components/chat/`): Message list, editor, sidebar
+- **Editor:** Vim-like mode with Ctrl+S to send, Ctrl+E for external editor
+- **Message Rendering:** Supports markdown with syntax highlighting (Chroma)
+- **Responsive Layout:** Using `lipgloss` for styling and positioning
+
+**Event Flow:**
+1. TUI subscribes to services via pub-sub brokers
+2. Services publish events (logging, messages, permissions, sessions, agent events)
+3. TUI receives events on channels and updates display
+4. User input triggers commands sent to LLM agent
+
+### 4. **LLM Integration**
+
+**Provider Layer** (`/internal/llm/provider/`):
+
+Implemented providers:
+- **Anthropic:** Native SDK + Claude cache support + Bedrock support
+- **OpenAI:** Using official SDK
+- **Gemini:** Google Cloud integration with VertexAI support
+- **Azure OpenAI:** Enterprise Azure integration
+- **GitHub Copilot:** Token-based authentication
+- **Groq:** OpenAI-compatible API wrapper
+- **OpenRouter:** Multi-model gateway wrapper
+- **X.AI:** (Grok models)
+- **Local:** Self-hosted OpenAI-compatible endpoints
+
+**Key Abstraction:**
+```go
+type Provider interface {
+    SendMessages(ctx, messages, tools) (*ProviderResponse, error)
+    StreamResponse(ctx, messages, tools) <-chan ProviderEvent
+    Model() models.Model
+}
+```
+
+**Features:**
+- **Streaming responses** via event channels
+- **Tool use/function calling** with structured JSON parameters
+- **Token usage tracking** with cost calculation
+- **Cache support** for Anthropic (prompt/response caching to reduce costs)
+- **Thinking mode** for reasoning models (via provider options)
+- **Extended thinking** for o1/o3 models
+
+**Cost Tracking:**
+- Calculates cost per session based on model rates
+- Tracks cached token costs separately
+- Stores in session: `prompt_tokens`, `completion_tokens`, `cost`
+
+### 5. **Tool System**
+
+**Tool Architecture** (`/internal/llm/tools/tools.go`):
+
+```go
+type BaseTool interface {
+    Info() ToolInfo          // Metadata for LLM
+    Run(ctx, call) Response  // Execution
+}
+
+type ToolInfo struct {
+    Name        string
+    Description string      // Full instruction text for LLM
+    Parameters  map[string]any
+    Required    []string
+}
+```
+
+**Built-in Tools:**
+
+| Tool | Purpose | Key Feature |
+|------|---------|------------|
+| **bash** | Execute shell commands | Persistent session, timeout, output truncation |
+| **edit** | Replace text in files | Requires context-rich old_string for uniqueness |
+| **write** | Create/overwrite files | Diff tracking, permission checks |
+| **view** | Read file contents | Line numbers, offset/limit support |
+| **glob** | Find files by pattern | Sorted by modification time |
+| **grep** | Search file contents | Regex + literal_text support, 100 file limit |
+| **ls** | List directories | Ignore patterns, formatted output |
+| **patch** | Apply unified diffs | Git-aware, conflict detection |
+| **fetch** | HTTP requests | URL fetching with timeout |
+| **sourcegraph** | Code search public repos | Rate-limited API |
+| **diagnostics** | LSP diagnostics | Per-file errors from language servers |
+| **agent** | Recursive sub-agent | Allows delegating tasks to another agent |
+
+**MCP Support** (`/internal/llm/agent/mcp-tools.go`):
+- **Model Context Protocol** tools dynamically loaded from config
+- Supports both **stdio** and **SSE** transports
+- Tool discovery and execution with permission checks
+- Integration as regular tools in tool list
+
+**Context Threading:**
+Tools receive context with:
+```go
+ctx = context.WithValue(ctx, SessionIDContextKey, sessionID)
+ctx = context.WithValue(ctx, MessageIDContextKey, messageID)
+```
+Used for permission tracking and session-specific operations.
+
+### 6. **Agent Loop**
+
+**File:** `/internal/llm/agent/agent.go` (758 lines)
+
+**Flow:**
+```
+User Prompt
+    ↓
+Run(ctx, sessionID, content) → creates goroutine
+    ↓
+createUserMessage() → saves to DB
+    ↓
+streamAndHandleEvents() → provider.StreamResponse()
+    ↓
+for each ProviderEvent:
+  - ContentDelta → append to message
+  - ToolUseStart → add tool call
+  - ToolUseStop → finish tool call
+  - EventComplete → set finish reason & save
+    ↓
+Execute Tool Calls (sequentially):
+  - Get tool from available tools
+  - Check permissions
+  - Run tool with context
+  - Collect results
+    ↓
+Create Tool Result Message
+    ↓
+if FinishReasonToolUse: loop back with tool results
+else: return response
+```
+
+**Key Features:**
+- **Session Busy Check:** Prevents concurrent requests on same session
+- **Cancellation Support:** Context cancellation propagates to tools
+- **Title Generation:** Auto-generates session title from first prompt (async)
+- **Cost Tracking:** Updates session with token counts and cost
+- **Context Summarization:** Auto-compacts long sessions when approaching context limit
+- **Message Types:** User, Assistant, Tool (results), with role-specific handling
+
+**Active Requests Tracking:**
+Uses `sync.Map` to track active cancellation funcs per sessionID:
+```go
+a.activeRequests.Store(sessionID, cancel)
+```
+
+### 7. **Security & Sandboxing**
+
+**Permission System** (`/internal/permission/permission.go`):
+
+```go
+type PermissionRequest struct {
+    ID, SessionID, ToolName, Description, Action, Path string
+    Params any
+}
+```
+
+**Features:**
+- **Per-session permissions:** Track which operations user approved
+- **Tool-action-path combo:** Identifies unique permissions
+- **Auto-approve sessions:** Non-interactive mode auto-approves all
+- **Permission persistence:** Can grant "permanent" permissions across sessions
+- **Blocking:** Tool execution blocked until permission granted/denied
+
+**Command Restrictions:**
+- Banned network/browser commands (curl, wget, firefox)
+- Safe read-only commands auto-approved
+- Custom commands must be whitelisted in code
+
+**No OS-level Sandboxing:**
+Unlike UnixAgent, OpenCode doesn't implement:
+- macOS Seatbelt sandbox
+- Linux Landlock sandbox
+- Just application-level permission checks
+
+### 8. **Session & Message Storage**
+
+**Database** (`/internal/db/`): SQLite with migrations
+
+**Schema:**
+```sql
+sessions
+├── id (TEXT PRIMARY KEY)
+├── parent_session_id (compaction lineage)
+├── title (auto-generated)
+├── message_count
+├── prompt_tokens, completion_tokens
+├── cost (REAL)
+├── updated_at, created_at
+
+messages
+├── id, session_id, role (user/assistant/tool)
+├── parts (JSON: content, tool calls, results)
+├── model (which model generated this)
+├── created_at, updated_at, finished_at
+
+files
+├── id, session_id, path, content, version
+├── created_at, updated_at
+├── Tracks file changes during session
+```
+
+**Services** (Pub-Sub pattern):
+- `session.Service` - CRUD + subscriptions
+- `message.Service` - Message creation/updates + subscriptions
+- `history.Service` - File tracking
+- `permission.Service` - Permission requests
+
+**Pub-Sub Broker** (`/internal/pubsub/broker.go`):
+- Generic event broker with typed subscribers
+- Channels with buffer size 64, max 1000 events
+- Context-aware subscription cleanup
+
+### 9. **LSP Integration**
+
+**Language Server Protocol** (`/internal/lsp/`):
+
+- **Multi-language support:** Configured per language in config
+- **Features:** File watching, diagnostics, (hover, goto, etc. supported but not exposed to LLM)
+- **Only diagnostics** exposed to AI via `diagnostics` tool
+- **Integration:** Loaded at startup, one client per language
+- **Watcher:** File system watcher notifies LSP of changes
+
+### 10. **Interesting/Novel Ideas**
+
+1. **Persistent Shell Session Model:**
+   - Maintains shell state between commands
+   - Enables efficient git operations, package management, etc.
+   - More realistic than separate shell invocations
+
+2. **Multi-Provider Abstraction:**
+   - Unified interface lets user swap models (Claude ↔ GPT-4 ↔ Gemini)
+   - Cost tracking across providers
+   - Configuration-driven provider selection
+
+3. **MCP (Model Context Protocol):**
+   - Standardized tool protocol for external integrations
+   - Dynamic tool discovery from config
+   - Supports stdio and SSE transports
+
+4. **Auto-Compaction/Context Summarization:**
+   - Automatically summarizes conversations at 95% context window
+   - Creates new session with summary as context
+   - Prevents "out of context" errors transparently
+
+5. **Session Lineage:**
+   - `parent_session_id` tracks compaction history
+   - Can trace reasoning back through summaries
+
+6. **File Change Tracking:**
+   - Tracks all file versions during session
+   - Diff calculation for permission display
+   - Enables reviewing what files were modified
+
+7. **Custom Commands:**
+   - User-defined commands in markdown files
+   - Named arguments with `$PLACEHOLDER` syntax
+   - Per-project and per-user command libraries
+
+8. **Permission Dialog UX:**
+   - Shows diff before file modifications
+   - Session-wide vs permanent permissions
+   - Clear description of what tool will do
+
+### 11. **Limitations & Weaknesses**
+
+1. **No OS-level Sandboxing:**
+   - Application-level permissions only
+   - Compromised LLM could escape via arbitrary bash commands
+   - vs. UnixAgent's layered defense (Seatbelt + Landlock)
+
+2. **Sequential Tool Execution:**
+   - Tools run one-by-one in agent loop
+   - No parallelization of independent operations
+   - Could be slow for multiple file operations
+
+3. **Limited Tool Context:**
+   - Each tool sees sessionID/messageID but not full conversation
+   - Tools can't reason about conversation history
+   - Agent must include context in tool parameters
+
+4. **Streaming Response Handling:**
+   - Tool calls collected during streaming then executed after
+   - Can't stream tool execution results back to LLM
+   - Longer feedback loops for tool-heavy tasks
+
+5. **Output Truncation:**
+   - Simple head/tail truncation with middle omitted
+   - Loses context from omitted lines
+   - Could fail on multi-section outputs
+
+6. **No Rollback/Git Integration:**
+   - Doesn't use git for safe rollback
+   - File modifications are permanent
+   - vs. UnixAgent's git-backed workspace
+
+7. **Limited LSP Integration:**
+   - Only diagnostics exposed to AI
+   - Could expose go-to-definition, hover, etc.
+   - Hover information could provide better context
+
+8. **Single Model Per Agent:**
+   - Coder/summarizer/title agents use fixed models
+   - Can't use different models for different tasks
+   - vs. dynamic model selection
+
+### 12. **Code Quality Observations**
+
+**Strengths:**
+- Clean separation of concerns (provider/agent/tools/tui)
+- Consistent error handling with context
+- Comprehensive logging infrastructure
+- Type-safe configuration with Viper
+- Database migrations for schema safety
+
+**Areas for Improvement:**
+- Large files (tui.go 965 lines, agent.go 758 lines)
+- Some magic strings repeated (ToolInfo names, tool keys)
+- Limited test coverage visible
+- Error messages could be more actionable
+
+### 13. **Key Files Reference**
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `/cmd/root.go` | 309 | CLI setup, TUI initialization, subscription routing |
+| `/internal/tui/tui.go` | 965 | Main TUI component, page routing, dialog management |
+| `/internal/llm/agent/agent.go` | 758 | Agent loop, streaming, tool execution, session logic |
+| `/internal/llm/tools/bash.go` | 348 | Bash tool with security checks and output handling |
+| `/internal/llm/provider/provider.go` | 248 | Provider abstraction, factory pattern |
+| `/internal/app/app.go` | 187 | App initialization, LSP setup, shutdown |
+| `/internal/permission/permission.go` | 100+ | Permission request/grant system |
+| `/internal/pubsub/broker.go` | 116 | Generic pub-sub event system |
+| `/internal/message/message.go` | 100+ | Message types, serialization |
+| `/internal/db/` | Multiple | SQLite database layer (sqlc-generated) |
+
+This is a well-architected agentic coding system that prioritizes developer experience (interactive TUI, fast model switching) while maintaining reasonable security through application-level permissions. The persistent shell and multi-provider support are particularly elegant designs.

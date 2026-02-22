@@ -1,0 +1,551 @@
+Perfect! Now I have enough information to create a comprehensive analysis. Let me compile my findings:
+
+## Deep Code Analysis: gptme Project
+
+I've completed a thorough analysis of the gptme codebase. Here's a comprehensive technical report:
+
+---
+
+### 1. ARCHITECTURE OVERVIEW
+
+**gptme** is a sophisticated Python-based AI agent CLI (~1200+ files) designed as a "unconstrained alternative to Claude Code, Codex, Cursor Agents." It's organized as a monolithic Python package with clear separation of concerns:
+
+**Core Package Structure** (`/home/user/unixgent/research/clones/gptme/gptme/`):
+- **chat.py** (20KB) - Main chat loop orchestration
+- **tools/** (550KB) - Extensible tool system with 30+ tools
+- **llm/** (189KB) - LLM provider adapters (Anthropic, OpenAI, etc.)
+- **logmanager.py** (31KB) - Conversation persistence and management
+- **prompts.py** (33KB) - Dynamic system prompt generation
+- **message.py** (16KB) - Message data structures
+- **codeblock.py** (14KB) - Code block parsing and extraction
+- **config.py** (42KB) - Comprehensive configuration system
+- **hooks/** (138KB) - Extensible hook system for lifecycle events
+- **context/** (54KB) - Context management and compression
+- **llm/models.py** (37KB) - Model metadata registry
+- **plugins/** - Plugin system for extending tools
+
+**Version**: 0.31.0 | **Python**: 3.10+ | **License**: MIT
+
+---
+
+### 2. HOW IT CONTROLS THE COMPUTER
+
+#### **2.1 Shell Command Execution** (`gptme/tools/shell.py` - 82KB)
+
+The shell tool is the primary control mechanism. It uses:
+
+1. **Command Parsing via bashlex** - Parses complex bash scripts into individual commands with proper handling of:
+   - Pipes, redirects, heredocs
+   - Quoted heredoc delimiters
+   - Reserved words (fallback to treating as single command)
+
+2. **Subprocess Management**:
+   - Uses `subprocess.Popen` with configurable timeout (default 20 minutes)
+   - Separate stdout/stderr capture
+   - ANSI escape sequence stripping for clean output
+   - Environment variable `GPTME_SHELL_TIMEOUT` for configuration
+
+3. **Background Job Support** (`BackgroundJob` dataclass):
+   - Tracks background processes with separate stdout/stderr buffers
+   - Thread-safe job management with reader threads
+   - Commands: `bg <cmd>`, `jobs`, `output <id>`, `kill <id>`
+   - Memory-bounded buffers (1MB per stream) to prevent accumulation
+
+4. **Safety Measures**:
+   - **Allowlist** (275 safe commands like `ls`, `cat`, `grep`, `rg`)
+   - **Deny Groups** - Blocks dangerous operations with alternatives suggested:
+     - Bulk git operations (`git add .`, `git commit -a`)
+     - Destructive operations (`rm -rf /`, `git reset --hard`)
+     - Permission abuse (`chmod 777`)
+     - Process killing (`pkill`, `killall`)
+     - Piping to shell interpreters
+   - Confirmation hooks for dangerous commands
+
+5. **Output Processing**:
+   - Token-aware truncation with `get_tokenizer()` integration
+   - Line-based truncation (`pre_lines`/`post_lines`)
+   - Date stripping for reproducible output
+   - Saves large outputs to disk with path references
+   - ANSI code handling
+
+**Code Flow**:
+```
+execute_shell(code, args, kwargs)
+  ├─ parse_cmd with bashlex
+  ├─ Check for bg/jobs/output/kill commands
+  ├─ Security check (allowlist + deny patterns)
+  ├─ Confirmation hook trigger
+  └─ subprocess.Popen execution with timeout
+```
+
+---
+
+#### **2.2 Code Block Detection & Execution Pipeline**
+
+**3-Stage Process**:
+
+1. **Streaming Code Block Detection** (`codeblock.py` - 14KB):
+   - Uses context-aware regex pattern matching with nested block support
+   - Handles markdown code blocks: ` ```lang\ncontent\n``` `
+   - In streaming mode, requires blank line after closing ` ``` ` to confirm completion
+   - Prevents incomplete block extraction during token streaming
+   - Handles nested code blocks with depth tracking
+
+2. **Tool Use Parsing** (`tools/base.py` - ToolUse class):
+   - Three formats supported:
+     - **Markdown**: ` ```lang\ncontent\n``` `
+     - **XML**: `<codeblock lang="..." path="...">content</codeblock>`
+     - **Tool format**: `@toolname(call_id): {json_args}`
+   
+   - `Codeblock.iter_from_markdown()` extracts all blocks from response
+   - `ToolUse.iter_from_content()` converts blocks to executable tool calls
+   - Preserves block order and line numbers for debugging
+
+3. **Execution** (`tools/__init__.py` - `execute_msg()` function):
+   ```python
+   for tooluse in ToolUse.iter_from_content(msg.content):
+       for tool_response in tooluse.execute(log=log, workspace=workspace):
+           yield tool_response
+   ```
+
+**Streaming-Specific Optimization** (`llm/__init__.py` - `_reply_stream()`):
+- Monitors each newline character during streaming
+- Breaks generation on complete code block detection
+- Uses `break_on_tooluse` flag (enabled by default via `GPTME_BREAK_ON_TOOLUSE`)
+- Allows user to execute commands before LLM continues
+- Suppresses thinking tags in display (`<think>`, `</thinking>`)
+
+---
+
+### 3. TOOL SYSTEM
+
+#### **3.1 Tool Architecture** (`tools/base.py`)
+
+**ToolSpec Dataclass** - Defines tool capabilities:
+```python
+@dataclass(frozen=True)
+class ToolSpec:
+    name: str                              # "shell", "python", "save", etc.
+    desc: str                              # Description for LLM
+    instructions: str                      # How to use tool
+    instructions_format: dict[str, str]    # Format-specific instructions
+    examples: str | Callable               # Example usage
+    functions: list[Callable]              # IPython REPL functions (python tool)
+    init: InitFunc | None                  # Initialization callback
+    execute: ExecuteFunc | None            # Actual execution logic
+    block_types: list[str]                 # Supported markdown lang tags
+    available: bool | Callable             # Availability check
+    parameters: list[Parameter]            # JSON schema parameters
+    load_priority: int                     # Loading order (higher = later)
+    disabled_by_default: bool              # Opt-in only
+    hooks: dict[str, tuple[str, HookFunc, int]]  # Lifecycle hooks
+    commands: dict[str, Callable]          # Slash commands (/foo)
+```
+
+**ToolUse Dataclass** - Represents execution:
+```python
+@dataclass(frozen=True)
+class ToolUse:
+    tool: str                    # Tool name
+    args: list[str] | None       # Positional args
+    content: str | None          # Code/command content
+    kwargs: dict[str, str] | None  # Keyword args
+    call_id: str | None          # For tool format tracking
+    _format: ToolFormat          # markdown/xml/tool
+    
+    def execute(self, log, workspace) -> Generator[Message]:
+        # Hook system integration
+        # Tool execution with tracing
+        # Error handling with telemetry
+```
+
+#### **3.2 Tool Discovery & Registration** (`tools/__init__.py`)
+
+**Dynamic Loading System**:
+```python
+def get_available_tools() -> list[ToolSpec]:
+    # Load from tool_modules (default: "gptme.tools")
+    # Add plugin tool modules from config
+    # Create MCP tool wrappers
+    # Sort by load_priority
+```
+
+**Tool Modules** (30+ tools in `/home/user/unixgent/research/clones/gptme/gptme/tools/`):
+
+| Tool | Purpose | Block Type |
+|------|---------|-----------|
+| **shell** | Execute bash commands | `shell` |
+| **python** | IPython REPL execution | `python` |
+| **save** | Create/overwrite files | `save <path>` |
+| **append** | Append to files | `append <path>` |
+| **patch** | Unified diff patching | `patch <path>` |
+| **read** | File reading | N/A (command tool) |
+| **browser** | Web browsing (3 backends) | N/A (tool) |
+| **computer** | Screen capture & mouse/keyboard | N/A (tool) |
+| **vision** | Image analysis (claude-vision) | N/A (tool) |
+| **gh** | GitHub CLI integration | N/A (tool) |
+| **tmux** | Tmux session control | N/A (tool) |
+| **subagent** | Spawn child agents | N/A (tool) |
+| **mcp** | MCP server management | N/A (tool) |
+| **precommit** | Pre-commit integration | N/A (tool) |
+| **morph** | Fast file editing | `morph <path>` |
+| **lessons** | Contextual guidance | N/A (tool) |
+| **youtube** | YouTube transcript extraction | N/A (tool) |
+| **rag** | RAG tool integration | N/A (tool) |
+| **tts** | Text-to-speech (Kokoro, TTS-1) | N/A (tool) |
+| **form** | Dynamic form input | N/A (tool) |
+| **choice** | Selection UI | N/A (tool) |
+| **complete** | Session termination | N/A (tool) |
+| **todo** | Todo list management | N/A (tool) |
+
+**Context-Local Tool State**:
+- Uses `ContextVar` for thread-safe tool isolation
+- Each context gets independent tool list
+- Critical for server mode (per-request contexts)
+
+---
+
+### 4. LLM INTEGRATION
+
+#### **4.1 Provider Support** (`llm/models.py`)
+
+**Built-in Providers** (12 providers):
+- Anthropic (claude-opus-4-1, claude-sonnet-4, claude-haiku-4-5)
+- OpenAI (GPT-4, GPT-4o, GPT-4-mini)
+- Azure OpenAI
+- OpenRouter, Groq, DeepSeek, xAI, NVIDIA, Gemini
+- Local (LM Studio, Ollama-compatible)
+- Custom OpenAI-compatible providers
+
+**ModelMeta Dataclass**:
+```python
+@dataclass(frozen=True)
+class ModelMeta:
+    provider: Provider | "unknown"
+    model: str
+    context: int                    # Context window size
+    max_output: int | None          # Max output tokens
+    supports_streaming: bool        # SSE streaming
+    supports_vision: bool           # Image input
+    supports_reasoning: bool        # Extended thinking
+    price_input: float              # USD per 1M input tokens
+    price_output: float             # USD per 1M output tokens
+```
+
+#### **4.2 Streaming Response Handling** (`llm/__init__.py`)
+
+**Three-Stage Streaming Pipeline**:
+
+1. **Provider Streaming**:
+   ```python
+   gen = stream_anthropic(messages, model, tools)
+   # OR
+   gen = stream_openai(messages, model, tools)
+   ```
+
+2. **Character-Level Display** (`_reply_stream()`):
+   - Iterates character-by-character for real-time display
+   - Tracks thinking tags and dims them (`[dim]...[/dim]`)
+   - Time-to-first-token (TTFT) and token/s metrics
+   - Keyboard interrupt handling with message recovery
+
+3. **Code Block Break Detection**:
+   ```python
+   if break_on_tooluse and char == "\n":
+       tooluses = list(ToolUse.iter_from_content(output, streaming=True))
+       if tooluses and any(tu.is_runnable for tu in tooluses):
+           break  # Stop generation to execute tools
+   ```
+
+**Metadata Capture**:
+- Input/output token counts
+- Cache read/creation tokens (for prompt caching)
+- Cost calculation: `(input_tokens * price_input + output_tokens * price_output) / 1_000_000`
+
+---
+
+### 5. CONTEXT MANAGEMENT
+
+#### **5.1 Message Structure** (`message.py`)
+
+```python
+@dataclass(frozen=True)
+class Message:
+    role: Literal["system", "user", "assistant"]
+    content: str
+    timestamp: datetime
+    files: list[FilePath]             # Attached files (images, etc.)
+    file_hashes: dict[str, str]       # Content hashing for caching
+    call_id: str | None               # Tool call tracking
+    pinned: bool                      # Never trim (sticky context)
+    hide: bool                        # Send to LLM but don't display
+    quiet: bool                       # Don't print on execution
+    metadata: MessageMetadata          # Token usage, costs
+```
+
+#### **5.2 Log Management** (`logmanager.py` - 31KB)
+
+**LogManager Class** - Conversation persistence:
+- **Persistence**: JSONL format (`conversation.jsonl`)
+- **Branching**: Multiple conversation branches in `branches/` directory
+- **Views**: Compacted views in `views/` directory (for compression)
+- **Locking**: File-based exclusive locks with PID tracking (prevents concurrent edits)
+- **Context Variable**: `_current_log_var` for tool access
+
+**Log Data Structure**:
+```python
+@dataclass(frozen=True)
+class Log:
+    messages: list[Message]
+    
+    def len_tokens(self, model: str) -> int:
+        # Token counting for context limits
+    
+    def append(msg: Message) -> Log:
+        # Immutable append (returns new Log)
+```
+
+#### **5.3 Context Assembly** (`prompts.py`)
+
+**Prompt Generation** (3 components):
+
+1. **Core Prompt**:
+   - gptme identity and instructions
+   - User preferences (from `~/.config/gptme/config.toml`)
+   - Tool descriptions (auto-generated from ToolSpecs)
+
+2. **File Context** (merges from config):
+   - Project config: `gptme.toml` `[prompt] files`
+   - User config: `~/.config/gptme/config.toml` `[prompt] files`
+   - Default patterns: `README*`, `Makefile`, `pyproject.toml`, etc.
+
+3. **Command Context**:
+   - Dynamic output from `context_cmd` in `gptme.toml`
+   - Example: `context_cmd = "git log --oneline -5"` to include recent commits
+
+**Context Compression** (`context/`):
+- Token-aware compression
+- Adaptive compressor (selective vs. full compression)
+- Task analyzer for intelligent summarization
+- Multiple selector strategies (recency, relevance, etc.)
+
+---
+
+### 6. INTERESTING/NOVEL ARCHITECTURAL PATTERNS
+
+#### **6.1 Hook System** (`hooks/` - 138KB)
+
+**Comprehensive Event-Driven Architecture**:
+```python
+class HookType(Enum):
+    # Step lifecycle
+    STEP_PRE = "step.pre"           # Before LLM generation
+    STEP_POST = "step.post"         # After tool execution
+    # Turn lifecycle
+    TURN_PRE = "turn.pre"           # Before entire user turn
+    TURN_POST = "turn.post"         # After all steps complete
+    # Tool lifecycle
+    TOOL_EXECUTE_PRE = "tool.execute.pre"
+    TOOL_EXECUTE_POST = "tool.execute.post"
+    TOOL_TRANSFORM = "tool.transform"
+    # File operations
+    FILE_SAVE_PRE = "file.save.pre"
+    FILE_PATCH_PRE = "file.patch.pre"
+    # Session lifecycle
+    SESSION_START = "session.start"
+    SESSION_END = "session.end"
+    # Generation
+    GENERATION_PRE = "generation.pre"
+    # Message transform
+    MESSAGE_TRANSFORM = "message.transform"
+    # Loop control
+    LOOP_CONTINUE = "loop.continue"
+```
+
+**Hook Handlers** with priority system:
+- `shell_allowlist_hook` (priority 10) - Auto-confirms allowlisted commands
+- `confirm_hook` (priority 0) - User confirmation prompts
+- `time_awareness_hook` - Adds current time context
+- `token_awareness_hook` - Tracks token limits and warns
+- `cost_awareness_hook` - Tracks API costs
+- `cache_awareness_hook` - Manages prompt caching info
+- `form_autodetect_hook` - Auto-detects form fields
+- `cwd_tracking_hook` - Tracks directory changes
+- `active_context_hook` - Manages active context
+
+**Tool Registration** (each tool can define hooks):
+```python
+tool = ToolSpec(
+    ...
+    hooks={
+        "allowlist": ("tool.confirm", shell_allowlist_hook, 10),
+        "session_end": ("session.end", _session_end_shell_cleanup, 0),
+    }
+)
+```
+
+#### **6.2 MCP (Model Context Protocol) Integration** (`tools/mcp*.py`)
+
+**First-class MCP Support** (~400 lines):
+- Registry-based server discovery
+- Dynamic server loading/unloading
+- Tool wrapping for MCP resources
+- Supports both stdio and HTTP transports
+- Automatic tool generation from server capabilities
+
+#### **6.3 Configuration System** (`config.py` - 42KB)
+
+**Multi-Level Config Hierarchy**:
+1. **System Defaults** (hardcoded)
+2. **User Config**: `~/.config/gptme/config.toml`
+3. **Project Config**: `./gptme.toml`
+4. **Environment Variables**: `GPTME_*` prefix
+5. **CLI Arguments**: Highest priority
+
+**Rich Config Objects**:
+```python
+@dataclass
+class MCPConfig:
+    enabled: bool
+    auto_start: bool
+    servers: list[MCPServerConfig]
+
+@dataclass
+class PluginsConfig:
+    paths: list[str]
+    enabled: list[str]
+
+@dataclass
+class ChatConfig:
+    tools: list[str]              # Tool allowlist
+    agent_config: AgentConfig
+    context_compression: bool
+    ...
+```
+
+#### **6.4 Session-Based Chat Loop** (`chat.py`)
+
+**Elegant Loop Control**:
+```python
+def _run_chat_loop(manager, prompt_queue, ...):
+    while True:
+        # Process prompt queue OR get user input
+        if prompt_queue:
+            msg = prompt_queue.pop(0)
+            manager.append(msg)
+            _process_message_conversation(...)
+        else:
+            # Get user input (interactive mode)
+            user_input = _get_user_input(...)
+            _process_message_conversation(...)
+        
+        # LOOP_CONTINUE hooks for auto-reply
+        if loop_msgs := trigger_hook(HookType.LOOP_CONTINUE, ...):
+            prompt_queue.extend(loop_msgs)
+            continue
+```
+
+**Tool Execution Loop** (`_process_message_conversation()`):
+```python
+while True:
+    # Generate response
+    response = reply(messages, model, stream=stream, tools=tools)
+    manager.append(response)
+    
+    # Execute tools in response
+    for tool_msg in execute_msg(response, log=manager.log):
+        manager.append(tool_msg)
+    
+    # Check if more tools to run
+    if not tooluses:
+        break
+```
+
+---
+
+### 7. LIMITATIONS & WEAKNESSES
+
+1. **Context Window Management**:
+   - Token limits are soft suggestions (warnings, not hard stops)
+   - Compression is optional and not always enabled
+   - No automatic conversation pruning
+
+2. **Streaming Execution Gap**:
+   - `break_on_tooluse` breaks generation after each code block
+   - LLM can't look ahead to see tool outputs before continuing
+   - May reduce multi-step reasoning quality
+
+3. **Tool Approval Model**:
+   - Allowlist is shell-command-specific, not LLM-input-specific
+   - LLM can request dangerous operations not in allowlist
+   - Depends on confirmation hooks (can be auto-approved by settings)
+
+4. **Code Block Detection**:
+   - Regex-based parsing is complex and error-prone
+   - Nesting logic is intricate (~300 lines)
+   - Special case handling for specific tools (`save`, `append`, `patch`)
+
+5. **Error Handling**:
+   - Tool failures yield system messages but don't interrupt execution
+   - No rollback mechanism for failed file operations
+   - Large output truncation silently drops data
+
+6. **Performance**:
+   - Python subprocess for shell (slower than native)
+   - IPython REPL startup overhead for Python tool
+   - Token counting on every tool execution
+
+7. **Thread Safety**:
+   - Context variables for tool isolation (good)
+   - But locks are file-based (fragile in distributed scenarios)
+   - Background job management uses global dict with locks
+
+---
+
+### 8. KEY FILE PATHS & ENTRY POINTS
+
+**Main Entry Points**:
+- `/home/user/unixgent/research/clones/gptme/gptme/__main__.py` → `gptme.cli.main:main`
+- `/home/user/unixgent/research/clones/gptme/gptme/cli/main.py` - CLI with Click
+
+**Core Modules**:
+- **Chat Loop**: `/home/user/unixgent/research/clones/gptme/gptme/chat.py` (20KB)
+- **Tool System**: `/home/user/unixgent/research/clones/gptme/gptme/tools/__init__.py` (11KB)
+- **Tool Base**: `/home/user/unixgent/research/clones/gptme/gptme/tools/base.py` (27KB)
+- **Shell Tool**: `/home/user/unixgent/research/clones/gptme/gptme/tools/shell.py` (82KB)
+- **Code Block Parsing**: `/home/user/unixgent/research/clones/gptme/gptme/codeblock.py` (14KB)
+- **LLM Integration**: `/home/user/unixgent/research/clones/gptme/gptme/llm/__init__.py` (17KB)
+- **Log Management**: `/home/user/unixgent/research/clones/gptme/gptme/logmanager.py` (31KB)
+- **Message Types**: `/home/user/unixgent/research/clones/gptme/gptme/message.py` (16KB)
+- **Configuration**: `/home/user/unixgent/research/clones/gptme/gptme/config.py` (42KB)
+- **Hook System**: `/home/user/unixgent/research/clones/gptme/gptme/hooks/__init__.py` (31KB)
+- **Prompt Generation**: `/home/user/unixgent/research/clones/gptme/gptme/prompts.py` (33KB)
+
+---
+
+### 9. COMPARISON TO UnixAgent
+
+**gptme's Advantages**:
+- Mature tool ecosystem (30+ tools)
+- MCP protocol support (standard)
+- Rich configuration system
+- Plugin system for extensibility
+- Token-aware context management
+- Comprehensive hook system
+
+**UnixAgent's Potential Advantages**:
+- Rust-based (performance, safety)
+- Dedicated sandbox system (Seatbelt/Landlock)
+- PTY-based terminal (true shell session)
+- Simpler, more constrained architecture
+- Focus on shell control specifically
+
+---
+
+This analysis provides a detailed understanding of how gptme architected an AI agent system at scale. The codebase demonstrates sophisticated patterns like:
+- Event-driven hook system for extensibility
+- Context-local tool isolation for multi-threading
+- Streaming-aware code block detection
+- Multi-level configuration hierarchy
+- Token-aware context compression
+- Sophisticated shell command safety
