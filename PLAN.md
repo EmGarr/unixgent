@@ -637,3 +637,30 @@ Split by `system_prompt` → each segment is one complete API call. No indices, 
 - How to surface child progress to the user? Batch UX already handles this for subagents.
 - Can checkpoints in the journal serve as RLM "summarization" strategy automatically?
 - Sandboxing: how to restrict child filesystem/network access (deferred).
+
+---
+
+## Research Notes: Competitive Landscape Analysis (2026-02-22)
+
+**Report**: `research/RESEARCH_REPORT.md` — ranked 11 projects by OS integration depth.
+**Extractable patterns**: `research/EXTRACTABLE_PATTERNS.md` — CUA + Butterfish → UnixAgent.
+
+### Key Findings
+
+UnixAgent leads in OS integration depth (kernel-level sandboxing via Landlock + Seatbelt).
+CUA leads in GUI breadth (accessibility APIs across 3 OSes). No project combines both.
+
+### Extractable Patterns (prioritized)
+
+| Pattern | Source | Effort | Impact | Status |
+|---------|--------|--------|--------|--------|
+| TUI detection + passthrough mode | Butterfish | Small | High | TODO |
+| Accurate line buffer (ShellBuffer) | Butterfish | Medium | Medium | TODO |
+| Structured CommandResult metadata | CUA | Medium | Medium-Low | TODO |
+
+### Anti-Patterns (explicitly rejected)
+
+- CUA's GUI handler abstraction (terminal IS the API — no wrapper needed)
+- Butterfish's capital-letter heuristic (our `#` prefix is better — fails safe as shell comment)
+- Custom PS1 markers (OSC 133 is the standard — don't regress)
+- tiktoken dependency for token counting (chars/4 is adequate for our context sizes)
