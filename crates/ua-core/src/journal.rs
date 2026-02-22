@@ -116,7 +116,7 @@ pub enum JournalEntry {
 // ---------------------------------------------------------------------------
 
 /// Approximate token cost for an image in the Anthropic API.
-const IMAGE_TOKEN_COST: usize = 1600;
+pub const IMAGE_TOKEN_COST: usize = 1600;
 
 /// Append-only session journal backed by a JSONL file.
 pub struct SessionJournal {
@@ -210,8 +210,20 @@ pub fn resolve_media_refs(results: &mut [ToolResultRecord], media_dir: &Path) {
 }
 
 /// Approximate token count for a string (chars / 4).
-fn approx_tokens(s: &str) -> usize {
+pub fn approx_tokens(s: &str) -> usize {
     s.len() / 4
+}
+
+/// Approximate token cost of a `ConversationMessage`.
+pub fn message_tokens(msg: &ConversationMessage) -> usize {
+    let mut t = approx_tokens(&msg.content);
+    for tu in &msg.tool_uses {
+        t += approx_tokens(&tu.name) + approx_tokens(&tu.input_json);
+    }
+    for r in &msg.tool_results {
+        t += approx_tokens(&r.content) + r.media.len() * IMAGE_TOKEN_COST;
+    }
+    t
 }
 
 /// Approximate token cost of a single journal entry.
@@ -1378,5 +1390,55 @@ mod tests {
             tokens >= IMAGE_TOKEN_COST,
             "tokens={tokens}, expected >= {IMAGE_TOKEN_COST}"
         );
+    }
+
+    // --- message_tokens tests ---
+
+    #[test]
+    fn message_tokens_plain_text() {
+        let msg = ConversationMessage::user("hello world"); // 11 chars → 2 tokens
+        assert_eq!(message_tokens(&msg), approx_tokens("hello world"));
+    }
+
+    #[test]
+    fn message_tokens_with_tool_uses() {
+        let msg = ConversationMessage::assistant_with_tool_use(
+            "Let me check.",
+            vec![ToolUseRecord {
+                id: "t1".to_string(),
+                name: "shell".to_string(),
+                input_json: r#"{"command":"ls -la"}"#.to_string(),
+            }],
+        );
+        let expected = approx_tokens("Let me check.")
+            + approx_tokens("shell")
+            + approx_tokens(r#"{"command":"ls -la"}"#);
+        assert_eq!(message_tokens(&msg), expected);
+    }
+
+    #[test]
+    fn message_tokens_with_tool_results_and_media() {
+        let msg = ConversationMessage {
+            role: ua_protocol::Role::User,
+            content: String::new(),
+            tool_uses: Vec::new(),
+            tool_results: vec![ToolResultRecord {
+                tool_use_id: "t1".to_string(),
+                content: "some output".to_string(),
+                media: vec![MediaRef {
+                    media_type: "image/png".to_string(),
+                    filename: "t1.png".to_string(),
+                }],
+                resolved_media: vec![],
+            }],
+        };
+        let expected = approx_tokens("some output") + IMAGE_TOKEN_COST;
+        assert_eq!(message_tokens(&msg), expected);
+    }
+
+    #[test]
+    fn message_tokens_empty_message() {
+        let msg = ConversationMessage::user("");
+        assert_eq!(message_tokens(&msg), 0);
     }
 }

@@ -20,7 +20,8 @@ use crate::context::{
 };
 use crate::display::PlanDisplay;
 use crate::journal::{
-    build_conversation_from_journal, epoch_secs, generate_session_id, JournalEntry, SessionJournal,
+    build_conversation_from_journal, epoch_secs, generate_session_id, message_tokens, JournalEntry,
+    SessionJournal,
 };
 use crate::judge::{self, JudgeVerdict};
 use crate::osc::{OscEvent, OscParser, TerminalState};
@@ -472,6 +473,12 @@ pub fn run_repl(
     let mut total_commands: u32 = 0;
     let mut turn_start: Option<Instant> = None;
 
+    // In-memory conversation cache: avoids re-reading the journal on every API call.
+    // None → rebuild from journal (first call, budget overflow).
+    // Some(conv) → use directly, skip journal read and SystemPrompt log.
+    let mut cached_conversation: Option<Vec<ua_protocol::ConversationMessage>> = None;
+    let mut conversation_tokens: usize = 0;
+
     // Child agent tracking.
     let mut known_children: HashSet<u32> = HashSet::new();
     let sessions_dir = config.journal.resolve_sessions_dir();
@@ -602,6 +609,9 @@ pub fn run_repl(
                                                 let _ = session.write_all(b"\x15");
 
                                                 // Start streaming from the backend
+                                                // Fresh instruction: rebuild from journal.
+                                                cached_conversation = None;
+                                                conversation_tokens = 0;
                                                 state = start_streaming(
                                                     rt_handle,
                                                     config,
@@ -612,6 +622,8 @@ pub fn run_repl(
                                                     &tx_for_streaming,
                                                     &mut renderer,
                                                     child_pid,
+                                                    &mut cached_conversation,
+                                                    &mut conversation_tokens,
                                                 );
                                             }
                                         } else if !trimmed.is_empty() {
@@ -1077,6 +1089,20 @@ pub fn run_repl(
                                 });
                             }
 
+                            // Append assistant message to in-memory conversation
+                            let assistant_msg = if tool_uses.is_empty() {
+                                ua_protocol::ConversationMessage::assistant(&response_text)
+                            } else {
+                                ua_protocol::ConversationMessage::assistant_with_tool_use(
+                                    &response_text,
+                                    tool_uses.clone(),
+                                )
+                            };
+                            conversation_tokens += message_tokens(&assistant_msg);
+                            if let Some(ref mut conv) = cached_conversation {
+                                conv.push(assistant_msg);
+                            }
+
                             // Extract tool_use_ids for Approving/Executing states
                             let tool_use_ids: Vec<String> =
                                 tool_uses.iter().map(|t| t.id.clone()).collect();
@@ -1107,6 +1133,8 @@ pub fn run_repl(
                                     total_input_tokens = 0;
                                     total_output_tokens = 0;
                                     total_commands = 0;
+                                    cached_conversation = None;
+                                    conversation_tokens = 0;
                                     state = AgentState::Idle;
                                     // Nudge shell to redisplay prompt below agent output
                                     let _ = session.write_all(b"\n");
@@ -1128,7 +1156,7 @@ pub fn run_repl(
                                         if let Some(ref mut j) = journal {
                                             j.append(&JournalEntry::Blocked {
                                                 ts: epoch_secs(),
-                                                results: tool_results,
+                                                results: tool_results.clone(),
                                             });
                                         }
                                     }
@@ -1137,6 +1165,9 @@ pub fn run_repl(
                                     total_output_tokens = 0;
                                     total_commands = 0;
                                     turn_start = None;
+                                    // Blocked goes Idle; next # instruction rebuilds from journal.
+                                    cached_conversation = None;
+                                    conversation_tokens = 0;
                                     state = AgentState::Idle;
                                     // Nudge shell to redisplay prompt below agent output
                                     let _ = session.write_all(b"\n");
@@ -1381,8 +1412,22 @@ pub fn run_repl(
                                     if let Some(ref mut j) = journal {
                                         j.append(&JournalEntry::ToolResult {
                                             ts: epoch_secs(),
-                                            results: tool_results,
+                                            results: tool_results.clone(),
                                         });
+                                    }
+
+                                    // Append tool_result to in-memory conversation
+                                    let result_msg =
+                                        ua_protocol::ConversationMessage::tool_result(tool_results);
+                                    conversation_tokens += message_tokens(&result_msg);
+                                    if let Some(ref mut conv) = cached_conversation {
+                                        conv.push(result_msg);
+                                    }
+
+                                    // Budget check: if over, force rebuild from journal
+                                    if conversation_tokens > config.journal.conversation_budget {
+                                        cached_conversation = None;
+                                        conversation_tokens = 0;
                                     }
 
                                     // Clear readline before next LLM call
@@ -1390,8 +1435,6 @@ pub fn run_repl(
 
                                     let next_iteration = iteration + 1;
 
-                                    // Journal has the tool_result — rebuild
-                                    // conversation fresh from journal.
                                     state = start_streaming(
                                         rt_handle,
                                         config,
@@ -1402,6 +1445,8 @@ pub fn run_repl(
                                         &tx_for_streaming,
                                         &mut renderer,
                                         child_pid,
+                                        &mut cached_conversation,
+                                        &mut conversation_tokens,
                                     );
                                 }
                                 // else: no output — stay Idle
@@ -1507,7 +1552,8 @@ pub fn run_repl(
 /// Spawn a tokio task to stream from the backend, forwarding events through the mpsc channel.
 /// Returns the initial AgentState::Streaming.
 ///
-/// Rebuilds conversation context fresh from the journal each time.
+/// If `cached_conversation` is `Some`, uses it directly (skipping journal read and SystemPrompt log).
+/// If `None`, rebuilds from journal, logs a SystemPrompt, and populates the cache.
 #[allow(clippy::too_many_arguments)]
 fn start_streaming<W: Write>(
     rt_handle: &Handle,
@@ -1519,6 +1565,8 @@ fn start_streaming<W: Write>(
     tx: &mpsc::Sender<Event>,
     renderer: &mut ReplRenderer<W>,
     child_pid: Option<u32>,
+    cached_conversation: &mut Option<Vec<ua_protocol::ConversationMessage>>,
+    conversation_tokens: &mut usize,
 ) -> AgentState {
     // Resolve API key
     let api_key = match config.backend.anthropic.resolve_api_key() {
@@ -1529,26 +1577,45 @@ fn start_streaming<W: Write>(
         }
     };
 
-    // Rebuild conversation from journal
-    let conversation = match journal {
-        Some(j) => {
-            let entries = j.read_all();
-            build_conversation_from_journal(&entries, config.journal.conversation_budget)
-        }
-        None => Vec::new(),
+    // Use cached conversation or rebuild from journal
+    let rebuilt_from_journal = cached_conversation.is_none();
+    let conversation = if let Some(conv) = cached_conversation.take() {
+        conv
+    } else {
+        let conv = match journal {
+            Some(j) => {
+                let entries = j.read_all();
+                build_conversation_from_journal(&entries, config.journal.conversation_budget)
+            }
+            None => Vec::new(),
+        };
+        *conversation_tokens = conv.iter().map(message_tokens).sum();
+        conv
     };
 
     // Build request — instruction is empty; the journal carries it.
-    let request = build_agent_request("", config, history, conversation, terminal_size, child_pid);
+    let request = build_agent_request(
+        "",
+        config,
+        history,
+        conversation.clone(),
+        terminal_size,
+        child_pid,
+    );
 
-    // Log system prompt to journal for trajectory reconstruction
-    if let Some(ref mut j) = journal {
-        let sp = build_system_prompt(&request);
-        j.append(&JournalEntry::SystemPrompt {
-            ts: epoch_secs(),
-            text: sp,
-        });
+    // Log system prompt to journal only when we rebuilt from journal.
+    if rebuilt_from_journal {
+        if let Some(ref mut j) = journal {
+            let sp = build_system_prompt(&request);
+            j.append(&JournalEntry::SystemPrompt {
+                ts: epoch_secs(),
+                text: sp,
+            });
+        }
     }
+
+    // Store conversation back in cache for the caller
+    *cached_conversation = Some(conversation);
 
     // Create client and stream
     let client = AnthropicClient::with_model(&api_key, &config.backend.anthropic.model);
@@ -2234,7 +2301,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let mut audit = AuditLogger::new(&path).unwrap();
         let config = gate_config(true, true); // judge enabled but should be skipped
-        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
+        let mut renderer = ReplRenderer::new(Vec::new(), Style::disabled());
 
         let action = classify_and_gate(
             vec!["ls /tmp".to_string()],
@@ -2274,7 +2341,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let mut audit = AuditLogger::new(&path).unwrap();
         let config = gate_config(true, true); // judge enabled
-        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
+        let mut renderer = ReplRenderer::new(Vec::new(), Style::disabled());
 
         // Use "rm build" (not "rm -rf /...") to avoid the deny pattern
         let action = classify_and_gate(
@@ -2311,7 +2378,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let mut audit = AuditLogger::new(&path).unwrap();
         let config = gate_config(true, false); // judge disabled
-        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
+        let mut renderer = ReplRenderer::new(Vec::new(), Style::disabled());
 
         let action = classify_and_gate(
             vec!["rm build".to_string()],
@@ -2336,7 +2403,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let mut audit = AuditLogger::new(&path).unwrap();
         let config = gate_config(true, true); // judge enabled but should be skipped
-        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
+        let mut renderer = ReplRenderer::new(Vec::new(), Style::disabled());
 
         // curl | bash is denied by policy
         let action = classify_and_gate(
@@ -2366,7 +2433,7 @@ mod tests {
     fn judge_gate_no_commands_returns_idle() {
         let mut audit = AuditLogger::noop();
         let config = gate_config(true, true);
-        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
+        let mut renderer = ReplRenderer::new(Vec::new(), Style::disabled());
 
         let action = classify_and_gate(
             vec![],
@@ -2388,7 +2455,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let mut audit = AuditLogger::new(&path).unwrap();
         let config = gate_config(true, true); // judge enabled
-        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
+        let mut renderer = ReplRenderer::new(Vec::new(), Style::disabled());
 
         let action = classify_and_gate(
             vec!["sudo reboot".to_string()],
@@ -2414,7 +2481,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
         let mut audit = AuditLogger::new(&path).unwrap();
-        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
+        let mut renderer = ReplRenderer::new(Vec::new(), Style::disabled());
 
         handle_judge_verdict(&JudgeVerdict::Safe, 0, &mut audit, &mut renderer);
 
@@ -2434,7 +2501,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
         let mut audit = AuditLogger::new(&path).unwrap();
-        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
+        let mut renderer = ReplRenderer::new(Vec::new(), Style::disabled());
 
         let verdict = JudgeVerdict::Unsafe {
             reasoning: "Downloads and executes remote script".to_string(),
@@ -2462,7 +2529,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
         let mut audit = AuditLogger::new(&path).unwrap();
-        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
+        let mut renderer = ReplRenderer::new(Vec::new(), Style::disabled());
 
         let verdict = JudgeVerdict::Error("connection timeout".to_string());
         handle_judge_verdict(&verdict, 0, &mut audit, &mut renderer);
@@ -2487,7 +2554,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let mut audit = AuditLogger::new(&path).unwrap();
         let config = gate_config(true, true);
-        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
+        let mut renderer = ReplRenderer::new(Vec::new(), Style::disabled());
 
         // Step 1: Simulate ToolUse event producing "rm /tmp/foo"
         let commands = vec!["rm /tmp/foo".to_string()];
@@ -2526,7 +2593,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let mut audit = AuditLogger::new(&path).unwrap();
         let config = gate_config(true, true);
-        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
+        let mut renderer = ReplRenderer::new(Vec::new(), Style::disabled());
 
         // Step 1: classify_and_gate → Judge
         let action = classify_and_gate(
@@ -2770,7 +2837,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let mut audit = AuditLogger::new(&path).unwrap();
         let config = gate_config(true, true);
-        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
+        let mut renderer = ReplRenderer::new(Vec::new(), Style::disabled());
 
         // mkdir is Write — should auto-approve when sandbox is active
         let action = classify_and_gate(
@@ -2801,7 +2868,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let mut audit = AuditLogger::new(&path).unwrap();
         let config = gate_config(true, true); // judge enabled
-        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
+        let mut renderer = ReplRenderer::new(Vec::new(), Style::disabled());
 
         // rm is Destructive — should go to Judge even when sandbox is active
         let action = classify_and_gate(
@@ -2827,7 +2894,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let mut audit = AuditLogger::new(&path).unwrap();
         let config = gate_config(true, true); // judge enabled
-        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
+        let mut renderer = ReplRenderer::new(Vec::new(), Style::disabled());
 
         // curl is Network — should go to Judge when sandbox is active
         let action = classify_and_gate(
@@ -2853,7 +2920,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let mut audit = AuditLogger::new(&path).unwrap();
         let config = gate_config(true, false); // judge disabled
-        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
+        let mut renderer = ReplRenderer::new(Vec::new(), Style::disabled());
 
         // mkdir is Write — without sandbox, should go to Approve (not auto-approve)
         let action = classify_and_gate(
@@ -2879,7 +2946,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let mut audit = AuditLogger::new(&path).unwrap();
         let config = gate_config(true, true);
-        let mut renderer = ReplRenderer::new_with_width(Vec::new(), Style::disabled(), 80);
+        let mut renderer = ReplRenderer::new(Vec::new(), Style::disabled());
 
         // cargo build is BuildTest — should auto-approve with sandbox
         let action = classify_and_gate(

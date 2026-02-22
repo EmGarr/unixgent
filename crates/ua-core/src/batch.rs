@@ -23,8 +23,8 @@ use crate::context::{
     TOOL_RESULT_PREFIX,
 };
 use crate::journal::{
-    build_conversation_from_journal, epoch_secs, resolve_media_refs, AttachmentMeta, JournalEntry,
-    SessionJournal,
+    build_conversation_from_journal, epoch_secs, message_tokens, resolve_media_refs,
+    AttachmentMeta, JournalEntry, SessionJournal,
 };
 use crate::judge;
 use crate::policy::{analyze_pipe_chain, RiskLevel};
@@ -413,37 +413,34 @@ pub async fn run_batch(
         };
     }
 
-    let mut iteration: usize = 0;
-    loop {
-        // Rebuild conversation from journal, resolving media refs
-        let mut conversation = match journal {
-            Some(ref j) => {
-                let entries = j.read_all();
-                build_conversation_from_journal(&entries, config.journal.conversation_budget)
-            }
-            None => Vec::new(),
-        };
-        if let Some(ref j) = journal {
-            for msg in &mut conversation {
-                resolve_media_refs(&mut msg.tool_results, j.media_dir());
-            }
+    // Build conversation from journal once before the loop.
+    // The conversation lives in memory; the journal is for crash recovery.
+    let mut conversation = match journal {
+        Some(ref j) => {
+            let entries = j.read_all();
+            build_conversation_from_journal(&entries, config.journal.conversation_budget)
         }
+        None => Vec::new(),
+    };
+    if let Some(ref j) = journal {
+        for msg in &mut conversation {
+            resolve_media_refs(&mut msg.tool_results, j.media_dir());
+        }
+    }
+    let mut conversation_tokens: usize = conversation.iter().map(message_tokens).sum();
 
-        // Build request — instruction is empty; journal carries it.
-        // Attachments are passed on every iteration since the journal
-        // only stores metadata, not the base64 data.
+    // Log one SystemPrompt entry at the start.
+    {
         let mut request = build_agent_request(
             "",
             config,
             &empty_history,
-            conversation,
+            conversation.clone(),
             (80, 24),
-            None, // No PTY child in batch mode
+            None,
         );
         request.system_prompt_extra = Some(system_extra.clone());
         request.attachments = attachments.clone();
-
-        // Log system prompt to journal for trajectory reconstruction
         if let Some(ref mut j) = journal {
             let sp = build_system_prompt(&request);
             j.append(&JournalEntry::SystemPrompt {
@@ -451,6 +448,58 @@ pub async fn run_batch(
                 text: sp,
             });
         }
+    }
+
+    let mut iteration: usize = 0;
+    loop {
+        // Budget check: if conversation exceeds budget, rebuild from journal.
+        if conversation_tokens > config.journal.conversation_budget {
+            conversation = match journal {
+                Some(ref j) => {
+                    let entries = j.read_all();
+                    build_conversation_from_journal(&entries, config.journal.conversation_budget)
+                }
+                None => Vec::new(),
+            };
+            if let Some(ref j) = journal {
+                for msg in &mut conversation {
+                    resolve_media_refs(&mut msg.tool_results, j.media_dir());
+                }
+            }
+            conversation_tokens = conversation.iter().map(message_tokens).sum();
+            // Log new SystemPrompt after budget rebuild.
+            let mut request = build_agent_request(
+                "",
+                config,
+                &empty_history,
+                conversation.clone(),
+                (80, 24),
+                None,
+            );
+            request.system_prompt_extra = Some(system_extra.clone());
+            request.attachments = attachments.clone();
+            if let Some(ref mut j) = journal {
+                let sp = build_system_prompt(&request);
+                j.append(&JournalEntry::SystemPrompt {
+                    ts: epoch_secs(),
+                    text: sp,
+                });
+            }
+        }
+
+        // Build request from in-memory conversation.
+        // Attachments are passed on every iteration since the journal
+        // only stores metadata, not the base64 data.
+        let mut request = build_agent_request(
+            "",
+            config,
+            &empty_history,
+            conversation.clone(),
+            (80, 24),
+            None, // No PTY child in batch mode
+        );
+        request.system_prompt_extra = Some(system_extra.clone());
+        request.attachments = attachments.clone();
 
         // Stream response
         let stream = client.send(&request);
@@ -522,6 +571,15 @@ pub async fn run_batch(
             });
         }
 
+        // Append assistant message to in-memory conversation
+        let assistant_msg = if tool_uses.is_empty() {
+            ua_protocol::ConversationMessage::assistant(&text)
+        } else {
+            ua_protocol::ConversationMessage::assistant_with_tool_use(&text, tool_uses.clone())
+        };
+        conversation_tokens += message_tokens(&assistant_msg);
+        conversation.push(assistant_msg);
+
         // No tool calls = final answer
         if tool_commands.is_empty() {
             output.emit_done(total_input_tokens, total_output_tokens);
@@ -589,9 +647,13 @@ pub async fn run_batch(
             if let Some(ref mut j) = journal {
                 j.append(&JournalEntry::Blocked {
                     ts: epoch_secs(),
-                    results: tool_results,
+                    results: tool_results.clone(),
                 });
             }
+            // Append blocked tool_result to in-memory conversation
+            let blocked_msg = ua_protocol::ConversationMessage::tool_result(tool_results);
+            conversation_tokens += message_tokens(&blocked_msg);
+            conversation.push(blocked_msg);
             continue;
         }
 
@@ -634,9 +696,14 @@ pub async fn run_batch(
                         if let Some(ref mut j) = journal {
                             j.append(&JournalEntry::Blocked {
                                 ts: epoch_secs(),
-                                results: tool_results,
+                                results: tool_results.clone(),
                             });
                         }
+                        // Append blocked tool_result to in-memory conversation
+                        let blocked_msg =
+                            ua_protocol::ConversationMessage::tool_result(tool_results);
+                        conversation_tokens += message_tokens(&blocked_msg);
+                        conversation.push(blocked_msg);
                         continue;
                     }
                     JudgeMode::Warn => {
@@ -746,9 +813,14 @@ pub async fn run_batch(
         if let Some(ref mut j) = journal {
             j.append(&JournalEntry::ToolResult {
                 ts: epoch_secs(),
-                results: all_results,
+                results: all_results.clone(),
             });
         }
+
+        // Append tool_result to in-memory conversation
+        let result_msg = ua_protocol::ConversationMessage::tool_result(all_results);
+        conversation_tokens += message_tokens(&result_msg);
+        conversation.push(result_msg);
 
         iteration += 1;
     }

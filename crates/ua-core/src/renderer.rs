@@ -20,27 +20,14 @@ const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦
 pub struct ReplRenderer<W: Write> {
     pub writer: W,
     style: Style,
-    #[allow(dead_code)]
-    term_width: u16,
     spinner_active: bool,
 }
 
 impl<W: Write> ReplRenderer<W> {
     pub fn new(writer: W, style: Style) -> Self {
-        let term_width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80);
         Self {
             writer,
             style,
-            term_width,
-            spinner_active: false,
-        }
-    }
-
-    pub fn new_with_width(writer: W, style: Style, width: u16) -> Self {
-        Self {
-            writer,
-            style,
-            term_width: width,
             spinner_active: false,
         }
     }
@@ -359,7 +346,7 @@ mod tests {
     use super::*;
 
     fn make_renderer(style: Style) -> ReplRenderer<Vec<u8>> {
-        ReplRenderer::new_with_width(Vec::new(), style, 80)
+        ReplRenderer::new(Vec::new(), style)
     }
 
     fn output_str(r: &ReplRenderer<Vec<u8>>) -> String {
