@@ -43,10 +43,16 @@ fn print_help() {
     println!("Options:");
     println!("  -p, --prompt <text>          Instruction text for batch mode");
     println!("  --attachments <files...>     Image files to attach (png, jpg, gif, webp)");
+    println!("  --system-prompt-file <path>   Prepend file contents to system prompt (batch mode)");
     println!("  --debug-osc                  Print OSC 133 events to stderr");
     println!("  --no-integration             Disable shell integration (OSC 133 injection)");
     println!("  --version                    Print version");
     println!("  --help                       Print this help");
+    println!();
+    println!("Environment:");
+    println!(
+        "  UNIXAGENT_COMPUTER_USE=macos  Enable computer-use mode (forces judge in Block mode)"
+    );
     println!();
     println!("Internal:");
     println!("  --sandbox-exec <cmd> [args...]  Apply sandbox and exec (used by agent)");
@@ -57,6 +63,7 @@ struct CliArgs {
     debug_osc: bool,
     no_integration: bool,
     prompt: Option<String>,
+    system_prompt_file: Option<String>,
     attachment_paths: Vec<String>,
     positional: Vec<String>,
 }
@@ -66,6 +73,7 @@ fn parse_args(args: &[String]) -> CliArgs {
         debug_osc: false,
         no_integration: false,
         prompt: None,
+        system_prompt_file: None,
         attachment_paths: Vec::new(),
         positional: Vec::new(),
     };
@@ -82,6 +90,15 @@ fn parse_args(args: &[String]) -> CliArgs {
                     result.prompt = Some(args[i].clone());
                 } else {
                     eprintln!("error: {arg} requires a value");
+                    std::process::exit(1);
+                }
+            }
+            "--system-prompt-file" => {
+                i += 1;
+                if i < args.len() {
+                    result.system_prompt_file = Some(args[i].clone());
+                } else {
+                    eprintln!("error: --system-prompt-file requires a path");
                     std::process::exit(1);
                 }
             }
@@ -140,7 +157,22 @@ fn main() {
 
     let cli = parse_args(&args);
 
-    let config = Config::load_or_default();
+    let mut config = Config::load_or_default();
+
+    // Detect computer-use mode
+    let computer_use = std::env::var("UNIXAGENT_COMPUTER_USE").is_ok();
+    if computer_use {
+        config.security.judge_enabled = true;
+        config.security.judge_mode = Some(ua_core::config::JudgeMode::Block);
+    }
+
+    // Read --system-prompt-file contents if provided
+    let system_prompt_file: Option<String> = cli.system_prompt_file.as_ref().map(|path| {
+        std::fs::read_to_string(path).unwrap_or_else(|e| {
+            eprintln!("error: --system-prompt-file: {e}");
+            std::process::exit(1);
+        })
+    });
 
     // Apply sandbox to agent process (children inherit).
     // Must happen AFTER config load (needs to read ~/.config/unixagent/config.toml)
@@ -229,6 +261,8 @@ fn main() {
             depth,
             sandbox_active,
             attachments,
+            system_prompt_file.as_deref(),
+            computer_use,
         ));
         std::process::exit(code);
     }
@@ -239,7 +273,6 @@ fn main() {
         std::process::exit(1);
     }
 
-    let mut config = config;
     if cli.no_integration {
         config.shell.integration = false;
     }

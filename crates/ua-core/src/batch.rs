@@ -310,12 +310,18 @@ pub async fn run_batch(
     depth: u32,
     sandbox_active: bool,
     attachments: Vec<ua_protocol::Attachment>,
+    system_prompt_file: Option<&str>,
+    computer_use: bool,
 ) -> i32 {
     let is_tty = std::io::stderr().is_terminal();
     let style = Style::new();
     let mut output = BatchOutput::new(std::io::stderr(), is_tty, depth, instruction, style);
 
-    let system_extra = build_batch_system_prompt(depth, config.security.max_agent_depth);
+    let mut system_extra = build_batch_system_prompt(depth, config.security.max_agent_depth);
+    if let Some(extra) = system_prompt_file {
+        system_extra.push_str("\n\n");
+        system_extra.push_str(extra);
+    }
 
     // Resolve API key
     let api_key = match config.backend.anthropic.resolve_api_key() {
@@ -608,6 +614,7 @@ pub async fn run_batch(
                 &std::env::current_dir()
                     .unwrap_or_default()
                     .to_string_lossy(),
+                computer_use,
             )
             .await;
 

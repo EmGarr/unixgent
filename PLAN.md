@@ -1,6 +1,6 @@
 # UnixAgent — Implementation Plan
 
-**Last updated**: 2026-02-19
+**Last updated**: 2026-02-22
 
 This document tracks the implementation status of every phase and sub-task.
 It is the single source of truth for "where are we at". See DESIGN.md for
@@ -340,6 +340,58 @@ Parent reads just this one line (seek to end, scan back) to get the fold view.
 **Exit criteria**: Commands look typed. Risk is visible at the prompt line.
 Token costs printed after every interaction. 50-agent tree produces ~50
 readable summary lines (not 50 live-updating table rows).
+
+---
+
+## Computer Use Demo — DONE
+
+Docker-based Ubuntu desktop environment for end-to-end computer use testing.
+Xvfb + x11vnc + noVNC on port 6080, Xfce4 desktop with Firefox, scrot for
+screenshots, xdotool for mouse/keyboard control. Agent runs in batch mode
+inside the container; magic byte detection pipeline captures screenshots as
+image content blocks for Claude.
+
+| Sub-task | Status | Files |
+|----------|--------|-------|
+| Dockerfile (Ubuntu 24.04 + Xvfb + VNC + noVNC + Xfce4 + tools + Rust) | DONE | `demo/computer-use/Dockerfile` |
+| docker-compose.yml (ports, env, shm_size) | DONE | `demo/computer-use/docker-compose.yml` |
+| entrypoint.sh (Xvfb → Xfce4 → x11vnc → noVNC startup sequence) | DONE | `demo/computer-use/entrypoint.sh` |
+| system-prompt.md (scrot + xdotool reference) | DONE | `demo/computer-use/system-prompt.md` |
+| README.md (usage instructions) | DONE | `demo/computer-use/README.md` |
+
+**Verification**: `docker compose up --build`, open `http://localhost:6080`,
+run agent with `docker compose exec desktop unixagent "Take a screenshot"`.
+
+---
+
+## macOS Native Computer-Use Demo — DONE
+
+Native macOS desktop control — no Docker, no VNC. Agent takes screenshots
+via `screencapture` and controls mouse/keyboard via `cliclick`. Seatbelt
+sandbox for filesystem isolation, judge in Block mode, policy deny list
+for sandbox escape vectors (osascript shell escape, open Terminal, etc.).
+
+| Sub-task | Status | Files |
+|----------|--------|-------|
+| `--system-prompt-file` CLI flag | DONE | `ua-core/src/main.rs` |
+| `UNIXAGENT_COMPUTER_USE` env var (forces judge Block mode) | DONE | `ua-core/src/main.rs` |
+| Thread `system_prompt_file` + `computer_use` through batch mode | DONE | `ua-core/src/batch.rs` |
+| Judge: 4 computer-use risk categories (screenshot abuse, input injection, permission escalation, app manipulation) | DONE | `ua-core/src/judge.rs` |
+| Policy: deny `osascript do shell script`, `open -a Terminal/iTerm/Script Editor` | DONE | `ua-core/src/policy.rs` |
+| Policy: classify `screencapture` (read-only), `cliclick` (write), `osascript` (network) | DONE | `ua-core/src/policy.rs` |
+| system-prompt.md (screencapture + cliclick reference, Retina notes) | DONE | `demo/computer-use-macos/system-prompt.md` |
+| launch.sh (permission checks, API key resolution, env setup) | DONE | `demo/computer-use-macos/launch.sh` |
+| cleanup.sh (TCC permission revocation) | DONE | `demo/computer-use-macos/cleanup.sh` |
+| README.md (prerequisites, architecture, security model) | DONE | `demo/computer-use-macos/README.md` |
+| 500 tests pass, `make check` clean | DONE | |
+
+**Security model (3 layers)**:
+- Seatbelt sandbox: kernel-enforced filesystem isolation (process-lifetime)
+- Judge (Block mode): LLM review of every non-read-only command
+- Policy deny list: static pattern matching for known exploit patterns
+
+**Known gap**: macOS TCC permissions (Accessibility, Screen Recording) are
+per-app, not per-process. `cleanup.sh` is advisory.
 
 ---
 

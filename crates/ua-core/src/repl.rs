@@ -1666,7 +1666,7 @@ fn start_judging<W: Write>(
     let tx_clone = tx.clone();
     rt_handle.spawn(async move {
         let verdict = tokio::select! {
-            v = judge::evaluate_commands(&client, &commands_owned, &instruction_owned, &cwd_owned) => v,
+            v = judge::evaluate_commands(&client, &commands_owned, &instruction_owned, &cwd_owned, false) => v,
             _ = cancel_rx => {
                 return; // Cancelled — don't send result
             }
