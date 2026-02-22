@@ -1,0 +1,527 @@
+Excellent! Now I have enough information. Let me create a comprehensive analysis document:
+
+## Deep Code Analysis: Butterfish Project
+
+Based on my thorough examination of the Butterfish codebase, here's a detailed technical analysis:
+
+### 1. ARCHITECTURE OVERVIEW
+
+**Butterfish** is a Go-based shell wrapper that augments the command-line experience with LLM capabilities (OpenAI API). The project is organized into logical packages:
+
+- **cmd/butterfish/main.go** - Entry point, CLI parsing, configuration loading
+- **butterfish/** - Core shell multiplexing, PTY management, state machine
+- **util/** - Shared types (CompletionRequest, HistoryBlock, ShellCall, etc.)
+- **prompt/** - Prompt library management and interpolation
+
+**Key file paths:**
+- `/home/user/unixgent/research/clones/butterfish/cmd/butterfish/main.go` - CLI entry point
+- `/home/user/unixgent/research/clones/butterfish/butterfish/shell.go` - Main multiplexer (2600+ lines)
+- `/home/user/unixgent/research/clones/butterfish/butterfish/shellbuffer.go` - Terminal editing buffer
+- `/home/user/unixgent/research/clones/butterfish/butterfish/openai_client.go` - LLM client
+- `/home/user/unixgent/research/clones/butterfish/util/util.go` - Shared types and utilities
+
+---
+
+### 2. HOW IT CONTROLS THE COMPUTER - PTY WRAPPING ARCHITECTURE
+
+#### 2.1 PTY Setup & Lifecycle
+
+The project uses the `creack/pty` library to create a pseudo-terminal (PTY). Key implementation in `butterfish.go` lines 246-301:
+
+```go
+func ptyCommand(ctx context.Context, envVars []string, command []string) (*os.File, func() error, error) {
+    // Create arbitrary command.
+    var cmd *exec.Cmd
+    // ... command setup ...
+    
+    // Start the command with a pty.
+    ptmx, err := pty.Start(cmd)  // ptmx is the master side of the PTY
+    
+    // Handle pty size - watch for SIGWINCH signals
+    ch := make(chan os.Signal, 1)
+    signal.Notify(ch, syscall.SIGWINCH)
+    go func() {
+        for range ch {
+            if err := pty.InheritSize(os.Stdin, ptmx); err != nil {
+                log.Printf("error resizing pty: %s", err)
+            }
+        }
+    }()
+    
+    // Set stdin in raw mode
+    oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+    
+    return ptmx, cleanup, nil
+}
+```
+
+This creates a PTY where:
+- The wrapped shell (bash/zsh) runs as a child process on the slave side
+- Butterfish controls the master side
+- All terminal I/O flows through this PTY
+
+#### 2.2 I/O Multiplexing - The Main Event Loop
+
+The core multiplexer is `ShellState.Mux()` in `shell.go` lines 1035-1287. This is a high-level event loop that manages:
+
+1. **Child output** (`ChildOutReader`) - shell command output
+2. **Parent input** (`ParentInReader`) - user keyboard input
+3. **LLM responses** (`PromptOutputChan`) - AI-generated content
+4. **Cursor position** (`CursorPosChan`) - terminal cursor location
+5. **Window resize** (`Sigwinch`) - terminal size changes
+6. **Autosuggest results** (`AutosuggestChan`) - AI command suggestions
+
+```go
+func (this *ShellState) Mux() {
+    log.Printf("Started shell mux")
+    childOutBuffer := []byte{}
+    
+    for {
+        select {
+        case <-this.Butterfish.Ctx.Done():
+            return
+        case err := <-this.PrintErrorChan:
+            // handle errors
+        case pos := <-this.CursorPosChan:
+            // handle cursor position responses
+        case <-this.Sigwinch:
+            // handle window resize
+        case result := <-this.AutosuggestChan:
+            // handle autosuggest results
+        case output := <-this.PromptOutputChan:
+            // handle LLM response
+        case childOutMsg := <-this.ChildOutReader:
+            // process child shell output
+        case parentInMsg := <-this.ParentInReader:
+            // process user input
+        }
+    }
+}
+```
+
+#### 2.3 Terminal I/O Handling
+
+**Two separate reader goroutines** push bytes into the mux via channels:
+
+1. `readerToChannel()` - Reads from child PTY and sends to `ChildOutReader` channel
+2. `readerToChannelWithPosition()` - Reads from parent stdin and detects cursor position queries, sends to `ParentInReader` and `CursorPosChan` channels
+
+This architecture allows non-blocking, concurrent handling of bidirectional I/O.
+
+#### 2.4 Terminal State Management
+
+The project tracks four distinct states (line 425 in shell.go):
+
+```go
+const (
+    stateNormal = iota        // Waiting for user input
+    stateShell                // User typing a regular command
+    statePrompting            // User typing an LLM prompt (capital letter)
+    statePromptResponse       // Receiving LLM response
+)
+```
+
+**State transitions:**
+- `stateNormal` → `stateShell`: User types a lowercase character
+- `stateNormal` → `statePrompting`: User types uppercase or `!` (Goal Mode)
+- `statePrompting` → `statePromptResponse`: User presses Enter, sending prompt to LLM
+- `statePromptResponse` → `stateNormal`: LLM response received
+
+---
+
+### 3. GOAL MODE - AUTONOMOUS LLM EXECUTION
+
+**Goal Mode** is Butterfish's most innovative feature. When a user starts a command with `!`, the LLM becomes an autonomous agent.
+
+#### 3.1 Goal Mode Initialization
+
+From `shell.go` lines 1658-1681:
+
+```go
+func (this *ShellState) GoalModeStart() {
+    // Get the prompt after the bang
+    goal := this.Prompt.String()[1:]  // Extract text after "!"
+    
+    // If the prompt is preceded with two bangs then go to unsafe mode
+    if goal[0] == '!' {
+        goal = goal[1:]
+        this.GoalModeUnsafe = true   // Skip command confirmation
+    } else {
+        this.GoalModeUnsafe = false  // Confirm each command
+    }
+    
+    this.GoalMode = true
+    fmt.Fprintf(this.PromptGoalAnswerWriter, "%sGoal mode starting...%s\n", ...)
+    this.GoalModeGoal = goal
+    this.Prompt.Clear()
+    
+    prompt := "Start now."
+    this.goalModePrompt(prompt)  // Send to LLM
+}
+```
+
+#### 3.2 Available Functions in Goal Mode
+
+The LLM can call three functions (lines 1857-1905):
+
+1. **`command(cmd: string)`** - Execute a shell command
+2. **`user_input(question: string)`** - Ask the user a question (pause for input)
+3. **`finish(success: bool)`** - Complete Goal Mode (success/failure)
+
+For newer models (GPT-5.1+), it also supports the **shell tool** (shell_call), which is more structured and allows multiple commands.
+
+#### 3.3 Command Execution Flow
+
+When the LLM returns a `command` or `shell_call`:
+
+From `shell.go` lines 1752-1784:
+
+```go
+func (this *ShellState) GoalModeFunction(output *util.CompletionResponse) {
+    if len(output.ShellCalls) > 0 {
+        // Handle multiple shell calls - only execute first, acknowledge the rest
+        for i := 1; i < len(output.ShellCalls); i++ {
+            if skipped := skippedShellCallOutput(output.ShellCalls[i]); skipped != nil {
+                this.History.AppendShellCallOutput(skipped)
+            }
+        }
+        
+        call := output.ShellCalls[0]
+        this.GoalModeBuffer = ""
+        this.PromptSuffixCounter = 0
+        this.setState(stateNormal)
+        
+        command := strings.Join(call.Commands, "\n")
+        fmt.Fprintf(this.ChildIn, "%s", command)  // INJECT COMMAND
+        if this.GoalModeUnsafe {
+            fmt.Fprintf(this.ChildIn, "\n")       // Auto-execute in unsafe mode
+        }
+        return
+    }
+    
+    // ... handle function calls ...
+}
+```
+
+**Key insight:** Commands are **injected directly into the PTY's master side** (this.ChildIn), bypassing the user's terminal. The shell executes them as if the user typed them.
+
+#### 3.4 Output Capture
+
+The mux detects when command execution completes by watching for prompt markers. From lines 1212-1275:
+
+```go
+if this.GoalMode {
+    this.GoalModeBuffer += childOutStr  // Accumulate output
+    if this.PromptSuffixCounter >= 2 {
+        // Seen two prompts = command is done
+        endOfFunctionCall = true
+    }
+}
+
+if endOfFunctionCall {
+    fmt.Fprintf(this.ParentOut, "\r%s", ESC_CLEAR)
+    var status string
+    if this.ActiveFunction == "command" {
+        status = fmt.Sprintf("Exit Code: %d\n", lastStatus)
+        this.GoalModeFunctionResponse(status)
+    } else if this.ActiveFunction == "shell" {
+        this.GoalModeShellCallResponse(lastStatus)
+    }
+    // Send output back to LLM for next iteration
+}
+```
+
+The mux uses custom **PS1 markers** (PROMPT_PREFIX/PROMPT_SUFFIX) to detect when the shell is ready for the next command. This is set via `SetPS1()` at lines 716-744.
+
+#### 3.5 Prompt Assembly for Goal Mode
+
+From `shell.go` lines 1945-1995:
+
+```go
+func (this *ShellState) goalModePrompt(lastPrompt string) {
+    sysMsg, err := this.Butterfish.PromptLibrary.GetPrompt(
+        prompt.GoalModeSystemMessage,
+        "goal", this.GoalModeGoal,
+        "sysinfo", GetSystemInfo())
+    
+    useShellTool := supportsShellToolModel(this.Butterfish.Config.ShellPromptModel)
+    functions := goalModeFunctions
+    tools := []util.ToolDefinition{}
+    if useShellTool {
+        functions = goalModeFunctionsShellTool
+        tools = append(tools, util.ToolDefinition{Type: "shell"})
+    }
+    
+    tokensForAnswer := 1024
+    lastPrompt, historyBlocks, err := this.AssembleChat(lastPrompt, sysMsg, 
+        getGoalModeFunctionsString(functions), tokensForAnswer)
+    
+    request := &util.CompletionRequest{
+        Ctx:             requestCtx,
+        Prompt:          lastPrompt,
+        Model:           this.Butterfish.Config.ShellPromptModel,
+        MaxTokens:       tokensForAnswer,
+        ReasoningEffort: this.configuredReasoningEffort(),
+        HistoryBlocks:   historyBlocks,
+        SystemMessage:   sysMsg,
+        Functions:       functions,
+        Tools:           tools,
+    }
+    
+    go CompletionRoutine(request, this.Butterfish.LLMClient,
+        this.PromptGoalAnswerWriter, this.PromptOutputChan, ...)
+}
+```
+
+---
+
+### 4. TERMINAL EDITING BUFFER - SHELLBUFFER
+
+The `ShellBuffer` is a sophisticated terminal editing simulation (shellbuffer.go). It tracks:
+- Current buffer content (runes)
+- Cursor position
+- Terminal width
+- Escape sequences (arrow keys, home, end, etc.)
+
+From lines 13-26:
+
+```go
+type ShellBuffer struct {
+    buffer       []rune    // The actual content
+    cursor       int       // Cursor position in buffer
+    termWidth    int       // Terminal width for wrapping
+    promptLength int       // Starting column of the buffer
+    color        string    // ANSI color codes
+    
+    lastAutosuggestLen int
+    lastJumpForward    int
+    oldLength          int
+    newLength          int
+}
+```
+
+When the user types, `Write()` updates the buffer AND generates the exact ANSI escape sequences needed to redraw it on the terminal (lines 227-306). This allows precise visual feedback without relying on the shell's native editing.
+
+---
+
+### 5. LLM INTEGRATION - STREAMING & RESPONSES API
+
+#### 5.1 OpenAI Client
+
+From `/home/user/unixgent/research/clones/butterfish/butterfish/openai_client.go`:
+
+```go
+func (this *OpenAIClient) CompletionStream(request *util.CompletionRequest, writer io.Writer) 
+    (*util.CompletionResponse, error)
+```
+
+The client uses OpenAI's **Responses API** (not the older Chat Completions API). This API supports:
+- **Function calling** (structured tool use)
+- **Shell tool** (for Goal Mode)
+- **Streaming** (incremental token generation)
+- **Reasoning** (using models like o1 with extended thinking)
+
+#### 5.2 History Assembly
+
+The `assembleChat()` function (lines 2052-2111) carefully constructs the prompt while respecting token limits:
+
+```go
+// Account for prompt, system message, functions, and history blocks
+numPromptTokens, prompt, truncated := countAndTruncate(prompt, encoder, maxPromptTokens)
+usedTokens += numPromptTokens
+
+sysMsgTokens := encoder.Encode(sysMsg, nil, nil)
+usedTokens += len(sysMsgTokens)
+
+functionTokens := encoder.Encode(functions, nil, nil)
+usedTokens += len(functionTokens)
+
+// Get history blocks within remaining token budget
+blocks, historyTokens := getHistoryBlocksByTokens(
+    history, encoder, maxHistoryBlockTokens, 
+    maxTokens-usedTokens, tokensPerMessage)
+```
+
+Token counting uses **tiktoken** for accurate estimation per model.
+
+---
+
+### 6. INTERESTING/NOVEL DESIGN PATTERNS
+
+#### 6.1 Shell Wrapping vs. Shell Replacement
+
+Unlike traditional terminal multiplexers (tmux, screen), Butterfish doesn't **replace** the shell. Instead, it **wraps** it via PTY. This is elegant:
+- User keeps their existing shell configuration
+- Shell history remains unchanged
+- Butterfish acts as a transparent middleware
+
+#### 6.2 Prompt Markers for State Detection
+
+Custom ANSI escape sequences (lines 47-50) wrap the shell prompt:
+
+```go
+const PROMPT_PREFIX = "\033Q"
+const PROMPT_SUFFIX = "\033R"
+```
+
+The shell PS1 becomes:
+```
+PS1=$'[prefix]'$PS1$'[suffix]'
+```
+
+Butterfish detects these markers to know:
+- When the shell is ready for input
+- When a command has completed
+- The exit code of the previous command
+
+This is **far more robust** than heuristic-based detection.
+
+#### 6.3 Interactive Child Passthrough
+
+For TUI applications (vim, less, top), Butterfish detects when they're running and **bypasses** expensive history parsing (lines 1165-1184):
+
+```go
+if this.InteractiveChildPassthrough {
+    if runningChildren && !hasPromptMarkers {
+        this.appendTUITail(childOutMsg.Data)  // Keep minimal tail
+        this.ParentOut.Write(childOutMsg.Data)
+        continue  // Skip history processing
+    }
+}
+```
+
+This prevents TUI redraw spam from polluting the LLM context.
+
+#### 6.4 Token Budget Management
+
+History is managed as a **ring buffer** with token accounting:
+- Each history block tracks token count
+- Blocks are truncated individually to a max
+- History is walked backwards until token budget exhausted
+- Newer history is preferred over older
+
+This ensures **consistent context window usage** (lines 2113-2193).
+
+#### 6.5 Autosuggest with Context
+
+The autosuggest feature (lines 2462-2585) runs in a separate goroutine with its own token budget:
+
+```go
+totalTokens := 1600  // limit autosuggest to 1600 tokens for cost reasons
+reserveForAnswer := 64
+
+historyBlocks, _ := getHistoryBlocksByTokens(history, encoder,
+    maxHistoryBlockTokens, totalTokens-reserveForAnswer, 4)
+
+// Build prompt with context
+prmpt, err := prompt.Interpolate(rawPrompt,
+    "history", historyStr,
+    "command", currCommand)
+```
+
+This is **cancellable** - new keystrokes cancel the pending request to save API costs.
+
+---
+
+### 7. LIMITATIONS & WEAKNESSES
+
+#### 7.1 Command Parsing
+
+The command extraction from LLM output uses a regex (lines 988-999):
+
+```go
+var commandRegex = regexp.MustCompile("^\\s*\\{\\s*\"cmd\"\\s*:\\s*\"(.*)\"\\s*\\}\\s*$")
+
+func parseCommandParams(params string) (string, error) {
+    matches := commandRegex.FindStringSubmatch(params)
+    if len(matches) != 2 {
+        return "", fmt.Errorf("Unable to parse command params: %s", params)
+    }
+    cmd := matches[1]
+```
+
+This is **brittle**:
+- Unescaped quotes in commands break parsing
+- Complex bash syntax may confuse the JSON unmarshaling
+- The code tries to patch this with `AddDoubleEscapesForJSON()` but it's a band-aid
+
+#### 7.2 One Command at a Time in Goal Mode
+
+Goal Mode only executes the first shell call if multiple are returned (line 1758):
+
+```go
+if len(output.ShellCalls) > 0 {
+    // The Responses API can return multiple shell_call items. We execute the
+    // first one and acknowledge the rest so follow-up requests don't fail due
+    // to missing tool outputs.
+    for i := 1; i < len(output.ShellCalls); i++ {
+        if skipped := skippedShellCallOutput(output.ShellCalls[i]); skipped != nil {
+            this.History.AppendShellCallOutput(skipped)
+        }
+    }
+    
+    call := output.ShellCalls[0]
+    // Only execute first...
+}
+```
+
+This was likely a design choice to avoid runaway command execution, but it's **limiting for complex tasks** that require sequential commands.
+
+#### 7.3 TUI Detection is Heuristic
+
+Interactive app detection (line 818) checks for control sequences:
+
+```go
+func likelyTUIControlSequence(data []byte) bool {
+    // ... scan for CSI sequences like cursor movement (A, B, C, D, etc.) ...
+    // Skip SGR ('m') color-only sequences
+```
+
+This can **false positive** on commands that emit many escape codes but aren't interactive (e.g., `ffmpeg` with progress bars).
+
+#### 7.4 No Sandbox/Safety Constraints
+
+Goal Mode will **execute ANY command** the LLM suggests. There's no:
+- Allowlist/blocklist of commands
+- Sudo password handling
+- File permission checks
+- Rollback mechanism
+
+The `GoalModeUnsafe` flag just skips the extra newline confirmation - it doesn't add any actual safety.
+
+#### 7.5 Context Window Precision
+
+Token counting assumes **exact model behavior**. If the LLM API changes tokenization or has off-by-one errors, the context can overflow.
+
+#### 7.6 History Truncation Losses
+
+Long-running commands with massive output are truncated to `ShellMaxHistoryBlockTokens` (default 1024 tokens). The LLM never sees the full output, limiting its ability to understand errors.
+
+---
+
+### 8. CODE ORGANIZATION SUMMARY
+
+| File | Purpose | Lines |
+|------|---------|-------|
+| `cmd/butterfish/main.go` | CLI parsing, config loading | 265 |
+| `butterfish/shell.go` | Main event loop, state machine, Goal Mode | 2600+ |
+| `butterfish/shellbuffer.go` | Terminal editing simulation | 396 |
+| `butterfish/openai_client.go` | LLM API client (streaming, Responses API) | 500+ |
+| `butterfish/shell_*.go` | Shell-specific commands, TUI handling | 73 lines (test) |
+| `util/util.go` | Types: CompletionRequest, HistoryBlock, ShellCall | 500+ |
+| `prompt/` | Prompt templating & library management | 200+ |
+
+---
+
+### 9. NOTABLE IMPLEMENTATION DETAILS
+
+1. **No external TTY library dependencies** - Uses standard `golang.org/x/term` for raw mode
+2. **Streaming responses** - Uses SSE (Server-Sent Events) for token-by-token output
+3. **Rich prompt templating** - YAML-based prompts with variable interpolation
+4. **Multi-model support** - Detects model capabilities (reasoning, shell tool) at runtime
+5. **Color scheme flexibility** - Dark/Light modes, customizable via config
+6. **Extensive logging** - Logs to `/var/tmp/butterfish.log` with multiple verbosity levels
+
+---
+
+This is a **well-architected project** with thoughtful solutions to hard problems (PTY multiplexing, token budgeting, interactive app detection). The main tradeoff is **flexibility vs. safety** - Goal Mode trusts the LLM completely, which enables powerful autonomous behavior but also risks unintended command execution.

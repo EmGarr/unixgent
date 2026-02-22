@@ -1,0 +1,352 @@
+Perfect! Now I have enough information to write a comprehensive analysis. Let me compile the findings:
+
+## Deep Code Analysis: Goose AI Agent
+
+Based on my analysis of the Goose codebase, here is a comprehensive technical overview:
+
+### 1. Architecture Overview
+
+**Crate Structure:**
+```
+crates/
+  goose/           # Core agent logic and LLM integration
+  goose-cli/       # Command-line interface (main entry point)
+  goose-mcp/       # Built-in MCP servers (developer, computer controller, etc.)
+  goose-acp/       # Agent Control Protocol server implementation
+  goose-acp-macros/ # Procedural macros for ACP
+  goose-server/    # Server deployment
+  goose-test/      # Testing utilities
+  goose-test-support/ # Test helpers
+```
+
+**Key Dependencies:**
+- `rmcp` (Rust Model Context Protocol) - MCP client/server implementation with multiple transports
+- `tokio` - Async runtime with full feature set
+- `axum` - Web framework for HTTP/WebSocket servers
+- `reqwest` - HTTP client with streaming support
+- `sqlx` - SQLite database with migrations for session persistence
+- `tree-sitter` - Code parsing across 7 languages
+- `llama-cpp-2` & `candle` - Local inference support with GPU acceleration
+
+**Workspace Configuration:**
+- Single workspace with shared dependency versions
+- Shared edition: 2021
+- Version: 1.24.0
+- Shared lints (clippy)
+
+### 2. How It Controls the Computer
+
+**Shell Command Execution Path:**
+
+**A. Developer Tool (goose-mcp)** - Built-in MCP server providing shell access:
+
+1. **File**: `/home/user/unixgent/research/clones/goose/crates/goose-mcp/src/developer/shell.rs`
+   - Detects OS and shell (bash/zsh/fish on Unix; PowerShell/cmd on Windows)
+   - Uses `-c` flag to execute commands
+   - Captures stdin/stdout/stderr
+
+2. **Shell Execution** (rmcp_developer.rs):
+   - `ShellParams` struct contains the command string
+   - Process spawned via `tokio::process::Command`
+   - Uses `ShellConfig` for platform-specific shell detection
+   - Handles working directory context
+
+3. **Example from Developer Tool**:
+   - `shell_tool` handler executes arbitrary commands
+   - Uses `configure_shell_command()` to set up execution context
+   - Captures output and returns as `CallToolResult`
+
+**B. Text Editor Tool** (text_editor.rs):
+   - Operations: `view`, `write`, `str_replace`, `insert`, `undo_edit`
+   - Supports unified diff format for atomic edits
+   - Can edit multiple files in one operation
+   - Does NOT create/delete files
+
+**C. Computer Controller Tool** (computercontroller/):
+   - Screen capture via `xcap` crate (platform-specific: Metal on macOS, Direct3D on Windows)
+   - Window enumeration
+   - Native OS-level automation (via AppleScript on macOS, UI Automation on Windows)
+
+**D. Tool Execution Flow**:
+
+```
+Agent.reply()
+  → Generate LLM response (streaming)
+    → Extract tool calls from response
+      → inspect_tool_calls() (security/permission checks)
+        → dispatch_tool_call()
+          → extension_manager.call_tool()
+            → MCP client calls extension
+              → Shell/editor/computer controller executes
+                → capture output
+                  → ToolResponse message
+```
+
+**Key Files**:
+- `/home/user/unixgent/research/clones/goose/crates/goose/src/agents/tool_execution.rs` - Tool execution orchestration
+- `/home/user/unixgent/research/clones/goose/crates/goose/src/agents/agent.rs` (line ~1750+) - Tool dispatch and result handling
+
+### 3. MCP Integration
+
+**Architecture**: Goose is a deep MCP consumer AND a producer:
+
+**As MCP Client** (`goose/src/agents/mcp_client.rs`):
+- Trait `McpClientTrait` with methods: `list_tools()`, `call_tool()`, `list_resources()`, `read_resource()`, `list_prompts()`, `get_prompt()`
+- Implements `rmcp::ClientHandler` for extensibility
+- Supports multiple transports:
+  - Child process (stdio) for external MCP servers
+  - Streamable HTTP for remote servers
+  - Duplex streams for in-process (built-in extensions)
+
+**Extension Manager** (`goose/src/agents/extension_manager.rs`, 77KB):
+- Registry pattern: `HashMap<String, Extension>` mapping name → MCP client
+- Each extension wraps: config + MCP client + server info + optional temp dir
+- Lazy initialization of tools (caching with versioning)
+- Manages resource loading (files, PDFs, Office docs)
+
+**Built-in Extensions** (`goose-mcp/src/lib.rs`):
+```rust
+BUILTIN_EXTENSIONS = [
+  ("developer", DeveloperServer),          // File editing, shell
+  ("autovisualiser", AutoVisualiserRouter),// Visualization
+  ("computercontroller", ComputerControllerServer), // Screen/input
+  ("memory", MemoryServer),               // Conversation memory
+  ("tutorial", TutorialServer),           // Interactive tutorials
+]
+```
+
+Each spawns via macro that uses `tokio::io::DuplexStream` for transport - no subprocess overhead!
+
+**Tool Definition Pattern** (in developer/rmcp_developer.rs):
+```rust
+#[tool_handler]
+pub async fn shell_tool(&self, params: ShellParams) -> Result<CallToolResult, ErrorData>
+```
+
+Uses `rmcp` macros for automatic tool schema generation from JsonSchema-annotated structs.
+
+**Prompt Support** - Extensions can provide context prompts via `list_prompts()` + `get_prompt()`:
+- Used by recipes and slash commands
+- Supports dynamic arguments
+- Loaded from YAML templates
+
+### 4. LLM Integration
+
+**Provider Abstraction** (`goose/src/providers/base.rs`):
+
+**Provider Trait** (lines 460+):
+```rust
+pub trait Provider: Send + Sync {
+    async fn stream(...) -> Result<MessageStream, ProviderError>;
+    async fn complete(...) -> Result<(Message, ProviderUsage), ProviderError>;
+}
+```
+
+**Streaming Architecture**:
+- Primary method: `stream()` returns `MessageStream` (Box<dyn Stream<Item=Result<(Option<Message>, Option<ProviderUsage>)>>>)
+- Coalesces partial text chunks into complete `Message` objects
+- Complete tool calls within same chunk (no interleaving)
+- Usage tracking (input/output tokens)
+
+**Supported Providers** (21+ implementations):
+- **Cloud**: Anthropic (Claude), OpenAI, Google Gemini, Azure, AWS Bedrock, Databricks, GCP Vertex AI, XAI, OpenRouter
+- **Self-hosted**: Ollama, OpenAI-compatible, LiteLLM
+- **Specialized**: Cursor Agent, GitHub Copilot, SageMaker TGI, Snowflake Cortex
+- **Local**: llama.cpp (with GPU support), Whisper transcription
+
+**Anthropic Provider Example** (`goose/src/providers/anthropic.rs`):
+- Uses streaming SSE format
+- Extended thinking support (with `anthropic-beta` headers)
+- Token-efficient tools (2025-02-19 API)
+- 200K context window models
+
+**Provider Registry** (`provider_registry.rs`):
+- Auto-detection from environment (API keys, config files)
+- Fallback chain for models (try fast model, fall back to main)
+- Multi-model support in single session
+
+**Request Format**:
+- System prompt assembly from extensions + agent instructions
+- Message conversion (supports thinking, tool calls, images)
+- Tool definitions passed as part of request
+- Response parsing handles chunked streaming
+
+### 5. Security Model
+
+**Multi-Layer Defense** (`goose/src/security/` and `goose/src/permission/`):
+
+**Layer 1: Tool Inspection** (`tool_inspection.rs`):
+- `SecurityInspector` - Detects prompt injection, code execution risks
+- `PermissionInspector` - User authorization checks
+- `RepetitionInspector` - Prevents tool call loops
+- Runs BEFORE tool execution
+
+**Layer 2: Permission Manager** (`permission.rs`):
+- Three levels: `AllowOnce`, `AlwaysAllow`, `Decline`
+- Permission storage: SQLite per-user/per-tool database
+- User confirmation UI (blocking message in conversation)
+- Example: `/home/user/unixgent/research/clones/goose/crates/goose-cli/src/agents/agent.rs` line 75+
+
+**Layer 3: Security Classification** (`security/classification_client.rs`):
+- Malware detection via external API
+- File extension + content scanning
+- Agent decision logs
+
+**Layer 4: Sandbox Options** (config):
+- Container execution mode (`--container CONTAINER_ID`)
+- Docker integration for extension isolation
+- Extension validation before loading
+
+**Tool Request/Approval Flow**:
+```
+Tool Call in LLM response
+  → extract tool_call from message
+    → inspection (security + permission checks)
+      → if approval needed:
+          → send ActionRequired message
+            → wait for user confirmation
+              → dispatch OR decline
+      → else:
+          → dispatch immediately
+```
+
+File: `/home/user/unixgent/research/clones/goose/crates/goose/src/agents/tool_execution.rs` (lines 52-100)
+
+### 6. Interesting/Novel Ideas
+
+**A. Session Persistence & Context Management**:
+- SQLite journal (JSONL format) with automatic compaction
+- Conversation history ring buffer with token counting
+- Auto-compaction triggers when exceeding 85% context window (configurable)
+- Conversation compaction via LLM summarization (preserves key facts)
+- Multi-session management with unique IDs (timestamp-based)
+
+**B. Extensible Prompt System**:
+- YAML/JSON recipes as composable task templates
+- Support for parameters with defaults
+- Slash commands (`/compact`, `/clear`, `/prompts`, `/prompt`)
+- Recipe templates with MiniJinja templating
+- Dynamic parameter binding at execution time
+
+**C. Streaming Response Display**:
+- `ReplRenderer<W>` - testable, event-driven display logic (Linus Torvalds forward-flow design)
+- Events: Message, McpNotification, ModelChange, HistoryReplaced
+- Real-time token usage tracking
+- Thinking/reasoning blocks with optional display
+
+**D. MCP Extension Polymorphism**:
+- Same tool interface for child process, HTTP, in-process
+- Automatic stdio buffer management
+- Auth abstraction (header-based, query params)
+- Pagination support with cursor tokens
+
+**E. Platform Abstraction**:
+- Same backend (`goose` crate) serving:
+  - CLI (`goose-cli`)
+  - Desktop app (via Desktop protocol)
+  - ACP server (`goose-acp`)
+- Configuration per-platform (Goose CLI vs Desktop features)
+
+**F. Tool Execution with Notifications**:
+- `ToolStream` combines notification stream + result future
+- Tools can emit server notifications during execution
+- Example: shell commands emitting progress updates
+
+**G. Declarative Provider Configuration**:
+- Custom LLM providers via config YAML
+- Headers, auth methods, model mapping configurable
+- Supports non-standard API-compatible endpoints
+
+### 7. Limitations & Constraints
+
+**A. Architectural Limitations**:
+
+1. **Single Active Provider**: Only one LLM provider active per session (can't mix Anthropic + OpenAI in same conversation)
+   - Workaround: Manual model switching within provider
+
+2. **Synchronous Tool Execution**: Tools execute sequentially, not parallel
+   - Agent must wait for tool results before next LLM call
+   - File: `agent.rs` line ~1000+ (message loop waits for each tool)
+
+3. **Tool Call Extraction Fragility**: Relies on provider to include tool calls in structured format
+   - Fallback: JSON parsing if format unclear (`agent.rs` line 1901)
+   - Risk: Malformed tool calls or tool calls in text only
+
+4. **Context Window Hard Limit**: When conversation exceeds threshold:
+   - Auto-compaction triggered
+   - Can lose fidelity in multi-turn conversations
+   - Compaction itself uses tokens
+
+**B. Security Trade-offs**:
+
+1. **Permission Fatigue**: User approval required for sensitive tools
+   - Large volume of approval requests degrades UX
+   - AllowOnce vs AlwaysAllow decision per tool/user
+
+2. **Shell Access**: Developer tool provides unrestricted shell execution
+   - File editing, text processing, system access all enabled
+   - Mitigation: Tool inspection + user approval only
+
+3. **Resource Loading**: Extensions can read arbitrary files
+   - Files indexed via `read_resource()` mechanism
+   - No automatic sandboxing
+
+**C. Performance Constraints**:
+
+1. **Token Counting**: Each message serialized for tiktoken counting
+   - Token overhead: variable (~2-10% overhead per message)
+   - Cached in SQLite but still CPU-bound
+
+2. **Large Response Handling**: 
+   - Streaming helps, but final message assembled in memory
+   - Large_response_handler truncates responses
+   - Tool results truncated to `tool_call_cut_off` threshold
+
+3. **Extension Initialization**: Each extension initialized on first use
+   - Child process startup latency
+   - No connection pooling for subprocess transports
+
+**D. Feature Gaps**:
+
+1. **No Multi-Agent Coordination**: Single agent loop only
+   - Sub-agents supported but sequential only
+   - No cross-agent resource sharing
+
+2. **Limited Tool Composition**: Tools can't call other tools
+   - No tool chaining within extension
+   - Composition happens at agent level only
+
+3. **Model Context Not Explicitly Managed**: Context assembly ad-hoc
+   - No explicit context prioritization
+   - Compaction strategy is lossy
+
+**E. Deployment Constraints**:
+
+1. **Local Execution Model**: Designed for on-machine execution
+   - Requires local filesystem access
+   - Shell execution inherently privileged
+
+2. **Single Session**: Not designed for multi-user or multi-instance
+   - SQLite session storage is local
+   - No distributed state management
+
+---
+
+### Key File Reference Map
+
+| Function | File | Key Lines |
+|----------|------|-----------|
+| **Agent Loop** | `goose/src/agents/agent.rs` | 858 (reply), 1000+ (turn loop) |
+| **Tool Execution** | `goose/src/agents/tool_execution.rs` | 52-100 (approval), 496+ (dispatch) |
+| **MCP Client** | `goose/src/agents/mcp_client.rs` | 42+ (trait), 107+ (GooseClient) |
+| **Extension Mgmt** | `goose/src/agents/extension_manager.rs` | 107+ (ExtensionManager), 200+ (tool list) |
+| **Shell/Editor** | `goose-mcp/src/developer/rmcp_developer.rs` | 119+ (ShellParams), 635+ (list_windows) |
+| **LLM Abstraction** | `goose/src/providers/base.rs` | 460+ (Provider trait), 708+ (streaming) |
+| **Message Format** | `goose/src/conversation/message.rs` | 186+ (MessageContent), 663+ (Message) |
+| **Security Inspection** | `goose/src/security/security_inspector.rs` | Tool risk classification |
+| **Recipes** | `goose/src/recipe/mod.rs` | Template engine for task composition |
+| **CLI Entry** | `goose-cli/src/cli.rs` | 37+ (Cli struct), 858+ (reply) |
+
+---
+
+This is a sophisticated, well-engineered system with thoughtful design around extensibility (MCP), security (multi-layer inspection), and UX (streaming, context management). The main trade-offs reflect its design as a **local, trustworthy AI agent** rather than a cloud-based service.
