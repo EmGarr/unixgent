@@ -1,6 +1,6 @@
 # UnixAgent — Implementation Plan
 
-**Last updated**: 2026-02-22
+**Last updated**: 2026-02-23
 
 This document tracks the implementation status of every phase and sub-task.
 It is the single source of truth for "where are we at". See DESIGN.md for
@@ -664,3 +664,47 @@ CUA leads in GUI breadth (accessibility APIs across 3 OSes). No project combines
 - Butterfish's capital-letter heuristic (our `#` prefix is better — fails safe as shell comment)
 - Custom PS1 markers (OSC 133 is the standard — don't regress)
 - tiktoken dependency for token counting (chars/4 is adequate for our context sizes)
+
+---
+
+## Research Notes: OpenClaw Deep Analysis (2026-02-23)
+
+**Report**: `research/OPENCLAW_ANALYSIS.md` — architecture, security, skill/plugin system.
+
+OpenClaw is a Node.js/TypeScript agent platform (~150K LOC) with a gateway server,
+heartbeat daemon, 54 built-in skills, 40+ extension plugins, and 23 lifecycle hooks.
+It solved problems UnixAgent hasn't reached yet: autonomous execution, extensibility,
+multi-channel I/O, and persistent memory.
+
+### Key Insight
+
+OpenClaw's *concepts* are extractable but its *implementation* is not. It's a web app
+that shells out; we're a Unix tool that talks to LLMs. We need Rust/Unix equivalents.
+
+### Extractable Patterns (prioritized)
+
+| Pattern | Source | Effort | Impact | Status |
+|---------|--------|--------|--------|--------|
+| Skills system (`skill.toml` + `context.md` in `~/.config/unixagent/skills/`) | OpenClaw SKILL.md | Small | High | TODO |
+| Daemon mode (`unixagent daemon` + `heartbeat.toml`) | OpenClaw heartbeat | Medium | High | TODO |
+| Persistent memory (`~/.local/share/.../memory/` plain files) | OpenClaw memory-core | Tiny | Medium | TODO |
+| Dynamic content wrapping (per-session random boundary markers) | OpenClaw external content | Small | Medium | TODO |
+| Hook runner (4 hooks: pre/post-execute, pre/post-session) | OpenClaw lifecycle hooks | Small | Low | TODO |
+
+### Anti-Patterns (explicitly rejected)
+
+- **In-process plugins** (Node.js jiti dynamic loading — security nightmare, bypasses kernel sandbox)
+- **Gateway / HTTP server** (changes threat model, over-engineering for terminal tool)
+- **Tool factories / lazy registration** (shell IS the universal tool — don't wrap it)
+- **Application-level permissions** (`"filesystem:read"` strings — kernel enforcement is stronger)
+- **54 bundled skills** (bloat — ship zero, let users create skills as plain files)
+
+### Security Comparison
+
+| Aspect | OpenClaw | UnixAgent | Winner |
+|--------|----------|-----------|--------|
+| Filesystem isolation | Docker (opt-in) | Seatbelt/Landlock (always-on) | **UnixAgent** |
+| Prompt injection defense | Unique marker wrapping | Static marker scrubbing | **OpenClaw** |
+| Audit trail | Minimal logging | Append-only JSONL | **UnixAgent** |
+| LLM security judge | None | Opt-in judge (Warn/Block) | **UnixAgent** |
+| Plugin trust | Skill scanner + path validation | N/A (no plugins) | OpenClaw |
