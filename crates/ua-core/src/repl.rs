@@ -954,10 +954,11 @@ pub fn run_repl(
                             // Nudge shell to redisplay prompt below agent output
                             let _ = session.write_all(b"\n");
                             pending_instruction = None;
-                        } else {
-                            // Forward other input to PTY (user may interact with commands)
-                            let _ = session.write_all(&data);
                         }
+                        // All other input is dropped — user interaction during agent
+                        // execution would corrupt the running command and its output
+                        // capture, and can generate spurious OSC events that cause
+                        // premature state transitions.
                     }
                 }
             }
@@ -1395,69 +1396,136 @@ pub fn run_repl(
                             } = std::mem::replace(&mut state, AgentState::Idle)
                             {
                                 let captured_lines = capture.lines();
-                                if !captured_lines.is_empty() {
-                                    // Build observation with scrubbing
+                                // Build observation — always send a tool_result so
+                                // the LLM gets its next turn. Silent commands (mkdir,
+                                // mv, etc.) still need a tool_result to keep the
+                                // conversation consistent.
+                                let observation = if !captured_lines.is_empty() {
                                     let raw_output = captured_lines.join("\n");
                                     let scrubbed = scrub_injection_markers(&raw_output);
-                                    let observation =
-                                        format!("{}{}\n", TOOL_RESULT_PREFIX, scrubbed);
+                                    format!("{}{}\n", TOOL_RESULT_PREFIX, scrubbed)
+                                } else {
+                                    format!("{}(no output)\n", TOOL_RESULT_PREFIX)
+                                };
 
-                                    // Write tool result to journal
-                                    let tool_results: Vec<ToolResultRecord> = tool_use_ids
-                                        .iter()
-                                        .map(|id| {
-                                            ToolResultRecord::text(id.clone(), observation.clone())
-                                        })
-                                        .collect();
-                                    if let Some(ref mut j) = journal {
-                                        j.append(&JournalEntry::ToolResult {
-                                            ts: epoch_secs(),
-                                            results: tool_results.clone(),
-                                        });
-                                    }
-
-                                    // Append tool_result to in-memory conversation
-                                    let result_msg =
-                                        ua_protocol::ConversationMessage::tool_result(tool_results);
-                                    conversation_tokens += message_tokens(&result_msg);
-                                    if let Some(ref mut conv) = cached_conversation {
-                                        conv.push(result_msg);
-                                    }
-
-                                    // Budget check: if over, force rebuild from journal
-                                    if conversation_tokens > config.journal.conversation_budget {
-                                        cached_conversation = None;
-                                        conversation_tokens = 0;
-                                    }
-
-                                    // Clear readline before next LLM call
-                                    let _ = session.write_all(b"\x15");
-
-                                    let next_iteration = iteration + 1;
-
-                                    state = start_streaming(
-                                        rt_handle,
-                                        config,
-                                        &mut journal,
-                                        &output_history,
-                                        terminal_size,
-                                        next_iteration,
-                                        &tx_for_streaming,
-                                        &mut renderer,
-                                        child_pid,
-                                        &mut cached_conversation,
-                                        &mut conversation_tokens,
-                                    );
+                                // Write tool result to journal
+                                let tool_results: Vec<ToolResultRecord> = tool_use_ids
+                                    .iter()
+                                    .map(|id| {
+                                        ToolResultRecord::text(id.clone(), observation.clone())
+                                    })
+                                    .collect();
+                                if let Some(ref mut j) = journal {
+                                    j.append(&JournalEntry::ToolResult {
+                                        ts: epoch_secs(),
+                                        results: tool_results.clone(),
+                                    });
                                 }
-                                // else: no output — stay Idle
+
+                                // Append tool_result to in-memory conversation
+                                let result_msg =
+                                    ua_protocol::ConversationMessage::tool_result(tool_results);
+                                conversation_tokens += message_tokens(&result_msg);
+                                if let Some(ref mut conv) = cached_conversation {
+                                    conv.push(result_msg);
+                                }
+
+                                // Budget check: if over, force rebuild from journal
+                                if conversation_tokens > config.journal.conversation_budget {
+                                    cached_conversation = None;
+                                    conversation_tokens = 0;
+                                }
+
+                                // Clear readline before next LLM call
+                                let _ = session.write_all(b"\x15");
+
+                                let next_iteration = iteration + 1;
+
+                                state = start_streaming(
+                                    rt_handle,
+                                    config,
+                                    &mut journal,
+                                    &output_history,
+                                    terminal_size,
+                                    next_iteration,
+                                    &tx_for_streaming,
+                                    &mut renderer,
+                                    child_pid,
+                                    &mut cached_conversation,
+                                    &mut conversation_tokens,
+                                );
                             }
                         }
                         QueueEvent::Failed(code) => {
                             renderer.emit_command_failed(code);
                             line_buf.clear();
-                            state = AgentState::Idle;
-                            // Nudge shell to redisplay prompt below agent output
-                            let _ = session.write_all(b"\n");
+
+                            // Feed failure back to the LLM so the agentic loop
+                            // can recover instead of silently stopping.
+                            if let AgentState::Executing {
+                                iteration,
+                                capture,
+                                tool_use_ids,
+                                ..
+                            } = std::mem::replace(&mut state, AgentState::Idle)
+                            {
+                                let captured_lines = capture.lines();
+                                let output_text = if captured_lines.is_empty() {
+                                    format!(
+                                        "{}Command failed with exit code {code} (no output)\n",
+                                        TOOL_RESULT_PREFIX
+                                    )
+                                } else {
+                                    let raw = captured_lines.join("\n");
+                                    let scrubbed = scrub_injection_markers(&raw);
+                                    format!(
+                                        "{}{}\n[exit code: {}]\n",
+                                        TOOL_RESULT_PREFIX, scrubbed, code
+                                    )
+                                };
+
+                                let tool_results: Vec<ToolResultRecord> = tool_use_ids
+                                    .iter()
+                                    .map(|id| {
+                                        ToolResultRecord::text(id.clone(), output_text.clone())
+                                    })
+                                    .collect();
+                                if let Some(ref mut j) = journal {
+                                    j.append(&JournalEntry::ToolResult {
+                                        ts: epoch_secs(),
+                                        results: tool_results.clone(),
+                                    });
+                                }
+
+                                let result_msg =
+                                    ua_protocol::ConversationMessage::tool_result(tool_results);
+                                conversation_tokens += message_tokens(&result_msg);
+                                if let Some(ref mut conv) = cached_conversation {
+                                    conv.push(result_msg);
+                                }
+
+                                if conversation_tokens > config.journal.conversation_budget {
+                                    cached_conversation = None;
+                                    conversation_tokens = 0;
+                                }
+
+                                let _ = session.write_all(b"\x15");
+
+                                let next_iteration = iteration + 1;
+                                state = start_streaming(
+                                    rt_handle,
+                                    config,
+                                    &mut journal,
+                                    &output_history,
+                                    terminal_size,
+                                    next_iteration,
+                                    &tx_for_streaming,
+                                    &mut renderer,
+                                    child_pid,
+                                    &mut cached_conversation,
+                                    &mut conversation_tokens,
+                                );
+                            }
                         }
                         QueueEvent::None => {}
                     }
