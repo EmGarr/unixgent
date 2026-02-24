@@ -12,6 +12,7 @@ pub struct Config {
     pub security: SecurityConfig,
     pub journal: JournalConfig,
     pub sandbox: SandboxConfig,
+    pub audio: AudioConfig,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -278,6 +279,44 @@ impl Default for SandboxConfig {
                 "$HOME/.aws".to_string(),
             ],
         }
+    }
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AudioConfig {
+    /// Override the recorder command (default: "rec" from sox).
+    pub recorder: Option<String>,
+    /// Override the transcriber command (default: "whisper-cpp").
+    pub transcriber: Option<String>,
+    /// Path to the Whisper model file.
+    pub whisper_model: String,
+    /// Maximum recording duration in seconds.
+    pub max_duration_secs: u32,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            recorder: None,
+            transcriber: None,
+            whisper_model: "models/ggml-base.en.bin".to_string(),
+            max_duration_secs: 30,
+        }
+    }
+}
+
+impl AudioConfig {
+    /// Resolved recorder command (default: "rec").
+    pub fn recorder_cmd(&self) -> String {
+        self.recorder.clone().unwrap_or_else(|| "rec".to_string())
+    }
+
+    /// Resolved transcriber command (default: "whisper-cpp").
+    pub fn transcriber_cmd(&self) -> String {
+        self.transcriber
+            .clone()
+            .unwrap_or_else(|| "whisper-cpp".to_string())
     }
 }
 
@@ -669,6 +708,61 @@ judge_mode = "block"
         let cfg = SecurityConfig::default();
         assert!(cfg.judge_mode.is_none());
         assert!(!cfg.judge_enabled);
+    }
+
+    #[test]
+    fn audio_config_defaults() {
+        let cfg = AudioConfig::default();
+        assert!(cfg.recorder.is_none());
+        assert!(cfg.transcriber.is_none());
+        assert_eq!(cfg.recorder_cmd(), "rec");
+        assert_eq!(cfg.transcriber_cmd(), "whisper-cpp");
+        assert_eq!(cfg.max_duration_secs, 30);
+        assert!(cfg.whisper_model.contains("ggml-base.en"));
+    }
+
+    #[test]
+    fn parse_audio_config() {
+        let toml_str = r#"
+[audio]
+recorder = "arecord"
+transcriber = "whisper"
+whisper_model = "/opt/models/large.bin"
+max_duration_secs = 60
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.audio.recorder.as_deref(), Some("arecord"));
+        assert_eq!(cfg.audio.transcriber.as_deref(), Some("whisper"));
+        assert_eq!(cfg.audio.whisper_model, "/opt/models/large.bin");
+        assert_eq!(cfg.audio.max_duration_secs, 60);
+    }
+
+    #[test]
+    fn audio_config_custom_recorder_cmd() {
+        let cfg = AudioConfig {
+            recorder: Some("arecord".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.recorder_cmd(), "arecord");
+    }
+
+    #[test]
+    fn audio_config_custom_transcriber_cmd() {
+        let cfg = AudioConfig {
+            transcriber: Some("whisper".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.transcriber_cmd(), "whisper");
+    }
+
+    #[test]
+    fn parse_toml_without_audio_uses_defaults() {
+        let toml_str = r#"
+[shell]
+command = "/bin/bash"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.audio, AudioConfig::default());
     }
 
     #[test]

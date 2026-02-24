@@ -17,7 +17,9 @@ pub fn apply_landlock(policy: &SandboxPolicy) -> Result<(), SandboxError> {
 
     let mut ruleset = Ruleset::default()
         .handle_access(AccessFs::from_all(abi))
-        .map_err(|e| SandboxError::Platform(format!("Landlock ruleset creation failed: {e}")))?;
+        .map_err(|e| SandboxError::Platform(format!("Landlock ruleset creation failed: {e}")))?
+        .create()
+        .map_err(|e| SandboxError::Platform(format!("Landlock ruleset create failed: {e}")))?;
 
     let read_access = AccessFs::from_read(abi);
     let all_access = AccessFs::from_all(abi);

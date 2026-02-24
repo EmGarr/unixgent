@@ -411,11 +411,26 @@ Screen capture and accessibility API integration.
 
 ---
 
-## Phase 7: Audio — TODO
+## Phase 7: Audio — WIP
 
-Microphone, system audio, speech-to-text.
+Microphone recording + speech-to-text transcription → agent executes spoken instruction.
+
+**Architecture**: Two-stage preprocessing pipeline (record → transcribe → text instruction).
+The Anthropic Messages API does not support native audio content blocks, so audio is
+transcribed to text before being sent to the LLM. The agent stays text-in/text-out.
 
 **Exit criteria**: User speaks instruction → agent transcribes and executes.
+
+| Sub-task | Status | Files |
+|----------|--------|-------|
+| `AudioConfig` (recorder, transcriber, model, duration) | DONE | `ua-core/src/config.rs` |
+| `record()` — capture mic via `sox` rec, 16kHz mono WAV, silence detection | DONE | `ua-core/src/audio.rs` |
+| `transcribe()` — STT via `whisper-cpp` CLI | DONE | `ua-core/src/audio.rs` |
+| `listen()` — combined record + transcribe convenience function | DONE | `ua-core/src/audio.rs` |
+| `--listen` CLI flag (batch mode integration) | DONE | `ua-core/src/main.rs` |
+| REPL voice trigger (e.g. hotkey to start recording) | TODO | |
+| System audio capture | TODO | |
+| Streaming transcription (real-time) | TODO | |
 
 ---
 

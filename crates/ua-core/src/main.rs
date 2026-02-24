@@ -39,9 +39,13 @@ fn print_help() {
     println!("  unixagent \"instruction\"      Batch mode (non-interactive)");
     println!("  echo \"instruction\" | unixagent  Batch mode via stdin pipe");
     println!("  unixagent -p \"prompt\" --attachments img.png  Multimodal batch mode");
+    println!("  unixagent --listen                          Record mic → transcribe → execute");
     println!();
     println!("Options:");
     println!("  -p, --prompt <text>          Instruction text for batch mode");
+    println!(
+        "  --listen                     Record from microphone, transcribe, run as instruction"
+    );
     println!("  --attachments <files...>     Image files to attach (png, jpg, gif, webp)");
     println!("  --system-prompt-file <path>   Prepend file contents to system prompt (batch mode)");
     println!("  --debug-osc                  Print OSC 133 events to stderr");
@@ -62,6 +66,7 @@ fn print_help() {
 struct CliArgs {
     debug_osc: bool,
     no_integration: bool,
+    listen: bool,
     prompt: Option<String>,
     system_prompt_file: Option<String>,
     attachment_paths: Vec<String>,
@@ -72,6 +77,7 @@ fn parse_args(args: &[String]) -> CliArgs {
     let mut result = CliArgs {
         debug_osc: false,
         no_integration: false,
+        listen: false,
         prompt: None,
         system_prompt_file: None,
         attachment_paths: Vec::new(),
@@ -84,6 +90,7 @@ fn parse_args(args: &[String]) -> CliArgs {
         match arg.as_str() {
             "--debug-osc" => result.debug_osc = true,
             "--no-integration" => result.no_integration = true,
+            "--listen" => result.listen = true,
             "-p" | "--prompt" => {
                 i += 1;
                 if i < args.len() {
@@ -193,7 +200,7 @@ fn main() {
         false
     };
 
-    // Determine instruction: -p flag, positional arg, or stdin pipe
+    // Determine instruction: --listen, -p flag, positional arg, or stdin pipe
     let stdin_is_pipe = !io::stdin().is_terminal();
 
     if cli.prompt.is_some() && !cli.positional.is_empty() {
@@ -201,7 +208,22 @@ fn main() {
         std::process::exit(1);
     }
 
-    let instruction = if let Some(ref p) = cli.prompt {
+    if cli.listen && (cli.prompt.is_some() || !cli.positional.is_empty()) {
+        eprintln!(
+            "error: --listen cannot be combined with -p/--prompt or a positional instruction"
+        );
+        std::process::exit(1);
+    }
+
+    let instruction = if cli.listen {
+        match ua_core::audio::listen(&config.audio) {
+            Ok(text) => Some(text),
+            Err(e) => {
+                eprintln!("error: audio input failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else if let Some(ref p) = cli.prompt {
         Some(p.clone())
     } else if let Some(arg) = cli.positional.first() {
         Some(arg.clone())
