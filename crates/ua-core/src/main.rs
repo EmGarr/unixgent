@@ -46,6 +46,10 @@ fn print_help() {
     println!(
         "  --listen                     Record from microphone, transcribe, run as instruction"
     );
+    println!();
+    println!("REPL voice input:");
+    println!("  #v / #voice / #listen        Start voice recording at the prompt");
+    println!("  Ctrl+V                       Push-to-talk (empty prompt only)");
     println!("  --attachments <files...>     Image files to attach (png, jpg, gif, webp)");
     println!("  --system-prompt-file <path>   Prepend file contents to system prompt (batch mode)");
     println!("  --debug-osc                  Print OSC 133 events to stderr");

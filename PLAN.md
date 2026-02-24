@@ -428,7 +428,15 @@ transcribed to text before being sent to the LLM. The agent stays text-in/text-o
 | `transcribe()` — STT via `whisper-cpp` CLI | DONE | `ua-core/src/audio.rs` |
 | `listen()` — combined record + transcribe convenience function | DONE | `ua-core/src/audio.rs` |
 | `--listen` CLI flag (batch mode integration) | DONE | `ua-core/src/main.rs` |
-| REPL voice trigger (e.g. hotkey to start recording) | TODO | |
+| `listen_async()` — background thread recording with cancellation via `AtomicBool` | DONE | `ua-core/src/audio.rs` |
+| `RecordingHandle` — cancel token for async recording | DONE | `ua-core/src/audio.rs` |
+| REPL voice triggers (`#v` / `#voice` / `#listen` at prompt) | DONE | `ua-core/src/repl.rs` |
+| Ctrl+V push-to-talk hotkey (empty prompt only) | DONE | `ua-core/src/repl.rs` |
+| `AgentState::Recording` — state machine integration | DONE | `ua-core/src/repl.rs` |
+| `Event::VoiceDone` — event loop integration | DONE | `ua-core/src/repl.rs` |
+| Renderer: `emit_recording()`, `emit_transcribing()`, `emit_voice_result()`, `emit_voice_error()` | DONE | `ua-core/src/renderer.rs` |
+| PTY buffering during Recording state | DONE | `ua-core/src/repl.rs` |
+| Ctrl+C cancellation during recording | DONE | `ua-core/src/repl.rs` |
 | System audio capture | TODO | |
 | Streaming transcription (real-time) | TODO | |
 
@@ -527,6 +535,7 @@ context via journal piping, children run in isolated journals. Static binary shi
 | ReplRenderer extraction (Linus forward-flow) | 2026-02-16 | Extracted ~30 ad-hoc `write!(stderr, ...)` calls from repl.rs into `ReplRenderer<W: Write>` in renderer.rs. Follows `BatchOutput<W>` pattern. Centralized `clear_spinner()` protocol: every persistent emit method clears spinner first, fixing spinner bleed into PTY output. Deleted `[ua] executing...` and `[ua] observing output` status lines. 30+ snapshot tests with `Vec<u8>` writer. |
 | Journal fidelity: user command output capture + output_mode | 2026-02-14 | `ShellCommand` journal entry gains `output: Option<String>` field (serde-default for backward compat). REPL captures terminal output between OSC 133;C and 133;D via `user_cmd_capture` buffer, mirroring how agent command output is captured. `convert_entries_to_messages()` appends output to `[ran: ...]` stub. Shell tool gains `output_mode` enum (`"full"` / `"final"`) — `"final"` mode uses `OutputHistory::with_cr_reset()` where `\r` clears `current_line`, collapsing progress bar output to only the final overwritten state. |
 | OS-level filesystem sandbox via `--sandbox-exec` | 2026-02-19 | Independent `ua-sandbox` crate with Seatbelt (macOS) + Landlock (Linux). Parent stays unsandboxed (needs API, journal, audit). Child commands run via `unixagent --sandbox-exec sh -c "cmd"` — policy serialized as JSON in `__UA_SANDBOX_POLICY` env var. Child deserializes, applies irreversible OS sandbox, execs. Seatbelt strategy: `(deny default)` + `(allow file*)` + `(deny file-write*)` + selective write allows. Landlock: default-deny, explicit PathBeneath rules. Batch mode wraps all commands; REPL passes `None` (human approval is the defense). Deny list expanded from 11 to 50+ patterns covering reverse shells, data exfiltration, credential theft, history tampering. |
+| Native REPL voice input via background thread + state machine | 2026-02-24 | `listen_async()` spawns recording in a thread, polls `child.try_wait()` every 100ms, checks `AtomicBool` cancel flag. Result flows back via `mpsc::channel` → relay thread → `Event::VoiceDone`. New `AgentState::Recording` variant with PTY buffering (same pattern as Approving/Judging). Three triggers: `#v`/`#voice`/`#listen` at prompt, Ctrl+V push-to-talk (empty prompt only). Ctrl+C cancels recording (kills sox child process). Transcribed text feeds into normal instruction path (journal + streaming). No new dependencies — uses existing `std::sync::atomic` + `std::thread` + `std::sync::mpsc`. |
 | Magic byte detection for binary media in tool results | 2026-02-21 | Batch mode `Command::output()` gives raw `Vec<u8>`. `detect_media_type()` checks magic bytes (PNG/JPEG/GIF/WEBP/WAV) on stdout. Binary output → sidecar file in `{journal}.media/` dir + base64-encoded `ResolvedMedia` for API. Journal stores `MediaRef` (filename only, not base64) with fixed 1600-token cost per image. `resolve_media_refs()` reloads sidecar files on journal replay. Anthropic `tool_result.content` emits array-form `[{type:"image",...},{type:"text",...}]` when media present, string form otherwise. REPL mode unchanged — PTY corrupts binary, so agents write to files there (Unix design: pipes carry anything, terminals carry text). |
 
 ---

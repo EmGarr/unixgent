@@ -45,6 +45,8 @@ enum Event {
     SpinnerTick,
     /// Periodic poll for child agent processes.
     ChildPoll,
+    /// Voice recording + transcription completed (from background thread).
+    VoiceDone(crate::audio::VoiceResult),
 }
 
 /// Agent state machine — drives the main event loop.
@@ -120,6 +122,11 @@ enum AgentState {
     // Note: The cr_resets mode is baked into the OutputHistory `capture` buffer
     // at construction time — `OutputHistory::new(200)` for "full" mode,
     // `OutputHistory::with_cr_reset(200)` for "final" mode.
+    /// Recording audio from the microphone (background thread running).
+    Recording {
+        /// Handle to cancel the recording.
+        handle: crate::audio::RecordingHandle,
+    },
 }
 
 /// Result of processing an OSC event through the command queue.
@@ -594,37 +601,68 @@ pub fn run_repl(
                                             let instruction = instruction.trim();
                                             if !instruction.is_empty() {
                                                 handled_instruction = true;
-                                                pending_instruction = Some(instruction.to_string());
 
-                                                // Write instruction to journal
-                                                if let Some(ref mut j) = journal {
-                                                    j.append(&JournalEntry::Instruction {
-                                                        ts: epoch_secs(),
-                                                        text: instruction.to_string(),
-                                                        attachments: vec![],
+                                                // Check for voice trigger: #v, #voice, #listen
+                                                if matches!(instruction, "v" | "voice" | "listen") {
+                                                    // Clear shell readline
+                                                    let _ = session.write_all(b"\x15");
+
+                                                    // Start async voice recording
+                                                    let (voice_tx, voice_rx) =
+                                                        std::sync::mpsc::channel();
+                                                    let recording_handle =
+                                                        crate::audio::listen_async(
+                                                            &config.audio,
+                                                            voice_tx,
+                                                        );
+
+                                                    // Spawn relay thread: voice_rx → main event loop
+                                                    let tx_voice = tx_for_streaming.clone();
+                                                    std::thread::spawn(move || {
+                                                        if let Ok(result) = voice_rx.recv() {
+                                                            let _ = tx_voice
+                                                                .send(Event::VoiceDone(result));
+                                                        }
                                                     });
+
+                                                    renderer.emit_recording();
+                                                    state = AgentState::Recording {
+                                                        handle: recording_handle,
+                                                    };
+                                                } else {
+                                                    pending_instruction =
+                                                        Some(instruction.to_string());
+
+                                                    // Write instruction to journal
+                                                    if let Some(ref mut j) = journal {
+                                                        j.append(&JournalEntry::Instruction {
+                                                            ts: epoch_secs(),
+                                                            text: instruction.to_string(),
+                                                            attachments: vec![],
+                                                        });
+                                                    }
+
+                                                    // Clear shell readline (removes the # text)
+                                                    let _ = session.write_all(b"\x15");
+
+                                                    // Start streaming from the backend
+                                                    // Fresh instruction: rebuild from journal.
+                                                    cached_conversation = None;
+                                                    conversation_tokens = 0;
+                                                    state = start_streaming(
+                                                        rt_handle,
+                                                        config,
+                                                        &mut journal,
+                                                        &output_history,
+                                                        terminal_size,
+                                                        0,
+                                                        &tx_for_streaming,
+                                                        &mut renderer,
+                                                        child_pid,
+                                                        &mut cached_conversation,
+                                                        &mut conversation_tokens,
+                                                    );
                                                 }
-
-                                                // Clear shell readline (removes the # text)
-                                                let _ = session.write_all(b"\x15");
-
-                                                // Start streaming from the backend
-                                                // Fresh instruction: rebuild from journal.
-                                                cached_conversation = None;
-                                                conversation_tokens = 0;
-                                                state = start_streaming(
-                                                    rt_handle,
-                                                    config,
-                                                    &mut journal,
-                                                    &output_history,
-                                                    terminal_size,
-                                                    0,
-                                                    &tx_for_streaming,
-                                                    &mut renderer,
-                                                    child_pid,
-                                                    &mut cached_conversation,
-                                                    &mut conversation_tokens,
-                                                );
                                             }
                                         } else if !trimmed.is_empty() {
                                             // Capture user shell command (non-# input).
@@ -666,6 +704,37 @@ pub fn run_repl(
                                             line_buf.truncate(pos + 1);
                                         } else {
                                             line_buf.clear();
+                                        }
+                                    }
+                                    0x16 => {
+                                        // Ctrl+V: push-to-talk voice input
+                                        if line_buf.is_empty() {
+                                            handled_instruction = true;
+
+                                            // Clear shell readline
+                                            let _ = session.write_all(b"\x15");
+
+                                            // Start async voice recording
+                                            let (voice_tx, voice_rx) = std::sync::mpsc::channel();
+                                            let recording_handle =
+                                                crate::audio::listen_async(&config.audio, voice_tx);
+
+                                            // Relay thread
+                                            let tx_voice = tx_for_streaming.clone();
+                                            std::thread::spawn(move || {
+                                                if let Ok(result) = voice_rx.recv() {
+                                                    let _ = tx_voice.send(Event::VoiceDone(result));
+                                                }
+                                            });
+
+                                            renderer.emit_recording();
+                                            state = AgentState::Recording {
+                                                handle: recording_handle,
+                                            };
+                                            break; // stop processing bytes — we're now Recording
+                                        } else {
+                                            // Mid-line Ctrl+V: just insert (like terminals do)
+                                            line_buf.push('\x16');
                                         }
                                     }
                                     b if b >= 0x20 => {
@@ -735,6 +804,23 @@ pub fn run_repl(
                             let _ = session.write_all(b"\n");
                         }
                         // Other input is ignored during judging
+                    }
+                    AgentState::Recording { ref handle } => {
+                        // Ctrl+C stops recording
+                        if data.contains(&0x03) {
+                            handle.cancel();
+                            // Flush buffered PTY output before leaving Recording
+                            if !pty_buffer.is_empty() {
+                                stdout.write_all(&pty_buffer)?;
+                                stdout.flush()?;
+                                pty_buffer.clear();
+                            }
+                            renderer.emit_cancelled();
+                            state = AgentState::Idle;
+                            let _ = session.write_all(b"\n");
+                        }
+                        // All other input is ignored during recording
+                        // (Enter/silence auto-stops the recorder naturally)
                     }
                     AgentState::Approving {
                         ref has_privileged,
@@ -1290,11 +1376,13 @@ pub fn run_repl(
                 }
             }
             Event::PtyOutput(data) => {
-                // Buffer PTY output during Approving/Judging to prevent
-                // zsh job notifications from corrupting the approval UI.
+                // Buffer PTY output during Approving/Judging/Recording to prevent
+                // zsh job notifications from corrupting the approval/recording UI.
                 if matches!(
                     state,
-                    AgentState::Approving { .. } | AgentState::Judging { .. }
+                    AgentState::Approving { .. }
+                        | AgentState::Judging { .. }
+                        | AgentState::Recording { .. }
                 ) {
                     pty_buffer.extend_from_slice(&data);
                 } else {
@@ -1500,17 +1588,78 @@ pub fn run_repl(
                 }
                 // SpinnerTick outside Streaming is silently ignored
             }
+            Event::VoiceDone(result) => {
+                // Only process if we're actually in Recording state.
+                if !matches!(state, AgentState::Recording { .. }) {
+                    // Recording was cancelled — VoiceDone arrived late. Ignore.
+                    continue;
+                }
+
+                match result {
+                    Ok(text) => {
+                        // Flush buffered PTY output
+                        if !pty_buffer.is_empty() {
+                            stdout.write_all(&pty_buffer)?;
+                            stdout.flush()?;
+                            pty_buffer.clear();
+                        }
+                        renderer.emit_voice_result(&text);
+
+                        // Feed transcribed text as an instruction — same path as # text input.
+                        pending_instruction = Some(text.clone());
+
+                        if let Some(ref mut j) = journal {
+                            j.append(&JournalEntry::Instruction {
+                                ts: epoch_secs(),
+                                text: text.clone(),
+                                attachments: vec![],
+                            });
+                        }
+
+                        // Start streaming
+                        cached_conversation = None;
+                        conversation_tokens = 0;
+                        state = start_streaming(
+                            rt_handle,
+                            config,
+                            &mut journal,
+                            &output_history,
+                            terminal_size,
+                            0,
+                            &tx_for_streaming,
+                            &mut renderer,
+                            child_pid,
+                            &mut cached_conversation,
+                            &mut conversation_tokens,
+                        );
+                    }
+                    Err(msg) => {
+                        // Flush buffered PTY output
+                        if !pty_buffer.is_empty() {
+                            stdout.write_all(&pty_buffer)?;
+                            stdout.flush()?;
+                            pty_buffer.clear();
+                        }
+                        renderer.emit_voice_error(&msg);
+                        state = AgentState::Idle;
+                        // Nudge shell to redisplay prompt
+                        let _ = session.write_all(b"\n");
+                    }
+                }
+            }
             Event::ChildPoll => {
                 let current_pids: HashSet<u32> =
                     crate::process::list_descendant_agent_pids(std::process::id())
                         .into_iter()
                         .collect();
 
-                // Suppress status emissions during Approving/Judging to prevent
-                // child status lines from corrupting the approval UI.
+                // Suppress status emissions during Approving/Judging/Recording to prevent
+                // child status lines from corrupting the approval/recording UI.
                 let suppress_emissions = matches!(
                     state,
-                    AgentState::Approving { .. } | AgentState::Judging { .. }
+                    AgentState::Approving { .. }
+                        | AgentState::Judging { .. }
+                        | AgentState::Recording { .. }
                 );
 
                 // New children: appeared since last poll

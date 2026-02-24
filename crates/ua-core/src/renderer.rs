@@ -326,9 +326,65 @@ impl<W: Write> ReplRenderer<W> {
         let _ = self.writer.flush();
     }
 
+    // ── Voice input methods ─────────────────────────────────────────────
+
+    /// Show recording indicator: `● recording... (Enter/Ctrl+C to stop)`
+    pub fn emit_recording(&mut self) {
+        self.clear_spinner();
+        let _ = write!(
+            self.writer,
+            "\r\n{}● recording...{} {}(Enter/Ctrl+C to stop){}",
+            self.style.red_start(),
+            self.style.reset(),
+            self.style.dim_start(),
+            self.style.reset(),
+        );
+        let _ = self.writer.flush();
+    }
+
+    /// Show transcription in progress: `  transcribing...`
+    pub fn emit_transcribing(&mut self) {
+        let _ = write!(
+            self.writer,
+            "\r\x1b[K{}  transcribing...{}",
+            self.style.dim_start(),
+            self.style.reset(),
+        );
+        let _ = self.writer.flush();
+    }
+
+    /// Show transcribed text: `  heard: "text"`
+    pub fn emit_voice_result(&mut self, text: &str) {
+        let display = truncate_for_display(text, 72);
+        let _ = writeln!(
+            self.writer,
+            "\r\x1b[K{}  heard: \"{display}\"{}",
+            self.style.dim_start(),
+            self.style.reset(),
+        );
+        let _ = self.writer.flush();
+    }
+
+    /// Show voice error: `  voice: error message`
+    pub fn emit_voice_error(&mut self, msg: &str) {
+        let _ = writeln!(self.writer, "\r\x1b[K[ua] voice: {msg}");
+        let _ = self.writer.flush();
+    }
+
     /// Whether the spinner is currently active (for testing).
     pub fn spinner_active(&self) -> bool {
         self.spinner_active
+    }
+}
+
+/// Truncate a string for display, adding "..." if too long.
+fn truncate_for_display(s: &str, max: usize) -> String {
+    if s.len() > max {
+        let mut t: String = s.chars().take(max - 3).collect();
+        t.push_str("...");
+        t
+    } else {
+        s.to_string()
     }
 }
 
@@ -755,5 +811,88 @@ mod tests {
         assert!(s.contains("\x1b[2m"), "should have dim codes");
         assert!(s.contains("sandbox:"));
         assert!(s.contains("/tmp"));
+    }
+
+    // ── Voice input ────────────────────────────────────────────────────
+
+    #[test]
+    fn emit_recording_no_ansi() {
+        let mut r = make_renderer(Style::disabled());
+        r.emit_recording();
+        let s = output_str(&r);
+        assert!(
+            s.contains("● recording..."),
+            "should show recording indicator"
+        );
+        assert!(s.contains("Enter/Ctrl+C to stop"), "should show stop hint");
+    }
+
+    #[test]
+    fn emit_recording_with_ansi() {
+        let mut r = make_renderer(Style::force_enabled());
+        r.emit_recording();
+        let s = output_str(&r);
+        assert!(s.contains("\x1b[31m"), "● should be red");
+        assert!(s.contains("recording..."));
+    }
+
+    #[test]
+    fn emit_transcribing_no_ansi() {
+        let mut r = make_renderer(Style::disabled());
+        r.emit_transcribing();
+        let s = output_str(&r);
+        assert!(s.contains("transcribing..."));
+    }
+
+    #[test]
+    fn emit_voice_result_no_ansi() {
+        let mut r = make_renderer(Style::disabled());
+        r.emit_voice_result("list the files in tmp");
+        let s = output_str(&r);
+        assert!(s.contains("heard:"), "should have heard prefix");
+        assert!(
+            s.contains("list the files in tmp"),
+            "should have transcribed text"
+        );
+    }
+
+    #[test]
+    fn emit_voice_result_truncates_long_text() {
+        let mut r = make_renderer(Style::disabled());
+        let long = "a".repeat(200);
+        r.emit_voice_result(&long);
+        let s = output_str(&r);
+        assert!(s.contains("..."), "long text should be truncated");
+    }
+
+    #[test]
+    fn emit_voice_error_no_ansi() {
+        let mut r = make_renderer(Style::disabled());
+        r.emit_voice_error("command not found: 'rec'");
+        let s = output_str(&r);
+        assert!(s.contains("voice:"), "should have voice prefix");
+        assert!(s.contains("command not found"), "should have error message");
+    }
+
+    #[test]
+    fn emit_recording_clears_spinner() {
+        let mut r = make_renderer(Style::disabled());
+        r.emit_spinner_initial();
+        assert!(r.spinner_active());
+        r.emit_recording();
+        assert!(!r.spinner_active(), "recording should clear spinner");
+    }
+
+    #[test]
+    fn truncate_for_display_short() {
+        assert_eq!(truncate_for_display("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_for_display_long() {
+        let long = "a".repeat(100);
+        let result = truncate_for_display(&long, 20);
+        assert_eq!(result.len(), 20);
+        assert!(result.ends_with("..."));
     }
 }
