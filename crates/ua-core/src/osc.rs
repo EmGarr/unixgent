@@ -25,7 +25,14 @@ enum ParseState {
 pub struct OscParser {
     state: ParseState,
     param_buf: Vec<u8>,
-    pub terminal_state: TerminalState,
+    terminal_state: TerminalState,
+}
+
+impl OscParser {
+    /// Current terminal state as tracked by OSC 133 events.
+    pub fn terminal_state(&self) -> TerminalState {
+        self.terminal_state
+    }
 }
 
 impl Default for OscParser {
@@ -191,7 +198,7 @@ mod tests {
         let mut parser = OscParser::new();
         let events = parser.feed_bytes(&osc_bytes("A"));
         assert_eq!(events, vec![OscEvent::Osc133A]);
-        assert_eq!(parser.terminal_state, TerminalState::Prompt);
+        assert_eq!(parser.terminal_state(), TerminalState::Prompt);
     }
 
     #[test]
@@ -199,7 +206,7 @@ mod tests {
         let mut parser = OscParser::new();
         let events = parser.feed_bytes(&osc_bytes("B"));
         assert_eq!(events, vec![OscEvent::Osc133B]);
-        assert_eq!(parser.terminal_state, TerminalState::Input);
+        assert_eq!(parser.terminal_state(), TerminalState::Input);
     }
 
     #[test]
@@ -207,7 +214,7 @@ mod tests {
         let mut parser = OscParser::new();
         let events = parser.feed_bytes(&osc_bytes("C"));
         assert_eq!(events, vec![OscEvent::Osc133C]);
-        assert_eq!(parser.terminal_state, TerminalState::Executing);
+        assert_eq!(parser.terminal_state(), TerminalState::Executing);
     }
 
     #[test]
@@ -215,7 +222,7 @@ mod tests {
         let mut parser = OscParser::new();
         let events = parser.feed_bytes(&osc_bytes("D;0"));
         assert_eq!(events, vec![OscEvent::Osc133D { exit_code: Some(0) }]);
-        assert_eq!(parser.terminal_state, TerminalState::Idle);
+        assert_eq!(parser.terminal_state(), TerminalState::Idle);
     }
 
     #[test]
@@ -262,22 +269,22 @@ mod tests {
         assert_eq!(parser.terminal_state, TerminalState::Idle);
 
         parser.feed_bytes(&osc_bytes("D;0"));
-        assert_eq!(parser.terminal_state, TerminalState::Idle);
+        assert_eq!(parser.terminal_state(), TerminalState::Idle);
 
         parser.feed_bytes(&osc_bytes("A"));
-        assert_eq!(parser.terminal_state, TerminalState::Prompt);
+        assert_eq!(parser.terminal_state(), TerminalState::Prompt);
 
         parser.feed_bytes(&osc_bytes("B"));
-        assert_eq!(parser.terminal_state, TerminalState::Input);
+        assert_eq!(parser.terminal_state(), TerminalState::Input);
 
         parser.feed_bytes(&osc_bytes("C"));
-        assert_eq!(parser.terminal_state, TerminalState::Executing);
+        assert_eq!(parser.terminal_state(), TerminalState::Executing);
 
         parser.feed_bytes(&osc_bytes("D;0"));
-        assert_eq!(parser.terminal_state, TerminalState::Idle);
+        assert_eq!(parser.terminal_state(), TerminalState::Idle);
 
         parser.feed_bytes(&osc_bytes("A"));
-        assert_eq!(parser.terminal_state, TerminalState::Prompt);
+        assert_eq!(parser.terminal_state(), TerminalState::Prompt);
     }
 
     #[test]
